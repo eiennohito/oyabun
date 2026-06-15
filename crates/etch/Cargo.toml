@@ -8,7 +8,7 @@ description = "Retained-mode terminal renderer: declare structure once, bind val
 workspace = true
 
 [dependencies]
-crossterm = "0.28"
+crossterm = "0.29"
 unicode-width = "0.2"
 
 [dev-dependencies]

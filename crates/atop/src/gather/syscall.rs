@@ -51,19 +51,22 @@ impl SyscallBackend {
             }
 
             // --- /proc/<pid>/cmdline ---
-            snap.procs[i].cmdline = read_cmdline(pid, &mut cmd_path, snap);
+            let (cmdline, cmd_non_ascii) = read_cmdline(pid, &mut cmd_path, snap);
+            snap.procs[i].cmdline = cmdline;
+            snap.procs[i].non_ascii |= cmd_non_ascii;
         }
     }
 }
 
 /// Read and process `/proc/<pid>/cmdline` into the arena. Returns the `StringRef`
-/// for the cleaned command line, or `EMPTY` on any failure.
-fn read_cmdline(pid: u32, path: &mut ProcPath, snap: &mut Snapshot) -> StringRef {
+/// for the cleaned command line (or `EMPTY` on any failure) and whether it contained
+/// non-ASCII bytes.
+fn read_cmdline(pid: u32, path: &mut ProcPath, snap: &mut Snapshot) -> (StringRef, bool) {
     let path_ptr = path.write(pid, b"cmdline");
     // SAFETY: valid C path, read-only.
     let fd = unsafe { libc::open(path_ptr, libc::O_RDONLY | libc::O_CLOEXEC) };
     if fd < 0 {
-        return StringRef::EMPTY;
+        return (StringRef::EMPTY, false);
     }
     let off = u32::try_from(snap.strings.alloc(SLOT_SIZE)).expect("arena offset fits u32");
     let ptr = snap.strings.write_ptr(off as usize);
@@ -71,18 +74,21 @@ fn read_cmdline(pid: u32, path: &mut ProcPath, snap: &mut Snapshot) -> StringRef
     let n = unsafe { libc::read(fd, ptr.cast(), SLOT_SIZE) };
     unsafe { libc::close(fd) };
     if n <= 0 {
-        return StringRef::EMPTY;
+        return (StringRef::EMPTY, false);
     }
     let raw_len = usize::try_from(n).unwrap_or(0).min(SLOT_SIZE);
     let buf = snap
         .strings
         .bytes_mut(off, u32::try_from(raw_len).unwrap_or(0));
-    let clean_len = parse::clean_cmdline(buf);
+    let (clean_len, non_ascii) = parse::clean_cmdline(buf);
     if clean_len == 0 {
-        return StringRef::EMPTY;
+        return (StringRef::EMPTY, false);
     }
-    StringRef {
-        offset: off,
-        len: clean_len,
-    }
+    (
+        StringRef {
+            offset: off,
+            len: clean_len,
+        },
+        non_ascii,
+    )
 }

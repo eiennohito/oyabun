@@ -11,7 +11,7 @@ use crate::arena::{HugePageBuf, StringRef};
 pub const NONE: u32 = u32::MAX;
 
 /// System-wide resource snapshot, computed once per gather cycle.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Hash)]
 pub struct SystemStats {
     /// CPU user+nice as fraction of total, basis points (10000 = 100%).
     pub cpu_user_bp: u32,
@@ -69,6 +69,10 @@ pub struct ProcessEntry {
     /// Full `/proc/<pid>/cmdline` (NUL→space), pointing into [`Snapshot::strings`].
     /// Empty for kernel threads and inaccessible processes.
     pub cmdline: StringRef,
+    /// Set if `comm` or `cmdline` contains any byte ≥ 0x80 — i.e. the Command column
+    /// needs unicode-aware width. False for the ~99% ASCII case (renderer fast path).
+    /// Computed for free during the byte-walks that already scan both fields.
+    pub non_ascii: bool,
 
     // --- tree links (filled by `tree::build`) ---
     /// Index of parent in `procs`, or [`NONE`] for roots.
@@ -104,6 +108,7 @@ impl ProcessEntry {
         start_time: 0,
         name: StringRef::EMPTY,
         cmdline: StringRef::EMPTY,
+        non_ascii: false,
         parent_idx: NONE,
         first_child: NONE,
         next_sibling: NONE,

@@ -11,12 +11,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use crossterm::{cursor, execute};
+use etch::Display;
 
 use crate::app::App;
 use crate::gather::{Ctrl, Gatherer, REFRESH_INTERVAL};
@@ -27,8 +26,7 @@ const UI_POLL: Duration = Duration::from_millis(200);
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = restore_terminal();
         original_hook(info);
     }));
 
@@ -45,14 +43,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = App::new(cell, tx.clone(), uid_names);
 
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+    let display = Display::new(io::stdout());
 
-    let result = run(&mut terminal, app);
+    let result = run(display, app);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    restore_terminal()?;
 
     let _ = tx.send(Ctrl::Quit);
     let _ = gather_handle.join();
@@ -60,25 +56,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    mut app: App,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn restore_terminal() -> io::Result<()> {
+    execute!(io::stdout(), cursor::Show, LeaveAlternateScreen)?;
+    disable_raw_mode()
+}
+
+fn run(mut display: Display<io::Stdout>, mut app: App) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = ui::columns();
     let mut dirty = true;
     loop {
-        let visible_height = terminal.size()?.height.saturating_sub(ui::CHROME_LINES) as usize;
+        let (width, height) = crossterm::terminal::size()?;
+        let visible_height = height.saturating_sub(ui::CHROME_LINES) as usize;
         if app.adjust_scroll(visible_height) {
             dirty = true;
         }
         if dirty {
-            terminal.draw(|frame| ui::render(frame, &app))?;
+            let mut frame = display.begin_frame(width, height);
+            ui::render(&mut frame, &app, &schema);
+            frame.commit()?;
             dirty = false;
         }
 
         if event::poll(UI_POLL)? {
             loop {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                if let Event::Key(key) = event::read()?
+                    && key.kind == KeyEventKind::Press
+                {
+                    match key.code {
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Up => app.move_up(),
                         KeyCode::Down => app.move_down(),
@@ -90,10 +94,9 @@ fn run(
                         KeyCode::Home => app.select_first(),
                         KeyCode::End => app.select_last(),
                         _ => {}
-                    },
-                    _ => {}
+                    }
+                    dirty = true;
                 }
-                dirty = true;
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }

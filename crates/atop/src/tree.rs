@@ -128,6 +128,7 @@ mod tests {
             start_time: 0,
             name: StringRef::EMPTY,
             cmdline: StringRef::EMPTY,
+            non_ascii: false,
             parent_idx: NONE,
             first_child: NONE,
             next_sibling: NONE,

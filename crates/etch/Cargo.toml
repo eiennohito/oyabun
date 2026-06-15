@@ -1,0 +1,15 @@
+[package]
+name = "etch"
+version = "0.1.0"
+edition = "2024"
+description = "Retained-mode terminal renderer: declare structure once, bind values per frame, re-emit only what changed."
+
+[lints]
+workspace = true
+
+[dependencies]
+crossterm = "0.28"
+unicode-width = "0.2"
+
+[dev-dependencies]
+vt100 = "0.16.2"

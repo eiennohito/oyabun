@@ -7,3 +7,6 @@ CLAUDE.local.md
 .claude/worktrees/
 /target
 __pycache__/
+# perf profiling dumps (perf record writes to CWD; rotates perf.data.old)
+/perf.data*
+/perf.stdio*

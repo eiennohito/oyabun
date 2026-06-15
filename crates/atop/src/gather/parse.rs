@@ -19,6 +19,8 @@ pub struct StatFields {
     pub start_time: u64,
     pub rss_pages: u64,
     pub comm: StringRef,
+    /// `comm` has a byte ≥ 0x80 (a process can set a non-ASCII name via `prctl`).
+    pub comm_non_ascii: bool,
 }
 
 impl StatFields {
@@ -36,6 +38,7 @@ impl StatFields {
         e.mem_bytes = self.rss_pages.saturating_mul(page_size);
         e.name = self.comm;
         e.uid = uid;
+        e.non_ascii = self.comm_non_ascii;
     }
 }
 
@@ -59,6 +62,7 @@ pub fn parse_stat(slot: &[u8], slot_offset: u32) -> Option<StatFields> {
         offset: slot_offset + (open + 1) as u32,
         len: (close - open - 1) as u32,
     };
+    let comm_non_ascii = slot[open + 1..close].iter().any(|&b| b >= 0x80);
 
     // Fields are single-space separated; ") " precedes the state char.
     let rest = slot.get(close + 2..)?;
@@ -88,6 +92,7 @@ pub fn parse_stat(slot: &[u8], slot_offset: u32) -> Option<StatFields> {
         start_time,
         rss_pages,
         comm,
+        comm_non_ascii,
     })
 }
 
@@ -118,20 +123,25 @@ fn parse_i8(b: &[u8]) -> Option<i8> {
 }
 
 /// Process raw `/proc/<pid>/cmdline` bytes in-place: replace NUL separators with
-/// spaces and trim trailing whitespace/NULs. Returns the usable byte length.
-pub fn clean_cmdline(buf: &mut [u8]) -> u32 {
+/// spaces and trim trailing whitespace/NULs. Returns the usable byte length and
+/// whether any byte is ≥ 0x80 (so the renderer enables unicode width for this row) —
+/// the non-ASCII check rides the NUL-replacement walk for free.
+pub fn clean_cmdline(buf: &mut [u8]) -> (u32, bool) {
     // Strip trailing NULs.
     let mut end = buf.len();
     while end > 0 && buf[end - 1] == 0 {
         end -= 1;
     }
-    // Replace internal NULs with spaces.
+    // Replace internal NULs with spaces; flag non-ASCII in the same pass.
+    let mut non_ascii = false;
     for b in &mut buf[..end] {
         if *b == 0 {
             *b = b' ';
+        } else if *b >= 0x80 {
+            non_ascii = true;
         }
     }
-    u32::try_from(end).unwrap_or(u32::MAX)
+    (u32::try_from(end).unwrap_or(u32::MAX), non_ascii)
 }
 
 fn parse_u64(b: &[u8]) -> Option<u64> {
@@ -212,14 +222,23 @@ mod tests {
     #[test]
     fn clean_cmdline_replaces_nuls_and_trims() {
         let mut buf = *b"/usr/bin/foo\0--bar\0--baz\0";
-        let len = clean_cmdline(&mut buf);
+        let (len, non_ascii) = clean_cmdline(&mut buf);
         assert_eq!(&buf[..len as usize], b"/usr/bin/foo --bar --baz");
+        assert!(!non_ascii);
     }
 
     #[test]
     fn clean_cmdline_empty() {
         let mut buf = [0u8; 4];
-        assert_eq!(clean_cmdline(&mut buf), 0);
-        assert_eq!(clean_cmdline(&mut []), 0);
+        assert_eq!(clean_cmdline(&mut buf), (0, false));
+        assert_eq!(clean_cmdline(&mut []), (0, false));
+    }
+
+    #[test]
+    fn clean_cmdline_flags_non_ascii() {
+        let mut buf = *b"/opt/\xe6\x97\xa5\xe6\x9c\xac/app\0--x\0";
+        let (len, non_ascii) = clean_cmdline(&mut buf);
+        assert!(non_ascii);
+        assert_eq!(&buf[..len as usize], "/opt/日本/app --x".as_bytes());
     }
 }

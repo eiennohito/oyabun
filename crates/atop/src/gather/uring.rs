@@ -299,7 +299,13 @@ impl UringBackend {
 
             let i = st.pid_idx as usize;
             if st.stat_ok && st.statx_ok {
-                let uid = statx[slot].stx_uid;
+                // Trust stx_uid only if the kernel actually returned it; otherwise it's
+                // still zero-initialised and would mislabel the process as root-owned.
+                let uid = if statx[slot].stx_mask & libc::STATX_UID != 0 {
+                    statx[slot].stx_uid
+                } else {
+                    u32::MAX
+                };
                 if let Some(f) =
                     parse::parse_stat(snap.strings.bytes(st.stat_off, st.stat_len), st.stat_off)
                 {
@@ -308,13 +314,14 @@ impl UringBackend {
             }
             if st.cmd_ok && st.cmd_len > 0 {
                 let buf = snap.strings.bytes_mut(st.cmd_off, st.cmd_len);
-                let clean_len = parse::clean_cmdline(buf);
+                let (clean_len, non_ascii) = parse::clean_cmdline(buf);
                 if clean_len > 0 {
                     snap.procs[i].cmdline = StringRef {
                         offset: st.cmd_off,
                         len: clean_len,
                     };
                 }
+                snap.procs[i].non_ascii |= non_ascii;
             }
             free_slots.push(u32::try_from(slot).unwrap_or(0));
             *completed += 1;

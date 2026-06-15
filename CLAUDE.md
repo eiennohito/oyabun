@@ -52,18 +52,28 @@ The goal is not to deliver 100% of the plan; it's to deliver 120% at better qual
 ```
 crates/       Rust workspace crates
   atop/src/
-    main.rs     terminal setup, thread spawn, UI event loop
+    main.rs     terminal setup, thread spawn, UI event loop (drives etch::Display)
     app.rs      UI-thread state: selection, collapse, cached display rows
-    ui.rs       ratatui rendering (system stats header, htop-style tree, collapsed summaries)
+    ui.rs       rendering via etch: column Schema + per-frame value binding; sys-stat
+                header, htop-style tree, Pct/Mem value-formatters (Display+Hash gates)
     snapshot.rs Snapshot / ProcessEntry / SystemStats (index-based, POD)
     arena.rs    HugePageBuf + StringRef (mmap/THP arena)
     tree.rs     index-based intrusive tree build + subtree aggregation
     sys.rs      sysconf, getdents64 enumeration, uid map, /proc/stat|meminfo|loadavg readers
     gather/     gatherer thread
       mod.rs    Gatherer, CpuTracker, Backend dispatch, double-buffer recycling
-      parse.rs  zero-copy /proc/<pid>/stat parse + cmdline cleanup
+      parse.rs  zero-copy /proc/<pid>/stat parse + cmdline cleanup (+ non_ascii flag)
       syscall.rs  open/read/fstat fallback backend (+ test oracle)
       uring.rs    io_uring backend (two linked chains per PID: stat+cmdline, + statx)
+  etch/src/     retained-mode, value-gated terminal renderer (no atop types)
+    lib.rs      public API: Display/Frame/Table/Row, Schema/ColSpec, Cell, Line, Style/Color
+    display.rs  Display + Frame/Table/Row builders + paint routines (the gate lives here)
+    schema.rs   ColSpec/Schema/Align — column geometry, precomputed x-offsets
+    cell.rs     Cell — width-tracked fill-column writer (ascii/glyph/unicode)
+    line.rs     Line — free-form styled spans, content-hash gated
+    hash.rs     GateHasher (FxHash) + gate()
+    style.rs    Style/Color (crossterm wrapper)
+    tests/integration.rs  vt100 render + gate tests (identical frame ⇒ 0 bytes)
 docs/
   ARCHITECTURE.md  how it's built — read before touching code
   GOALS.md         goals/constraints

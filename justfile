@@ -53,6 +53,14 @@ build-release: _require-cargo
 run *ARGS: _require-cargo
     @cargo run --release -- {{ ARGS }}
 
+# Build with profiling profile (frame pointers + full debug info)
+build-profiling: _require-cargo
+    @RUSTFLAGS="-C force-frame-pointers=yes" {{ _run }} build-profiling cargo build --workspace --profile profiling
+
+# Run with profiling profile
+run-profiling *ARGS: _require-cargo
+    @RUSTFLAGS="-C force-frame-pointers=yes" cargo run --profile profiling -- {{ ARGS }}
+
 # --- Pre-commit ---
 
 # Pre-commit checklist: format, lint, check, test

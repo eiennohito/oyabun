@@ -8,8 +8,8 @@ This describes how atop is actually built. For *why* (goals/constraints) see `GO
 
 Two OS threads, no async runtime:
 
-- **UI thread** (main): ratatui + crossterm event loop. Loads the current snapshot,
-  flattens the tree to display rows, renders, handles input.
+- **UI thread** (main): `etch` (retained renderer) + crossterm event loop. Loads the
+  current snapshot, flattens the tree to display rows, renders, handles input.
 - **Gatherer thread**: enumerates `/proc`, reads stat files, parses, computes CPU%,
   builds the tree, publishes the snapshot.
 
@@ -65,6 +65,7 @@ ProcessEntry {                       // Copy
   start_time,                        // (pid, start_time) = a unique incarnation
   name: StringRef,                   // offset+len into `strings` (comm)
   cmdline: StringRef,                // /proc/<pid>/cmdline (NUL→space), may be empty
+  non_ascii: bool,                   // comm|cmdline has a byte ≥0x80 → renderer unicode path
   parent_idx, first_child, next_sibling, subtree_size, depth,  // tree links
   subtree_cpu, subtree_mem           // inclusive aggregates for collapsed display
 }
@@ -158,6 +159,51 @@ The structural tree is collapse-independent. The **UI** flattens it to display r
 (`app::rebuild_rows`), skipping collapsed subtrees, only when the snapshot generation
 or the collapse set changes. Selection follows the selected PID across refreshes.
 
+## Rendering (`etch`)
+
+A separate workspace crate, `crates/etch/` — a **retained-mode, value-gated** terminal
+renderer with no atop domain types. It replaced ratatui, whose `Paragraph`/
+`LineTruncator` grapheme segmentation (≈43% of CPU) and blind 10k-cell `Buffer::diff`
+(≈22%) dominated profiles. Work is now proportional to what *changed*, not to screen
+size.
+
+Two-level API: **structure declared once, values bound per frame.**
+
+- A `Schema` of columns (`ColSpec::{right,left,fill}`) owns geometry — leading
+  separator + body width + alignment, with fixed-column x-offsets precomputed once. It
+  drives both the header and every body row (one source of column truth).
+- Per frame, `Display::begin_frame` → `Frame` exposes `line()` (free-form styled spans
+  for the stat header/footer), `header()` (titles from the schema), and `table()`.
+  Inside `table`, each `row(id, style, …)` binds columns: `r.field(value)` and
+  `r.fill(gate, closure)`.
+
+**The gate is the bound value itself.** `field<T: Display + Hash>(v)` hashes `v`
+(fast `FxHash`) and compares to the value that produced the cell's last output. On a
+match the `Display` impl is *never invoked* — zero formatting, zero output. Because the
+formatted value and the gated value are the same `T`, the gate can never drift from
+what's shown. The `fill` column (Command) takes an explicit gate + a closure that runs
+only on a miss; its gate is a **content hash of the cmdline bytes + tree prefix**, not
+the arena `StringRef` (arena offsets are not stable across snapshots, so the ref would
+mismatch every cycle).
+
+Per-row identity is the PID: same PID at the same screen line ⇒ per-cell gating; a
+different PID (scroll happened) ⇒ the whole row repaints. A style change (selection
+move, state-color change) also forces the row. Unoccupied rows below the table are
+blanked. A terminal-size change (or the first frame) clears the screen and repaints
+everything. All output is batched into one buffer and flushed once per `commit()`.
+
+ASCII is the fast path: 1 byte = 1 column, no grapheme work. The `Cell` writer tracks
+display width explicitly — `glyph(s, w)` for known-width tree connectors (`●├─│▾`),
+`ascii` for the common cmdline, and `unicode` (via `unicode-width`) only when
+`ProcessEntry::non_ascii` is set (the gatherer flags this for free during the byte
+walks that already scan comm/cmdline). Integration tests (`vt100`) assert both the
+rendered screen and that an unchanged frame emits **zero** bytes.
+
+Not yet done (deliberately deferred, measured first): terminal **scroll regions**
+(`CSI S`/`T`) so a ±1 scroll shifts the terminal's own buffer instead of repainting the
+visible window. The value-gated renderer already removed both ratatui hot spots; scroll
+regions are a pure optimization for the held-arrow case.
+
 ## CPU%
 
 Per-process CPU is a **per-core rate over real elapsed time** (`top`/`htop` "Irix
@@ -194,7 +240,11 @@ with a small hand-rolled `FxHash`-style hasher (`FxBuildHasher`), since the defa
 - `io-uring` 0.7 — thin, runtime-free wrapper over the raw ring (hand-rolling the
   ring setup is hundreds of lines of memory-ordering-critical unsafe).
 - `arc-swap` 1 — the lock-free snapshot cell.
-- `ratatui` / `crossterm` — TUI.
+- `etch` (workspace path crate) — the retained-mode renderer (see above). Depends on
+  `crossterm` (escape generation) and `unicode-width` (opt-in wide-char measurement);
+  dev-dep `vt100` for terminal-emulator-based render tests.
+- `crossterm` 0.28 — terminal setup (raw mode, alt screen) + input events; also etch's
+  output backend.
 - `libc` — syscalls. No `procfs` crate (it allocates and parses more than we need).
 
 ## Deviations from the original plan & known edges

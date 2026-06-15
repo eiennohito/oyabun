@@ -9,3 +9,12 @@ pedantic = { level = "warn", priority = -1 }
 debug = 1
 split-debuginfo = "packed"
 lto = "thin"
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = "none"
+lto = "thin"
+
+[profile.profiling.build-override]
+debug = true

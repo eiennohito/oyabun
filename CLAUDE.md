@@ -29,6 +29,7 @@ Before proposing a fix: what general capability does this case need? Does the sy
 
 ## Environment
 - **NEVER commit unless the user literally says "commit."** When committing, run `/precommit`.
+- **Commit to `main` directly** — no feature branches. No remote/PR workflow yet, so branches are pure overhead.
 - **Use `just`**, not raw commands. Never pipe `just` output through filters.
 
 ## Workflow
@@ -50,13 +51,28 @@ The goal is not to deliver 100% of the plan; it's to deliver 120% at better qual
 
 ```
 crates/       Rust workspace crates
-  atop/       Main binary — TUI process manager
-docs/         Documentation
-  plans/      Active work-in-progress plans
+  atop/src/
+    main.rs     terminal setup, thread spawn, UI event loop
+    app.rs      UI-thread state: selection, collapse, cached display rows
+    ui.rs       ratatui rendering
+    snapshot.rs Snapshot / ProcessEntry (index-based, POD)
+    arena.rs    HugePageBuf + StringRef (mmap/THP arena)
+    tree.rs     index-based intrusive tree build
+    sys.rs      sysconf, getdents64 enumeration, uid map
+    gather/     gatherer thread
+      mod.rs    Gatherer, CpuTracker, Backend dispatch, double-buffer recycling
+      parse.rs  zero-copy /proc/<pid>/stat parse
+      syscall.rs  open/read/fstat fallback backend (+ test oracle)
+      uring.rs    io_uring backend (linked direct-fd chain + ReadFixed + statx)
+docs/
+  ARCHITECTURE.md  how it's built — read before touching code
+  GOALS.md         goals/constraints
+  plans/           active work-in-progress plans
 ```
 
 ## Project Goals
 
-**atop** — a Rust CLI/TUI process manager. See `docs/GOALS.md` for full goals.
+**atop** — a Rust CLI/TUI process manager. See `docs/GOALS.md` for full goals and
+`docs/ARCHITECTURE.md` for the implemented design.
 Linux (io_uring + syscall fallback) and macOS (`sysctl`/`libproc`). Windows is not a goal.
 Core invariants: near-zero idle CPU, sub-ms input response, O(n) on process/core count, safe sudo escalation.

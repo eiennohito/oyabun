@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 
-use crate::snapshot::{ProcessEntry, Snapshot};
-use crate::sys::{ProcDir, clk_tck};
+use crate::snapshot::{ProcessEntry, Snapshot, SystemStats};
+use crate::sys::{self, ProcDir, RawCpuCounters, clk_tck};
 use crate::tree;
 use syscall::SyscallBackend;
 use uring::UringBackend;
@@ -76,6 +76,10 @@ struct CpuHistory {
     len: usize,
     sum_ticks: u64,
     sum_jiff: u64,
+    /// Cached peak rate (bp). Recomputed lazily only when the peak sample is evicted.
+    peak_bp: u32,
+    /// Ring index of the sample that produced `peak_bp` (or `usize::MAX` = dirty).
+    peak_at: usize,
     /// Tracker generation when last seen, for evicting vanished PIDs.
     seen_gen: u32,
 }
@@ -89,6 +93,8 @@ impl CpuHistory {
             len: 0,
             sum_ticks: 0,
             sum_jiff: 0,
+            peak_bp: 0,
+            peak_at: usize::MAX,
             seen_gen,
         }
     }
@@ -99,6 +105,7 @@ impl CpuHistory {
     }
 
     fn push(&mut self, ticks: u32, jiff: u32) {
+        let evicting_peak = self.len == CPU_WINDOW && self.next == self.peak_at;
         if self.len == CPU_WINDOW {
             let evicted = self.samples[self.next];
             self.sum_ticks -= u64::from(evicted.ticks);
@@ -106,10 +113,20 @@ impl CpuHistory {
         } else {
             self.len += 1;
         }
-        self.samples[self.next] = Sample { ticks, jiff };
+        let idx = self.next;
+        self.samples[idx] = Sample { ticks, jiff };
         self.sum_ticks += u64::from(ticks);
         self.sum_jiff += u64::from(jiff);
         self.next = (self.next + 1) % CPU_WINDOW;
+
+        let new_rate = rate(u64::from(ticks), u64::from(jiff));
+        if new_rate >= self.peak_bp {
+            self.peak_bp = new_rate;
+            self.peak_at = idx;
+        } else if evicting_peak {
+            // The old peak was just evicted — rescan to find the new max.
+            self.peak_at = usize::MAX;
+        }
     }
 
     /// Sum-weighted moving average over the window (exact integer math).
@@ -117,13 +134,24 @@ impl CpuHistory {
         rate(self.sum_ticks, self.sum_jiff)
     }
 
-    /// Max single-interval rate still in the window.
-    fn peak(&self) -> u32 {
-        self.samples[..self.len]
-            .iter()
-            .map(|s| rate(u64::from(s.ticks), u64::from(s.jiff)))
-            .max()
-            .unwrap_or(0)
+    /// Max single-interval rate still in the window. O(1) in the common case;
+    /// O(`CPU_WINDOW`) only when the previous peak sample is evicted (~1/window).
+    fn peak(&mut self) -> u32 {
+        if self.peak_at == usize::MAX {
+            // Dirty: rescan.
+            let (mut best, mut best_at) = (0u32, 0usize);
+            for i in 0..self.len {
+                let s = &self.samples[i];
+                let r = rate(u64::from(s.ticks), u64::from(s.jiff));
+                if r >= best {
+                    best = r;
+                    best_at = i;
+                }
+            }
+            self.peak_bp = best;
+            self.peak_at = best_at;
+        }
+        self.peak_bp
     }
 }
 
@@ -214,7 +242,7 @@ impl CpuTracker {
                 self.last = Some(now);
             }
             for p in procs.iter_mut() {
-                match self.hist.get(&p.pid) {
+                match self.hist.get_mut(&p.pid) {
                     Some(h) => {
                         p.cpu_pct = h.avg();
                         p.cpu_peak = h.peak();
@@ -274,6 +302,51 @@ fn rate(ticks: u64, jiff: u64) -> u32 {
     u32::try_from(ticks.saturating_mul(10000) / jiff).unwrap_or(u32::MAX)
 }
 
+/// Tracks cumulative `/proc/stat` CPU counters to compute deltas.
+struct SysCpuAccum {
+    prev: Option<RawCpuCounters>,
+    num_cores: u32,
+}
+
+impl SysCpuAccum {
+    fn new() -> Self {
+        Self {
+            prev: None,
+            num_cores: sys::num_cpus(),
+        }
+    }
+
+    /// Read current counters, compute basis-point rates from the delta, and fill
+    /// `sys` with CPU + memory + load stats. The first call baselines only.
+    fn update(&mut self, sys: &mut SystemStats) {
+        let cur = sys::read_cpu_counters();
+        if let Some(prev) = &self.prev {
+            let d_user = cur.user.wrapping_sub(prev.user) + cur.nice.wrapping_sub(prev.nice);
+            let d_sys = cur.system.wrapping_sub(prev.system)
+                + cur.irq.wrapping_sub(prev.irq)
+                + cur.softirq.wrapping_sub(prev.softirq);
+            let d_iowait = cur.iowait.wrapping_sub(prev.iowait);
+            let d_total = cur.total().wrapping_sub(prev.total()).max(1);
+
+            sys.cpu_user_bp = u32::try_from(d_user * 10000 / d_total).unwrap_or(u32::MAX);
+            sys.cpu_sys_bp = u32::try_from(d_sys * 10000 / d_total).unwrap_or(u32::MAX);
+            sys.cpu_iowait_bp = u32::try_from(d_iowait * 10000 / d_total).unwrap_or(u32::MAX);
+        }
+        self.prev = Some(cur);
+        sys.num_cores = self.num_cores;
+
+        let mem = sys::read_meminfo();
+        sys.mem_total = mem.total;
+        sys.mem_used = mem.total.saturating_sub(mem.available);
+        sys.mem_cached = mem.buffers.saturating_add(mem.cached);
+        sys.swap_total = mem.swap_total;
+        sys.swap_used = mem.swap_total.saturating_sub(mem.swap_free);
+
+        sys.load = sys::read_loadavg();
+        sys.uptime_secs = sys::read_uptime_secs();
+    }
+}
+
 enum Backend {
     Uring(Box<UringBackend>),
     Syscall(SyscallBackend),
@@ -288,8 +361,8 @@ impl Backend {
     ) -> std::io::Result<()> {
         match self {
             Backend::Uring(u) => u.collect(pids, snap, page_size),
-            Backend::Syscall(_) => {
-                SyscallBackend::collect(pids, snap, page_size);
+            Backend::Syscall(s) => {
+                s.collect(pids, snap, page_size);
                 Ok(())
             }
         }
@@ -304,6 +377,7 @@ pub struct Gatherer {
     pids: Vec<u32>,
     dent_buf: Vec<u8>,
     cpu: CpuTracker,
+    sys_cpu: SysCpuAccum,
     tree_stack: Vec<u32>,
     tree_order: Vec<u32>,
     page_size: u64,
@@ -331,6 +405,7 @@ impl Gatherer {
             pids: Vec::new(),
             dent_buf: vec![0u8; 64 * 1024],
             cpu: CpuTracker::new(clk_tck()),
+            sys_cpu: SysCpuAccum::new(),
             tree_stack: Vec::new(),
             tree_order: Vec::new(),
             page_size,
@@ -367,7 +442,8 @@ impl Gatherer {
         };
         let snap = Arc::get_mut(&mut arc).expect("recycled buffer is unique");
 
-        let needed = self.pids.len() * SLOT_SIZE;
+        // 2 arena slots per PID: stat + cmdline.
+        let needed = self.pids.len() * SLOT_SIZE * 2;
         Self::prepare(snap, &self.pids, needed, &mut self.backend);
 
         if self
@@ -384,6 +460,12 @@ impl Gatherer {
         snap.compact();
         self.cpu.update(&mut snap.procs, now);
         snap.first_root = tree::build(&mut snap.procs, &mut self.tree_stack, &mut self.tree_order);
+        tree::aggregate(&mut snap.procs, &self.tree_order);
+
+        // System-wide stats (tiny reads, ~3 μs total).
+        self.sys_cpu.update(&mut snap.sys);
+        snap.count_tasks();
+
         self.generation += 1;
         snap.generation = self.generation;
 
@@ -393,12 +475,15 @@ impl Gatherer {
 
     /// Reset and pre-size the snapshot, re-registering the `io_uring` buffer if it
     /// grew (moved). Seeds tombstones for every PID in sorted order.
+    ///
+    /// `reserve` MUST happen before any `alloc` or `io_uring` submission that targets
+    /// this buffer — a grow relocates the mapping and would invalidate registered
+    /// buffer pointers and in-flight read destinations.
     fn prepare(snap: &mut Snapshot, pids: &[u32], needed: usize, backend: &mut Backend) {
         snap.reset();
         for &pid in pids {
             snap.push_tombstone(pid);
         }
-        // Only the io_uring backend pins a registered buffer that must follow a grow.
         if snap.strings.reserve(needed)
             && let Backend::Uring(u) = backend
         {
@@ -520,7 +605,7 @@ mod tests {
             a.push_tombstone(pid);
         }
         a.strings.reserve(pids.len() * SLOT_SIZE);
-        SyscallBackend::collect(&pids, &mut a, page_size);
+        SyscallBackend.collect(&pids, &mut a, page_size);
         a.compact();
 
         for &pid in &pids {

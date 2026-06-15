@@ -149,9 +149,17 @@ impl HugePageBuf {
 
     pub fn bytes(&self, offset: u32, len: u32) -> &[u8] {
         let (offset, len) = (offset as usize, len as usize);
-        debug_assert!(offset + len <= self.capacity);
-        // SAFETY: range bounded by capacity; bytes were written before publish.
+        assert!(offset + len <= self.capacity, "StringRef out of bounds");
+        // SAFETY: range bounded by capacity (checked above); bytes were written before publish.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
+    }
+
+    /// Mutable byte slice — only valid while the gatherer holds unique access.
+    pub fn bytes_mut(&mut self, offset: u32, len: u32) -> &mut [u8] {
+        let (offset, len) = (offset as usize, len as usize);
+        assert!(offset + len <= self.capacity, "StringRef out of bounds");
+        // SAFETY: range bounded by capacity (checked above); exclusive access via &mut self.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(offset), len) }
     }
 
     pub fn get(&self, sref: StringRef) -> &[u8] {

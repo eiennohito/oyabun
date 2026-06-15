@@ -18,6 +18,186 @@ pub fn clk_tck() -> u64 {
     u64::try_from(v).unwrap_or(100).max(1)
 }
 
+pub fn num_cpus() -> u32 {
+    // SAFETY: sysconf with a valid name.
+    let v = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    u32::try_from(v).unwrap_or(1).max(1)
+}
+
+// ---------------------------------------------------------------------------
+// System-wide stat readers (tiny files, read into stack buffers)
+// ---------------------------------------------------------------------------
+
+/// Read a small procfs file into a stack buffer. Returns the valid slice.
+fn read_proc_file<const N: usize>(path: *const libc::c_char, buf: &mut [u8; N]) -> &[u8] {
+    // SAFETY: valid C path, read-only.
+    let fd = unsafe { libc::open(path, libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return &[];
+    }
+    // SAFETY: buf is a valid writable region.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), N) };
+    unsafe { libc::close(fd) };
+    if n <= 0 {
+        return &[];
+    }
+    &buf[..usize::try_from(n).unwrap_or(0).min(N)]
+}
+
+/// Cumulative CPU jiffies from the aggregate `cpu` line of `/proc/stat`.
+#[derive(Clone, Copy, Default)]
+pub struct RawCpuCounters {
+    pub user: u64,
+    pub nice: u64,
+    pub system: u64,
+    pub idle: u64,
+    pub iowait: u64,
+    pub irq: u64,
+    pub softirq: u64,
+    pub steal: u64,
+}
+
+impl RawCpuCounters {
+    pub fn total(&self) -> u64 {
+        self.user
+            + self.nice
+            + self.system
+            + self.idle
+            + self.iowait
+            + self.irq
+            + self.softirq
+            + self.steal
+    }
+}
+
+/// Parse the first (`cpu`) line of `/proc/stat`.
+pub fn read_cpu_counters() -> RawCpuCounters {
+    let mut buf = [0u8; 512];
+    let data = read_proc_file(c"/proc/stat".as_ptr(), &mut buf);
+    // First line: "cpu  <user> <nice> <sys> <idle> <iowait> <irq> <softirq> <steal> ..."
+    let line = data.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let mut it = line.split(|&b| b == b' ').filter(|f| !f.is_empty());
+    it.next(); // skip "cpu"
+    let mut n = || it.next().and_then(parse_u64_bytes).unwrap_or(0);
+    let user = n();
+    let nice = n();
+    let system = n();
+    let idle = n();
+    let iowait = n();
+    let irq = n();
+    let softirq = n();
+    let steal = n();
+    RawCpuCounters {
+        user,
+        nice,
+        system,
+        idle,
+        iowait,
+        irq,
+        softirq,
+        steal,
+    }
+}
+
+/// Memory stats from `/proc/meminfo` (bytes).
+#[derive(Clone, Copy, Default)]
+pub struct MemInfo {
+    pub total: u64,
+    pub available: u64,
+    pub buffers: u64,
+    pub cached: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
+}
+
+pub fn read_meminfo() -> MemInfo {
+    let mut buf = [0u8; 2048];
+    let data = read_proc_file(c"/proc/meminfo".as_ptr(), &mut buf);
+    let mut info = MemInfo::default();
+    for line in data.split(|&b| b == b'\n') {
+        let Some((key, val)) = meminfo_line(line) else {
+            continue;
+        };
+        // Values in /proc/meminfo are in kB (1024 bytes).
+        let bytes = val.saturating_mul(1024);
+        match key {
+            b"MemTotal" => info.total = bytes,
+            b"MemAvailable" => info.available = bytes,
+            b"Buffers" => info.buffers = bytes,
+            b"Cached" => info.cached = bytes,
+            b"SwapTotal" => info.swap_total = bytes,
+            b"SwapFree" => info.swap_free = bytes,
+            _ => {}
+        }
+    }
+    info
+}
+
+/// Parse `"Key:    1234 kB\n"` → `(key, value_in_kB)`.
+fn meminfo_line(line: &[u8]) -> Option<(&[u8], u64)> {
+    let colon = line.iter().position(|&b| b == b':')?;
+    let key = &line[..colon];
+    let rest = &line[colon + 1..];
+    let num = rest
+        .split(|&b| b == b' ')
+        .find(|f| !f.is_empty())
+        .and_then(parse_u64_bytes)?;
+    Some((key, num))
+}
+
+/// Load averages × 100 and uptime in seconds.
+pub fn read_loadavg() -> [u32; 3] {
+    let mut buf = [0u8; 128];
+    let data = read_proc_file(c"/proc/loadavg".as_ptr(), &mut buf);
+    let mut fields = data.split(|&b| b == b' ');
+    let parse_load = |f: Option<&[u8]>| -> u32 {
+        let s = f.unwrap_or(&[]);
+        // "1.23" → 123
+        let dot = s.iter().position(|&b| b == b'.').unwrap_or(s.len());
+        let whole = parse_u64_bytes(&s[..dot]).unwrap_or(0);
+        let frac_bytes = s.get(dot + 1..).unwrap_or(&[]);
+        let digit = |b: u8| {
+            if b.is_ascii_digit() {
+                u64::from(b - b'0')
+            } else {
+                0
+            }
+        };
+        let d0 = frac_bytes.first().copied().unwrap_or(b'0');
+        let d1 = frac_bytes.get(1).copied().unwrap_or(b'0');
+        let frac = digit(d0) * 10 + digit(d1);
+        u32::try_from(whole * 100 + frac).unwrap_or(u32::MAX)
+    };
+    [
+        parse_load(fields.next()),
+        parse_load(fields.next()),
+        parse_load(fields.next()),
+    ]
+}
+
+pub fn read_uptime_secs() -> u64 {
+    let mut buf = [0u8; 64];
+    let data = read_proc_file(c"/proc/uptime".as_ptr(), &mut buf);
+    // "12345.67 ..."
+    let field = data.split(|&b| b == b' ').next().unwrap_or(&[]);
+    let dot = field.iter().position(|&b| b == b'.').unwrap_or(field.len());
+    parse_u64_bytes(&field[..dot]).unwrap_or(0)
+}
+
+fn parse_u64_bytes(b: &[u8]) -> Option<u64> {
+    if b.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
+    }
+    Some(n)
+}
+
 /// Kernel `PID_MAX_LIMIT` (2^22 on 64-bit). A real PID never exceeds it; used to
 /// reject a pathologically long numeric dirent name that would otherwise wrap.
 const PID_MAX_LIMIT: u32 = 1 << 22;
@@ -37,7 +217,7 @@ impl ProcPath {
     pub fn write(&mut self, pid: u32, suffix: &[u8]) -> *const libc::c_char {
         let buf = &mut self.0;
         // "/proc/" (6) + up to 10 PID digits + "/" (1) + NUL (1) + suffix.
-        debug_assert!(
+        assert!(
             6 + 10 + 1 + 1 + suffix.len() <= buf.len(),
             "proc path overflow"
         );
@@ -83,9 +263,12 @@ fn write_u32(buf: &mut [u8], v: u32) -> usize {
 }
 
 /// Send `sig` to `pid` **only if it is still the same process incarnation** — i.e.
-/// `/proc/<pid>/stat`'s start-time still matches `start_time`. Race-free: a pidfd
-/// pins the current occupant of `pid`, identity is re-checked, then the signal goes
-/// through the pidfd (never a reused PID). Returns whether the signal was sent.
+/// `/proc/<pid>/stat`'s start-time still matches `start_time`. Race-safe: the signal
+/// goes through the pidfd (anchored to the kernel `task_struct`, not the PID number),
+/// so even if the PID is recycled between `pidfd_open` and the `start_time` check,
+/// `pidfd_send_signal` targets the original (now-dead) process and harmlessly fails
+/// with ESRCH. The `start_time` check prevents signaling a process that exited and
+/// was replaced — the pidfd makes it safe, the `start_time` makes it correct.
 pub fn kill_verified(pid: u32, start_time: u64, sig: i32) -> bool {
     let Ok(pid_arg) = libc::pid_t::try_from(pid) else {
         return false;
@@ -117,6 +300,10 @@ pub fn kill_verified(pid: u32, start_time: u64, sig: i32) -> bool {
 
 /// Field 22 of `/proc/<pid>/stat` — process start time (jiffies since boot), the
 /// discriminator that distinguishes PID reuse. `None` if the PID is gone.
+///
+/// Intentionally duplicates the field-22 parse from `gather::parse::parse_stat` —
+/// `sys` is a low-level module that must not depend on `gather`, and this path uses
+/// a small stack buffer rather than the arena.
 fn process_start_time(pid: u32) -> Option<u64> {
     let mut path = ProcPath::new();
     let ptr = path.write(pid, b"stat");
@@ -293,6 +480,33 @@ mod tests {
         let a = process_start_time(me).expect("own start time");
         let b = process_start_time(me).expect("own start time");
         assert_eq!(a, b, "start time must be constant for a live process");
+    }
+
+    #[test]
+    fn cpu_counters_are_nonzero() {
+        let c = read_cpu_counters();
+        assert!(c.total() > 0, "total jiffies must be > 0");
+        assert!(c.idle > 0, "idle jiffies should be > 0 on a live system");
+    }
+
+    #[test]
+    fn meminfo_has_total() {
+        let m = read_meminfo();
+        assert!(m.total > 0, "MemTotal must be > 0");
+        assert!(m.available > 0, "MemAvailable must be > 0");
+        assert!(m.available <= m.total);
+    }
+
+    #[test]
+    fn loadavg_parses() {
+        let l = read_loadavg();
+        // On any live system, load average is some positive number.
+        assert!(l[0] > 0 || l[1] > 0 || l[2] > 0, "all loads zero?");
+    }
+
+    #[test]
+    fn uptime_positive() {
+        assert!(read_uptime_secs() > 0);
     }
 
     #[test]

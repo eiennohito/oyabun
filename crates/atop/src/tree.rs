@@ -78,6 +78,26 @@ pub fn build(procs: &mut [ProcessEntry], stack: &mut Vec<u32>, order: &mut Vec<u
     first_root
 }
 
+/// Compute inclusive subtree aggregates (`subtree_cpu`, `subtree_mem`) via the same
+/// reverse-pre-order pass. Must be called after `build` and after CPU% /
+/// `mem_bytes` are finalized. `order` is the pre-order from `build`.
+pub fn aggregate(procs: &mut [ProcessEntry], order: &[u32]) {
+    // Initialize to self, then accumulate children bottom-up.
+    for &iu in order {
+        let i = iu as usize;
+        procs[i].subtree_cpu = procs[i].cpu_pct;
+        procs[i].subtree_mem = procs[i].mem_bytes;
+    }
+    for &iu in order.iter().rev() {
+        let i = iu as usize;
+        if procs[i].parent_idx != NONE {
+            let p = procs[i].parent_idx as usize;
+            procs[p].subtree_cpu = procs[p].subtree_cpu.saturating_add(procs[i].subtree_cpu);
+            procs[p].subtree_mem = procs[p].subtree_mem.saturating_add(procs[i].subtree_mem);
+        }
+    }
+}
+
 /// Push a sibling chain (head + its `next_sibling`s) onto the DFS stack.
 fn push_chain(procs: &[ProcessEntry], head: u32, stack: &mut Vec<u32>) {
     let mut c = head;
@@ -98,17 +118,23 @@ mod tests {
             ppid: parent,
             uid: 0,
             state: b'S',
+            priority: 20,
+            nice: 0,
+            num_threads: 1,
             cpu_pct: 0,
             cpu_peak: 0,
             mem_bytes: 0,
             ticks: 0,
             start_time: 0,
             name: StringRef::EMPTY,
+            cmdline: StringRef::EMPTY,
             parent_idx: NONE,
             first_child: NONE,
             next_sibling: NONE,
             subtree_size: 0,
             depth: 0,
+            subtree_cpu: 0,
+            subtree_mem: 0,
         }
     }
 
@@ -191,5 +217,35 @@ mod tests {
         assert_eq!(order, vec![1, 50]);
         let by_pid = |pid: u32| procs.iter().find(|p| p.pid == pid).unwrap();
         assert_eq!(by_pid(50).parent_idx, NONE);
+    }
+
+    #[test]
+    fn aggregate_sums_subtree() {
+        // 1 → {10 → {100}, 11}
+        // Set cpu/mem values on each node.
+        let mut procs = vec![proc(1, 0), proc(10, 1), proc(11, 1), proc(100, 10)];
+        procs[0].cpu_pct = 100;
+        procs[0].mem_bytes = 1000;
+        procs[1].cpu_pct = 200;
+        procs[1].mem_bytes = 2000;
+        procs[2].cpu_pct = 300;
+        procs[2].mem_bytes = 3000;
+        procs[3].cpu_pct = 400;
+        procs[3].mem_bytes = 4000;
+
+        let (mut s, mut o) = (Vec::new(), Vec::new());
+        build(&mut procs, &mut s, &mut o);
+        aggregate(&mut procs, &o);
+
+        let by_pid = |pid: u32| procs.iter().find(|p| p.pid == pid).unwrap();
+        // Root: 100 + 200 + 300 + 400 = 1000
+        assert_eq!(by_pid(1).subtree_cpu, 1000);
+        assert_eq!(by_pid(1).subtree_mem, 10000);
+        // PID 10: 200 + 400 = 600
+        assert_eq!(by_pid(10).subtree_cpu, 600);
+        assert_eq!(by_pid(10).subtree_mem, 6000);
+        // Leaves: just themselves.
+        assert_eq!(by_pid(11).subtree_cpu, 300);
+        assert_eq!(by_pid(100).subtree_cpu, 400);
     }
 }

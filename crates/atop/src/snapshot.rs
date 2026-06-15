@@ -10,6 +10,33 @@ use crate::arena::{HugePageBuf, StringRef};
 /// Sentinel index meaning "none" for tree links and roots.
 pub const NONE: u32 = u32::MAX;
 
+/// System-wide resource snapshot, computed once per gather cycle.
+#[derive(Clone, Copy, Default)]
+pub struct SystemStats {
+    /// CPU user+nice as fraction of total, basis points (10000 = 100%).
+    pub cpu_user_bp: u32,
+    /// CPU system+irq+softirq, basis points.
+    pub cpu_sys_bp: u32,
+    /// CPU iowait, basis points.
+    pub cpu_iowait_bp: u32,
+    pub mem_total: u64,
+    /// `total - available` (what's actively used by processes).
+    pub mem_used: u64,
+    /// Buffers + Cached (reclaimable page cache).
+    pub mem_cached: u64,
+    pub swap_total: u64,
+    pub swap_used: u64,
+    /// Load averages × 100 (e.g. 215 = 2.15). Index 0/1/2 = 1/5/15 min.
+    pub load: [u32; 3],
+    pub uptime_secs: u64,
+    pub num_cores: u32,
+    pub tasks_running: u32,
+    pub tasks_sleeping: u32,
+    pub tasks_stopped: u32,
+    pub tasks_zombie: u32,
+    pub tasks_idle: u32,
+}
+
 /// Per-process record. POD — `Vec::clear` drops nothing, enabling zero-alloc reuse.
 #[derive(Clone, Copy)]
 pub struct ProcessEntry {
@@ -18,6 +45,12 @@ pub struct ProcessEntry {
     pub uid: u32,
     /// Process state char (`R`, `S`, `Z`, …) as a raw byte.
     pub state: u8,
+    /// Kernel scheduling priority (lower = higher priority). Normal: 20+nice.
+    pub priority: i8,
+    /// Nice value (−20 … 19). User-controllable scheduling hint.
+    pub nice: i8,
+    /// Thread count (`num_threads` from `/proc/<pid>/stat`).
+    pub num_threads: u32,
     /// Moving-average CPU% in basis points (hundredths of a percent); 10000 = one
     /// full core. Stable reading over the recent sample window.
     pub cpu_pct: u32,
@@ -33,6 +66,9 @@ pub struct ProcessEntry {
     pub start_time: u64,
     /// `comm` (process name), pointing into [`Snapshot::strings`].
     pub name: StringRef,
+    /// Full `/proc/<pid>/cmdline` (NUL→space), pointing into [`Snapshot::strings`].
+    /// Empty for kernel threads and inaccessible processes.
+    pub cmdline: StringRef,
 
     // --- tree links (filled by `tree::build`) ---
     /// Index of parent in `procs`, or [`NONE`] for roots.
@@ -43,6 +79,12 @@ pub struct ProcessEntry {
     pub subtree_size: u32,
     /// Distance from a root (0 = root).
     pub depth: u16,
+
+    // --- subtree aggregates (filled by `tree::aggregate`) ---
+    /// `cpu_pct` of self + all descendants (for collapsed-group display).
+    pub subtree_cpu: u32,
+    /// `mem_bytes` of self + all descendants.
+    pub subtree_mem: u64,
 }
 
 impl ProcessEntry {
@@ -52,17 +94,23 @@ impl ProcessEntry {
         ppid: 0,
         uid: 0,
         state: b'?',
+        priority: 0,
+        nice: 0,
+        num_threads: 0,
         cpu_pct: 0,
         cpu_peak: 0,
         mem_bytes: 0,
         ticks: 0,
         start_time: 0,
         name: StringRef::EMPTY,
+        cmdline: StringRef::EMPTY,
         parent_idx: NONE,
         first_child: NONE,
         next_sibling: NONE,
         subtree_size: 0,
         depth: 0,
+        subtree_cpu: 0,
+        subtree_mem: 0,
     };
 
     /// A slot is a tombstone (read failed / PID vanished) iff `pid == 0`. Linux never
@@ -82,6 +130,8 @@ pub struct Snapshot {
     /// Stable `io_uring` registered-buffer index for `strings` (one per physical
     /// buffer in the double-buffer pool). Ignored by the syscall backend.
     pub buf_index: u16,
+    /// System-wide stats collected this cycle.
+    pub sys: SystemStats,
 }
 
 impl Snapshot {
@@ -92,6 +142,7 @@ impl Snapshot {
             first_root: NONE,
             generation: 0,
             buf_index,
+            sys: SystemStats::default(),
         }
     }
 
@@ -117,5 +168,24 @@ impl Snapshot {
     /// Drop vanished PIDs, preserving order (PIDs were enumerated sorted).
     pub fn compact(&mut self) {
         self.procs.retain(|p| !p.is_tombstone());
+    }
+
+    /// Tally process states into `sys.tasks_*`.
+    pub fn count_tasks(&mut self) {
+        let (mut run, mut slp, mut stp, mut zmb, mut idl) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        for p in &self.procs {
+            match p.state {
+                b'R' => run += 1,
+                b'T' | b't' => stp += 1,
+                b'Z' | b'X' => zmb += 1,
+                b'I' | b'D' => idl += 1,
+                _ => slp += 1,
+            }
+        }
+        self.sys.tasks_running = run;
+        self.sys.tasks_sleeping = slp;
+        self.sys.tasks_stopped = stp;
+        self.sys.tasks_zombie = zmb;
+        self.sys.tasks_idle = idl;
     }
 }

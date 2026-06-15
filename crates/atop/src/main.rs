@@ -66,7 +66,7 @@ fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut dirty = true;
     loop {
-        let visible_height = terminal.size()?.height.saturating_sub(2) as usize;
+        let visible_height = terminal.size()?.height.saturating_sub(ui::CHROME_LINES) as usize;
         if app.adjust_scroll(visible_height) {
             dirty = true;
         }

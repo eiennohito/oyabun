@@ -54,16 +54,16 @@ crates/       Rust workspace crates
   atop/src/
     main.rs     terminal setup, thread spawn, UI event loop
     app.rs      UI-thread state: selection, collapse, cached display rows
-    ui.rs       ratatui rendering
-    snapshot.rs Snapshot / ProcessEntry (index-based, POD)
+    ui.rs       ratatui rendering (system stats header, htop-style tree, collapsed summaries)
+    snapshot.rs Snapshot / ProcessEntry / SystemStats (index-based, POD)
     arena.rs    HugePageBuf + StringRef (mmap/THP arena)
-    tree.rs     index-based intrusive tree build
-    sys.rs      sysconf, getdents64 enumeration, uid map
+    tree.rs     index-based intrusive tree build + subtree aggregation
+    sys.rs      sysconf, getdents64 enumeration, uid map, /proc/stat|meminfo|loadavg readers
     gather/     gatherer thread
       mod.rs    Gatherer, CpuTracker, Backend dispatch, double-buffer recycling
-      parse.rs  zero-copy /proc/<pid>/stat parse
+      parse.rs  zero-copy /proc/<pid>/stat parse + cmdline cleanup
       syscall.rs  open/read/fstat fallback backend (+ test oracle)
-      uring.rs    io_uring backend (linked direct-fd chain + ReadFixed + statx)
+      uring.rs    io_uring backend (two linked chains per PID: stat+cmdline, + statx)
 docs/
   ARCHITECTURE.md  how it's built — read before touching code
   GOALS.md         goals/constraints

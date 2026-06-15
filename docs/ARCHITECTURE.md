@@ -49,13 +49,24 @@ allocation. `Vec::clear` drops nothing, so reset is O(1).
 
 ```
 Snapshot { procs: Vec<ProcessEntry>, strings: HugePageBuf, first_root: u32,
-           generation: u64, buf_index: u16 }
+           generation: u64, buf_index: u16, sys: SystemStats }
+
+SystemStats {                        // Copy, per-cycle system-wide stats
+  cpu_user_bp, cpu_sys_bp, cpu_iowait_bp,   // CPU deltas as basis points
+  mem_total, mem_used, mem_cached,           // bytes
+  swap_total, swap_used,                     // bytes
+  load: [u32; 3], uptime_secs, num_cores,
+  tasks_running, tasks_sleeping, tasks_stopped, tasks_zombie, tasks_idle
+}
 
 ProcessEntry {                       // Copy
-  pid, ppid, uid, state(u8), cpu_pct(bp), cpu_peak(bp), mem_bytes, ticks,
+  pid, ppid, uid, state(u8), priority(i8), nice(i8), num_threads,
+  cpu_pct(bp), cpu_peak(bp), mem_bytes, ticks,
   start_time,                        // (pid, start_time) = a unique incarnation
-  name: StringRef,                   // offset+len into `strings`
-  parent_idx, first_child, next_sibling, subtree_size, depth   // tree links
+  name: StringRef,                   // offset+len into `strings` (comm)
+  cmdline: StringRef,                // /proc/<pid>/cmdline (NUL→space), may be empty
+  parent_idx, first_child, next_sibling, subtree_size, depth,  // tree links
+  subtree_cpu, subtree_mem           // inclusive aggregates for collapsed display
 }
 StringRef { offset: u32, len: u32 }  // slice of `strings`
 ```
@@ -99,17 +110,19 @@ mid-run the gatherer permanently downgrades to syscall and redoes the cycle. The
 
 ### io_uring backend
 
-Per PID, one linked chain + an independent statx, identified by `user_data =
-(slot << 2) | op`:
+Per PID, two linked chains + an independent statx (7 SQEs, 7 CQEs), identified by
+`user_data = (slot << 2) | op`:
 
 ```
-OpenAt(direct slot) -[IO_LINK]-> ReadFixed(slot → arena) -[IO_HARDLINK]-> Close(slot)
+OpenAt(/stat, fd=2s)    -[IO_LINK]-> ReadFixed(→ arena) -[IO_HARDLINK]-> Close(fd=2s)
+OpenAt(/cmdline, fd=2s+1) -[IO_LINK]-> ReadFixed(→ arena) -[IO_HARDLINK]-> Close(fd=2s+1)
 Statx(→ uid)
 ```
 
 - **Direct descriptors**: `OpenAt` installs into a registered fixed-file slot
-  (`register_files_sparse`), so `ReadFixed`/`Close` can target it within the same
-  linked submission without learning the fd at runtime.
+  (`register_files_sparse(n_slots * 2)`), so `ReadFixed`/`Close` can target it
+  within the same linked submission without learning the fd at runtime. Two fd slots
+  per PID (stat + cmdline).
 - **Registered buffers**: both snapshot arenas are registered (`register_buffers`)
   at stable indices 0/1 = `Snapshot::buf_index`; `ReadFixed` skips the per-read
   page-table walk. Re-registered only when an arena grows.
@@ -117,14 +130,17 @@ Statx(→ uid)
   (read/close return `ECANCELED`) — handled, PID left as tombstone.
 - **`IO_HARDLINK` on read**: guarantees `Close` runs even if the read errors after a
   successful open, so an installed direct descriptor is never leaked.
+- **Two arena slots per PID**: stat text + cmdline text, each `SLOT_SIZE` (2 KiB).
+  Cmdline bytes are processed in-place after the read (NUL → space) and stored
+  as a `StringRef`.
 - **Bounded in-flight + slot free-list** (not fixed waves): keep filling the SQ while
   slots are free, then reap completed PIDs and parse them — so the kernel reads the
   next PIDs *while the CPU parses the last ones* (continuous I/O↔parse overlap). A PID
-  is parsed once all four of its CQEs land; its slot returns to the free-list after
-  `Close`. uid comes from the statx result (`stx_uid`).
+  is parsed once all seven of its CQEs land; its slot returns to the free-list after
+  both `Close` ops. uid comes from the statx result (`stx_uid`).
 
-`N_SLOTS=512` concurrent PIDs, `RING_ENTRIES=4096` (4 SQEs/PID). `submit_and_wait`
-retries on `EINTR`.
+`N_SLOTS=512` concurrent PIDs, `RING_ENTRIES=4096` (7 SQEs/PID × 512 = 3584, fits).
+`submit_and_wait` retries on `EINTR`.
 
 ## Tree build
 
@@ -133,6 +149,10 @@ reverse-index prepend (yields PID-ascending siblings), no `HashMap`/per-node `Ve
 One pre-order pass assigns `depth` and records order; its reverse accumulates
 `subtree_size`. Scratch (`stack`, `order`) is gatherer-owned and reused. Iterative
 (no recursion) — safe for pathologically deep trees.
+
+A second reverse-order pass (`tree::aggregate`) computes inclusive `subtree_cpu` and
+`subtree_mem` (self + all descendants) for collapsed-group display — same O(n) as the
+size accumulation, using the existing `order` vector.
 
 The structural tree is collapse-independent. The **UI** flattens it to display rows
 (`app::rebuild_rows`), skipping collapsed subtrees, only when the snapshot generation
@@ -157,7 +177,8 @@ ring depth is derived as `CPU_WINDOW_MS ÷ REFRESH_MS`:
   stable reading. Reaches a new sustained level over ≤ `CPU_WINDOW` intervals.
 - **`cpu_peak`** = the max single-interval rate still in the window — **captures
   spikes** the average dilutes, and holds them for `CPU_WINDOW` intervals. Shown as
-  a separate `PEAK` column.
+  a separate `PEAK` column. Tracked incrementally: a cached `peak_bp` + ring index
+  updates on push and rescans only when the peak sample is evicted (~1/window).
 
 All arithmetic is exact integer math (no float, no EWMA accumulation error).
 Robustness: refreshes closer than `MIN_SAMPLE` (100 ms — e.g. the forced refresh
@@ -195,6 +216,6 @@ with a small hand-rolled `FxHash`-style hasher (`FxBuildHasher`), since the defa
 
 macOS (`sysctl`/`libproc`) backend; thread-group (TGID) handling; CEF/Chromium-aware
 collapse + persisted collapse rules; config + state-cache files; `sudo` escalation
-for protected processes; disk-I/O (`/proc/pid/io`) and other columns (cmdline/exe);
-netlink/delta enumeration instead of full rescan; gatherer pause on
-`SIGTSTP`/background.
+for protected processes; disk-I/O (`/proc/pid/io`) and other columns (exe path);
+per-core CPU bars (toggle); netlink/delta enumeration instead of full rescan;
+gatherer pause on `SIGTSTP`/background.

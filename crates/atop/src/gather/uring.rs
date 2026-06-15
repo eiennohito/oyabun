@@ -1,9 +1,10 @@
 //! `io_uring` backend: batched, zero-copy `/proc` reads with continuous I/O↔parse
 //! overlap.
 //!
-//! Per PID we submit a linked chain plus an independent statx:
+//! Per PID we submit two linked chains plus an independent statx:
 //! ```text
-//!   OpenAt(direct slot) -[IO_LINK]->  ReadFixed(slot → arena) -[IO_HARDLINK]-> Close(slot)
+//!   OpenAt(/stat, fd=2s)  -[IO_LINK]->  ReadFixed(→ arena) -[IO_HARDLINK]-> Close(fd=2s)
+//!   OpenAt(/cmdline, fd=2s+1) -[IO_LINK]-> ReadFixed(→ arena) -[IO_HARDLINK]-> Close(fd=2s+1)
 //!   Statx(→ uid)
 //! ```
 //! `IO_LINK` on open cancels the chain if the process vanished before open.
@@ -13,22 +14,28 @@
 //! Concurrency is a bounded in-flight window over a slot free-list: we keep filling
 //! the submission queue while slots are free, then reap whatever completed and parse
 //! it — so the kernel reads the next PIDs while we parse the last ones. Each PID's
-//! arena region persists for the snapshot (names point into it); only the direct-fd
-//! slots and statx buffers recycle.
+//! arena regions persist for the snapshot (names/cmdline point into them); only the
+//! direct-fd slots and statx buffers recycle.
 
 use std::io;
 
 use io_uring::{IoUring, opcode, squeue, types};
 
+use crate::arena::StringRef;
 use crate::gather::{SLOT_SIZE, parse};
 use crate::snapshot::Snapshot;
 use crate::sys::ProcPath;
 
-// CQE `user_data` packs `(slot << 2) | op` — a 2-bit op tag below the slot index.
-const OP_OPEN: u64 = 0;
-const OP_READ: u64 = 1;
-const OP_CLOSE: u64 = 2;
-const OP_STATX: u64 = 3;
+// CQE `user_data` packs `(slot << 2) | op` — 2-bit op tag below the slot index.
+// We only need to distinguish: stat read, cmdline read, statx, and everything else.
+const OP_STAT_READ: u64 = 0;
+const OP_CMD_READ: u64 = 1;
+const OP_STATX: u64 = 2;
+const OP_OTHER: u64 = 3;
+
+/// `io_uring` ops per PID: stat(open+read+close) + cmd(open+read+close) + statx = 7.
+/// Each SQE produces exactly one CQE, so SQ capacity and pending count are the same.
+const OPS_PER_PID: usize = 7;
 
 fn pack(slot: u32, op: u64) -> u64 {
     (u64::from(slot) << 2) | op
@@ -44,10 +51,13 @@ const SLOT_SIZE_U32: u32 = SLOT_SIZE as u32;
 #[derive(Clone, Copy, Default)]
 struct SlotState {
     pid_idx: u32,
-    buf_off: u32,
-    read_len: u32,
+    stat_off: u32,
+    stat_len: u32,
+    cmd_off: u32,
+    cmd_len: u32,
     pending: u8,
-    read_ok: bool,
+    stat_ok: bool,
+    cmd_ok: bool,
     statx_ok: bool,
 }
 
@@ -57,8 +67,10 @@ pub struct UringBackend {
     free_slots: Vec<u32>,
     slots: Vec<SlotState>,
     statx: Vec<libc::statx>,
-    /// Per-slot path storage; must stay live until the slot's open completes.
-    paths: Vec<ProcPath>,
+    /// Per-slot path storage for `/proc/<pid>/stat`.
+    stat_paths: Vec<ProcPath>,
+    /// Per-slot path storage for `/proc/<pid>/cmdline`.
+    cmd_paths: Vec<ProcPath>,
     /// Registered buffer descriptors, one per snapshot (index = `buf_index`).
     bufs: [libc::iovec; 2],
 }
@@ -85,7 +97,10 @@ impl UringBackend {
         back: &Snapshot,
     ) -> Option<Self> {
         let ring = IoUring::new(ring_entries).ok()?;
-        ring.submitter().register_files_sparse(n_slots).ok()?;
+        // Two direct-fd slots per PID slot: one for stat, one for cmdline.
+        ring.submitter()
+            .register_files_sparse(n_slots.checked_mul(2)?)
+            .ok()?;
 
         let bufs = [iovec_of(front), iovec_of(back)];
         // SAFETY: both iovecs point at live, mmap'd snapshot arenas that outlive
@@ -93,11 +108,13 @@ impl UringBackend {
         unsafe { ring.submitter().register_buffers(&bufs) }.ok()?;
 
         let z: libc::statx = unsafe { std::mem::zeroed() };
+        let ns = n_slots as usize;
         Some(Self {
-            free_slots: Vec::with_capacity(n_slots as usize),
-            slots: vec![SlotState::default(); n_slots as usize],
-            statx: vec![z; n_slots as usize],
-            paths: vec![ProcPath::new(); n_slots as usize],
+            free_slots: Vec::with_capacity(ns),
+            slots: vec![SlotState::default(); ns],
+            statx: vec![z; ns],
+            stat_paths: vec![ProcPath::new(); ns],
+            cmd_paths: vec![ProcPath::new(); ns],
             bufs,
             n_slots,
             ring,
@@ -140,14 +157,15 @@ impl UringBackend {
             free_slots,
             slots,
             statx,
-            paths,
+            stat_paths,
+            cmd_paths,
             ..
         } = self;
         let buf_index = snap.buf_index;
         let mut sq = ring.submission();
 
         while *next < pids.len() {
-            if sq.capacity() - sq.len() < 4 {
+            if sq.capacity() - sq.len() < OPS_PER_PID {
                 break;
             }
             let Some(slot) = free_slots.pop() else {
@@ -155,29 +173,61 @@ impl UringBackend {
             };
             let s = slot as usize;
             let pid = pids[*next];
-            let off = u32::try_from(snap.strings.alloc(SLOT_SIZE)).expect("arena offset fits u32");
-            let buf_ptr = snap.strings.write_ptr(off as usize);
-            let path_ptr = paths[s].write(pid, b"stat");
 
-            let dest = types::DestinationSlot::try_from_slot_target(slot).expect("slot < n_slots");
+            // Two arena allocations per PID: stat + cmdline.
+            let stat_off =
+                u32::try_from(snap.strings.alloc(SLOT_SIZE)).expect("arena offset fits u32");
+            let stat_ptr = snap.strings.write_ptr(stat_off as usize);
+            let cmd_off =
+                u32::try_from(snap.strings.alloc(SLOT_SIZE)).expect("arena offset fits u32");
+            let cmd_ptr = snap.strings.write_ptr(cmd_off as usize);
 
-            let open = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
+            let stat_path_ptr = stat_paths[s].write(pid, b"stat");
+            let cmd_path_ptr = cmd_paths[s].write(pid, b"cmdline");
+
+            // Direct-fd slots: slot*2 for stat, slot*2+1 for cmdline.
+            let stat_fd = slot * 2;
+            let cmd_fd = slot * 2 + 1;
+            let stat_dest =
+                types::DestinationSlot::try_from_slot_target(stat_fd).expect("slot fits");
+            let cmd_dest = types::DestinationSlot::try_from_slot_target(cmd_fd).expect("slot fits");
+
+            // Chain 1: stat open → read → close
+            let stat_open = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), stat_path_ptr)
                 .flags(libc::O_RDONLY)
-                .file_index(Some(dest))
+                .file_index(Some(stat_dest))
                 .build()
-                .user_data(pack(slot, OP_OPEN))
+                .user_data(pack(slot, OP_OTHER))
                 .flags(squeue::Flags::IO_LINK);
-            let read =
-                opcode::ReadFixed::new(types::Fixed(slot), buf_ptr, SLOT_SIZE_U32, buf_index)
+            let stat_read =
+                opcode::ReadFixed::new(types::Fixed(stat_fd), stat_ptr, SLOT_SIZE_U32, buf_index)
                     .build()
-                    .user_data(pack(slot, OP_READ))
+                    .user_data(pack(slot, OP_STAT_READ))
                     .flags(squeue::Flags::IO_HARDLINK);
-            let close = opcode::Close::new(types::Fixed(slot))
+            let stat_close = opcode::Close::new(types::Fixed(stat_fd))
                 .build()
-                .user_data(pack(slot, OP_CLOSE));
+                .user_data(pack(slot, OP_OTHER));
+
+            // Chain 2: cmdline open → read → close
+            let cmd_open = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), cmd_path_ptr)
+                .flags(libc::O_RDONLY)
+                .file_index(Some(cmd_dest))
+                .build()
+                .user_data(pack(slot, OP_OTHER))
+                .flags(squeue::Flags::IO_LINK);
+            let cmd_read =
+                opcode::ReadFixed::new(types::Fixed(cmd_fd), cmd_ptr, SLOT_SIZE_U32, buf_index)
+                    .build()
+                    .user_data(pack(slot, OP_CMD_READ))
+                    .flags(squeue::Flags::IO_HARDLINK);
+            let cmd_close = opcode::Close::new(types::Fixed(cmd_fd))
+                .build()
+                .user_data(pack(slot, OP_OTHER));
+
+            // Independent: statx for uid
             let stx = opcode::Statx::new(
                 types::Fd(libc::AT_FDCWD),
-                path_ptr,
+                stat_path_ptr,
                 std::ptr::from_mut(&mut statx[s]).cast(),
             )
             .mask(libc::STATX_UID)
@@ -185,17 +235,22 @@ impl UringBackend {
             .user_data(pack(slot, OP_STATX));
 
             // SAFETY: path/arena/statx buffers all outlive completion; SQ has room
-            // for 4 entries (checked above), so no chain is split across submits.
+            // for OPS_PER_PID entries (checked above), so no chain is split.
             unsafe {
-                let _ = sq.push(&open);
-                let _ = sq.push(&read);
-                let _ = sq.push(&close);
+                let _ = sq.push(&stat_open);
+                let _ = sq.push(&stat_read);
+                let _ = sq.push(&stat_close);
+                let _ = sq.push(&cmd_open);
+                let _ = sq.push(&cmd_read);
+                let _ = sq.push(&cmd_close);
                 let _ = sq.push(&stx);
             }
             slots[s] = SlotState {
                 pid_idx: u32::try_from(*next).expect("pid index fits u32"),
-                buf_off: off,
-                pending: 4,
+                stat_off,
+                cmd_off,
+                #[allow(clippy::cast_possible_truncation)] // OPS_PER_PID = 7
+                pending: OPS_PER_PID as u8,
                 ..SlotState::default()
             };
             *next += 1;
@@ -212,7 +267,7 @@ impl UringBackend {
         }
     }
 
-    /// Drain ready completions; parse a PID once all four of its CQEs arrive.
+    /// Drain ready completions; parse a PID once all seven of its CQEs arrive.
     fn reap(&mut self, snap: &mut Snapshot, page_size: u64, completed: &mut usize) {
         let Self {
             ring,
@@ -226,23 +281,39 @@ impl UringBackend {
             let res = cqe.result();
             let st = &mut slots[slot];
             match op {
-                OP_READ if res > 0 => {
-                    st.read_len = u32::try_from(res).unwrap_or(0).min(SLOT_SIZE_U32);
-                    st.read_ok = true;
+                OP_STAT_READ if res > 0 => {
+                    st.stat_len = u32::try_from(res).unwrap_or(0).min(SLOT_SIZE_U32);
+                    st.stat_ok = true;
+                }
+                OP_CMD_READ if res > 0 => {
+                    st.cmd_len = u32::try_from(res).unwrap_or(0).min(SLOT_SIZE_U32);
+                    st.cmd_ok = true;
                 }
                 OP_STATX => st.statx_ok = res >= 0,
-                _ => {} // OP_OPEN / OP_CLOSE: result not needed
+                _ => {}
             }
             st.pending -= 1;
             if st.pending != 0 {
                 continue;
             }
 
-            if st.read_ok && st.statx_ok {
-                let (i, off, len) = (st.pid_idx as usize, st.buf_off, st.read_len);
+            let i = st.pid_idx as usize;
+            if st.stat_ok && st.statx_ok {
                 let uid = statx[slot].stx_uid;
-                if let Some(f) = parse::parse_stat(snap.strings.bytes(off, len), off) {
+                if let Some(f) =
+                    parse::parse_stat(snap.strings.bytes(st.stat_off, st.stat_len), st.stat_off)
+                {
                     f.write_into(&mut snap.procs[i], uid, page_size);
+                }
+            }
+            if st.cmd_ok && st.cmd_len > 0 {
+                let buf = snap.strings.bytes_mut(st.cmd_off, st.cmd_len);
+                let clean_len = parse::clean_cmdline(buf);
+                if clean_len > 0 {
+                    snap.procs[i].cmdline = StringRef {
+                        offset: st.cmd_off,
+                        len: clean_len,
+                    };
                 }
             }
             free_slots.push(u32::try_from(slot).unwrap_or(0));

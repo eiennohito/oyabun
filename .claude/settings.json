@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test *)",
+      "Bash(cargo check *)",
+      "Bash(cargo clippy *)",
+      "Bash(just *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(just *)",
+            "command": "cmd=$(jq -r '.tool_input.command'); if echo \"$cmd\" | grep -qP '\\bjust\\b[^|]*\\|'; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Do not pipe just output. Modify just configuration directly so other sessions will also be able to use it.\",\"additionalContext\":\"Do not pipe just output through other commands (grep, tail, head, awk, etc). The just recipes produce compact output by design. If you want to add something to output, modify just configuration (justfile or scripts/run-logged.sh) directly so other sessions will also be able to use it.\"}}'; fi",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

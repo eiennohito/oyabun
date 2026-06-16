@@ -1,14 +1,21 @@
 //! The double-buffered, index-based process snapshot.
 //!
 //! A `Snapshot` is built by the gatherer and published via `ArcSwap`. The UI reads
-//! it read-only. All cross-references (tree links) are indices into `procs`, and
-//! all strings are [`StringRef`]s into `strings` — no pointers, no lifetimes, no
-//! per-process heap allocation.
+//! it read-only. Tree links are indices into `procs`. `comm` (the process name) lives in
+//! the per-cycle `strings` arena; `cmdline` is a [`StringRef<Cmd>`] into the gatherer's
+//! generational `Cmd` store, resolved read-only through the snapshot's [`ByteResolver`] —
+//! so an unchanged cmdline is *not* re-copied each cycle (its slot persists across cycles).
 
-use crate::arena::{HugePageBuf, StringRef};
+use thoop::{ByteResolver, StringRef};
+
+use crate::arena::{self, HugePageBuf};
 
 /// Sentinel index meaning "none" for tree links and roots.
 pub const NONE: u32 = u32::MAX;
+
+/// Tag type for the cmdline string store: makes a [`StringRef<Cmd>`] resolvable only
+/// against the `Cmd` store / its [`ByteResolver`], never another store.
+pub struct Cmd;
 
 /// System-wide resource snapshot, computed once per gather cycle.
 #[derive(Clone, Copy, Default, Hash)]
@@ -65,10 +72,11 @@ pub struct ProcessEntry {
     /// process incarnation — used to make `kill` safe against PID reuse.
     pub start_time: u64,
     /// `comm` (process name), pointing into [`Snapshot::strings`].
-    pub name: StringRef,
-    /// Full `/proc/<pid>/cmdline` (NUL→space), pointing into [`Snapshot::strings`].
-    /// Empty for kernel threads and inaccessible processes.
-    pub cmdline: StringRef,
+    pub name: arena::StringRef,
+    /// Full `/proc/<pid>/cmdline` (NUL→space) as a handle into the generational `Cmd`
+    /// store, resolved via [`Snapshot::cmd`]. Empty for kernel threads and inaccessible
+    /// processes. The handle is stable across cycles while the cmdline is unchanged.
+    pub cmdline: StringRef<Cmd>,
     /// Set if `comm` or `cmdline` contains any byte ≥ 0x80 — i.e. the Command column
     /// needs unicode-aware width. False for the ~99% ASCII case (renderer fast path).
     /// Computed for free during the byte-walks that already scan both fields.
@@ -109,7 +117,7 @@ impl ProcessEntry {
         mem_bytes: 0,
         ticks: 0,
         start_time: 0,
-        name: StringRef::EMPTY,
+        name: arena::StringRef::EMPTY,
         cmdline: StringRef::EMPTY,
         non_ascii: false,
         is_kthread: false,
@@ -131,7 +139,12 @@ impl ProcessEntry {
 
 pub struct Snapshot {
     pub procs: Vec<ProcessEntry>,
+    /// Per-cycle `comm` arena (reset each cycle). `ProcessEntry::name` indexes it.
     pub strings: HugePageBuf,
+    /// Read-only view of the gatherer's `Cmd` store at publish time — resolves every
+    /// `ProcessEntry::cmdline`. Overwritten each publish; not reset (the store is shared
+    /// and persistent, unlike `strings`).
+    pub cmd: ByteResolver<Cmd>,
     /// Head of the root sibling chain (via `next_sibling`), or [`NONE`].
     pub first_root: u32,
     /// Monotonic version; UI rebuilds its display list when this changes.
@@ -149,6 +162,7 @@ impl Snapshot {
         Self {
             procs: Vec::new(),
             strings: HugePageBuf::new(min_buf),
+            cmd: ByteResolver::EMPTY,
             first_root: NONE,
             generation: 0,
             pool_overflow: 0,
@@ -156,13 +170,27 @@ impl Snapshot {
         }
     }
 
-    /// O(1) reset: clear records (no drops — POD) and rewind the arena cursor.
+    /// O(1) reset: clear records (no drops — POD) and rewind the comm arena cursor. The
+    /// `cmd` resolver is *not* reset — it is replaced at publish from the live `Cmd` store;
     /// `generation`/`first_root` are overwritten by the gatherer before publish.
     pub fn reset(&mut self) {
         self.procs.clear();
         self.strings.reset();
         self.first_root = NONE;
         self.pool_overflow = 0;
+    }
+
+    /// The `comm` (process name) bytes for an entry.
+    #[must_use]
+    pub fn name(&self, e: &ProcessEntry) -> &[u8] {
+        self.strings.get(e.name)
+    }
+
+    /// The cmdline bytes for an entry (empty for kthreads / inaccessible processes),
+    /// resolved through the published `Cmd`-store view.
+    #[must_use]
+    pub fn cmdline(&self, e: &ProcessEntry) -> &[u8] {
+        self.cmd.resolve(e.cmdline)
     }
 
     /// Push a tombstone slot for a PID, to be filled in place by a backend and

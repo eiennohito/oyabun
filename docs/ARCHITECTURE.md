@@ -53,8 +53,8 @@ Index-based, POD, arena-backed — no pointers, no lifetimes, no per-process hea
 allocation. `Vec::clear` drops nothing, so reset is O(1).
 
 ```
-Snapshot { procs: Vec<ProcessEntry>, strings: HugePageBuf, first_root: u32,
-           generation: u64, sys: SystemStats }
+Snapshot { procs: Vec<ProcessEntry>, strings: HugePageBuf, cmd: ByteResolver<Cmd>,
+           first_root: u32, generation: u64, sys: SystemStats }
 
 SystemStats {                        // Copy, per-cycle system-wide stats
   cpu_user_bp, cpu_sys_bp, cpu_iowait_bp,   // CPU deltas as basis points
@@ -68,8 +68,8 @@ ProcessEntry {                       // Copy
   pid, ppid, uid, state(u8), priority(i8), nice(i8), num_threads,
   cpu_pct(bp), cpu_peak(bp), mem_bytes, ticks,
   start_time,                        // (pid, start_time) = a unique incarnation
-  name: StringRef,                   // offset+len into `strings` (comm)
-  cmdline: StringRef,                // /proc/<pid>/cmdline (NUL→space), may be empty
+  name: StringRef,                   // offset+len into `strings` (comm), per-cycle arena
+  cmdline: StringRef<Cmd>,           // handle into the generational Cmd store (resolved via `cmd`)
   non_ascii: bool,                   // comm|cmdline has a byte ≥0x80 → renderer unicode path
   is_kthread: bool,                  // PF_KTHREAD — kernel thread (no cmdline ever)
   parent_idx, first_child, next_sibling, subtree_size, depth,  // tree links
@@ -82,8 +82,16 @@ persistent-fd pool and used the transient fallback (0 in the common case; non-ze
 `RLIMIT_NOFILE` is the binding constraint). Surfaced so a low fd limit is never silent.
 
 ```
-StringRef { offset: u32, len: u32 }  // slice of `strings`
+StringRef { offset: u32, len: u32 }       // slice of `strings` (comm; the `arena` crate)
+StringRef<Cmd> { idx: u32, len: u16 }     // slot in the generational Cmd store (`thoop`)
 ```
+
+`comm` and `cmdline` use two different string mechanisms because they have different
+lifetimes. `comm` is re-parsed from `stat` every cycle (cheap, no redundancy), so it lands
+in a per-cycle bump arena (`strings`, reset each cycle). `cmdline` is *cached* across cycles
+(read on a coarse cadence) — re-copying the cached bytes into a per-cycle arena every cycle
+was pure waste, so it lives in a **generational store** whose slots persist across cycles
+(see Generational storage below).
 
 `NONE = u32::MAX` is the null index/root sentinel. PIDs vanishing mid-scan are kept
 as tombstones (`pid == 0`) and `compact()`ed out before publish; because PIDs are
@@ -95,26 +103,63 @@ Every failure path (open, read, reopen, parse) must re-mark the slot dead, or it
 compaction as a *phantom row* — a real PID with empty fields. This is load-bearing for the
 birth probe (below), where most speculative reads are meant to fail.
 
-## Memory regions (`MmapRegion`, `HugePageBuf`)
+## Memory regions (`thoop`, `HugePageBuf`)
 
-`MmapRegion` is the owned-`mmap` primitive (anonymous private mapping, rounded up to a
-2 MiB huge page, `MADV_HUGEPAGE`-hinted, unmapped on drop). It backs the string arena and
-the io_uring landing pad, and is the seed for the deferred move of the gatherer's
-persistent structures onto huge pages. When only part of a mapping should be *pinned*, the
-caller registers a sub-range — the landing pad pins only its read-slot prefix and uses the
-free huge-page tail for unpinned scratch (below), so locked memory never exceeds the prefix.
+`MmapRegion` (in the `thoop` crate) is the owned-`mmap` primitive (anonymous private
+mapping, rounded up to a 2 MiB huge page, `MADV_HUGEPAGE`-hinted, unmapped on drop). It
+backs the comm arena, the io_uring landing pad, and `thoop`'s generational stores. When
+only part of a mapping should be *pinned*, the caller registers a sub-range — the landing
+pad pins only its read-slot prefix and uses the free huge-page tail for unpinned scratch
+(below), so locked memory never exceeds the prefix.
 
-`HugePageBuf` (a huge `MmapRegion` + bump cursor; `reset()` rewinds, `reserve()` grows
-by doubling) is the snapshot's **string store** — *not* an I/O target. After parsing,
-the gatherer copies each PID's `comm` (~15 B) into it, plus the per-cycle cmdline copies
-re-materialized from `ProcCache`. Cross-thread sharing is sound because mutation happens
-only under `get_mut` (unique access) and shared access is read-only.
+`HugePageBuf` (a huge `MmapRegion` + bump cursor; `reset()` rewinds, `reserve()` grows by
+doubling) is the snapshot's **comm arena** — *not* an I/O target. After parsing, the
+gatherer copies each PID's `comm` (~15 B) into it. (cmdline used to be re-materialized here
+every cycle; it now lives in a generational store instead — see below.) Cross-thread
+sharing is sound because mutation happens only under `get_mut` (unique access) and shared
+access is read-only.
 
 Because the arena is no longer an io_uring registered buffer, a mid-cycle grow can no
-longer race an in-flight read or stale a registration. The gatherer still `reserve()`s
-the cycle's need up front, but now purely to avoid a re-mmap+copy mid-fill — a
-performance choice, not a correctness invariant. Reads land elsewhere (the landing pad,
-below); only the small `comm`/cmdline copies hit the arena.
+longer race an in-flight read or stale a registration. The gatherer still `reserve()`s the
+cycle's need up front, but now purely to avoid a re-mmap+copy mid-fill — a performance
+choice, not a correctness invariant. Reads land elsewhere (the landing pad, below); only
+the small `comm` copy hits the arena.
+
+## Generational storage (`thoop`) — the arena, the cmdline store, the lease
+
+The gatherer's slow-changing per-PID strings should not be re-copied every cycle. `thoop`
+provides a **generational store** (`GenStore<T>`, and `StrStore<N,S>` for byte slots): a
+slot persists across cycles, and a one-byte `Gen` tag tracks its lifecycle — `ALIVE`
+(immortal until released), demoted-at-generation (released but maybe still leased), or
+`FREE`. cmdline lives in a `Cmd` `StrStore`; an unchanged cmdline keeps its slot (no
+per-cycle copy — the eliminated waste), and only a *changed* cmdline allocates a new slot
+and demotes the old.
+
+**The arena.** Stores do not each `mmap` a huge page — with THP, a touched 2 MiB mapping
+commits a full huge page, so a mapping per structure is ~5× waste at a dozen structures.
+Instead they share a few regions via an `Arena` suballocator that hands out `ChunkId`s. The
+arena's chunk table is the source of truth for where a chunk lives, so growth (which
+relocates) is transparent: a store keeps its `ChunkId`, a `Ref` is a slot *index* (stable
+across relocation), and the gatherer re-fetches the base each access. Growth is two-regime:
+**A** (common) bumps a larger copy from the region's tail, leaving the old bytes as a frozen
+hole; **B** (rare, tail exhausted) repacks all chunks into a fresh region — compacting
+holes, sized to live + headroom rather than a blind 2× — and retires the old region.
+
+**The lease.** A published snapshot carries a `ByteResolver<Cmd>` — a read-only capture of
+the `Cmd` chunk's base *at publish* — so the UI thread resolves `cmdline` handles without
+touching the gatherer-owned store. While a snapshot is held, every cmdline slot it
+references must stay alive. This is *not* the `Arc`/`get_mut` double-buffer guarantee (that
+protects the per-snapshot `procs`/comm arena, which the gatherer owns uniquely); the store
+is **shared**, so safety rests on **generation arithmetic**. The unifying idea: *growth
+copies now, frees later*. A demoted slot's data lingers until GC; a relocated chunk's old
+bytes linger (an A hole, or a B retired region); both are reclaimed only once `min_live`
+(= published generation − `GC_LAG`) passes the generation they were released/retired at, by
+which point no live snapshot can still read them. `GC_LAG ≥ 2` covers the two-snapshot live
+window, and the same `min_live` drives slot GC *and* arena-region GC. The `u8` generation
+tag wraps with ~127 generations of headroom, so the lag is set conservatively for free.
+Cross-thread reads are sound because the gatherer's concurrent mutations touch only a
+slot's 1-byte tag (a distinct memory location from its data) or slots no live snapshot
+references (free/new on intern, expired on GC).
 
 ## `/proc` enumeration — maintained live set + cadence + birth probe
 
@@ -236,7 +281,11 @@ storm here regardless: plain closes hit `files->file_lock`, not `uring_lock`).
 
 comm rides inside stat (re-read every cycle, free). `uid` and `cmdline` do not, and
 change slowly, so a gatherer-owned `ProcCache` (beside `CpuTracker`) owns them via plain
-syscalls — backend-agnostic (the **hybrid rule**: low-volume ops stay synchronous):
+syscalls — backend-agnostic (the **hybrid rule**: low-volume ops stay synchronous). The
+per-PID metadata (`PidMeta`: uid, cmdline handle, cadence bookkeeping) lives in a
+`GenStore<PidMeta>` on huge pages, keyed by a `PidIndex` (PID → slot). `PidMeta` is
+gatherer-internal — no snapshot references it — so a dead PID's slot is freed immediately
+(`GenStore::free`, no lease); only the cmdline *string* it points at is snapshot-leased.
 
 - **Kernel threads** (`is_kthread`) cost **zero** syscalls — uid is root (0), cmdline is
   permanently empty. On a typical box kthreads are the majority of PIDs.
@@ -244,9 +293,11 @@ syscalls — backend-agnostic (the **hybrid rule**: low-volume ops stay synchron
   (first `CMDLINE_SETTLE_GENS=3` cycles, for exec/argv settling), then on a **staggered
   coarse tick**: PID `p` refreshes when `(gen + p) % N == 0`, so ~1/N refresh per cycle
   (`CMDLINE_REFRESH_N=16`, ~8 s worst-case staleness; `ATOP_CMDLINE_REFRESH_N` overrides).
-- Each cycle the chosen cmdline (fresh or cached) is **re-materialized** into the current
-  arena → a valid `StringRef` that survives the double-buffer reset. PID reuse
-  (`start_time` change) resets the cache entry.
+- A fresh read replaces the cmdline's slot in the `Cmd` store **only when the bytes
+  changed** (old slot demoted, new slot interned `ALIVE`); an unchanged or not-refreshed
+  PID keeps its slot, so `ProcessEntry::cmdline` is just an 8-byte handle copy — the
+  per-cycle re-materialization is gone. PID reuse (`start_time` change) and eviction demote
+  the slot so GC can reclaim it once the lease expires (see Generational storage).
 
 ### Overflow (more live PIDs than the pool holds)
 
@@ -356,6 +407,9 @@ with a small hand-rolled `FxHash`-style hasher (`FxBuildHasher`), since the defa
   dev-dep `vt100` for terminal-emulator-based render tests.
 - `crossterm` 0.29 — terminal setup (raw mode, alt screen) + input events; also etch's
   output backend.
+- `thoop` (workspace path crate) — THP-backed generational storage primitives
+  (`MmapRegion`, `GenStore`, `TypedBuf`, `StrStore`/`ByteResolver`). Owns the gatherer's
+  huge-page-resident structures; depends only on `libc`. See Generational storage above.
 - `libc` — syscalls. No `procfs` crate (it allocates and parses more than we need).
 
 ## Deviations from the original plan & known edges

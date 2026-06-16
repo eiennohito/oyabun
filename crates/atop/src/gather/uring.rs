@@ -34,7 +34,8 @@ use std::io;
 
 use io_uring::{IoUring, opcode, squeue, types};
 
-use crate::arena::MmapRegion;
+use thoop::MmapRegion;
+
 use crate::gather::syscall::read_transient;
 use crate::gather::{PidMap, STAT_SLOT, parse};
 use crate::snapshot::Snapshot;

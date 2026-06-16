@@ -15,9 +15,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use thoop::{Arena, ByteResolver, Gen, GenStore, Ref, StrStore, StringRef};
 
-use crate::arena::{HugePageBuf, StringRef};
-use crate::snapshot::{ProcessEntry, Snapshot, SystemStats};
+use crate::snapshot::{Cmd, ProcessEntry, Snapshot, SystemStats};
 use crate::sys::{self, ProcDir, ProcPath, RawCpuCounters, clk_tck, nofile_soft_limit};
 use crate::tree;
 use syscall::SyscallBackend;
@@ -38,11 +38,10 @@ pub const CMD_SLOT: usize = 256;
 /// Unlike [`STAT_SLOT`] this is **not** a hard bound: the actual copy uses `comm.len()` and
 /// the arena grows freely — see [`ARENA_BYTES_PER_PID`].
 const COMM_SLOT: usize = 16;
-/// Arena bytes reserved per PID: the copied-out `comm` plus a re-materialized cmdline.
-/// Smaller than the old stat-text-retaining arena since raw stat now lands in the
-/// (separate, fixed) read pad. A **reserve sizing hint only** — the arena grows freely if
-/// exceeded, so the per-PID estimate need not be exact.
-const ARENA_BYTES_PER_PID: usize = COMM_SLOT + CMD_SLOT;
+/// Comm-arena bytes reserved per PID. Only `comm` lives in the per-cycle arena now —
+/// cmdline moved to the generational `Cmd` store (no per-cycle re-copy). A **reserve sizing
+/// hint only**; the arena grows freely if exceeded.
+const ARENA_BYTES_PER_PID: usize = COMM_SLOT;
 /// `io_uring` SQ depth. A new PID costs 2 SQEs (open+read), a cached PID 1; the bounded
 /// fill/reap loop submits in rounds, so this only bounds in-flight concurrency.
 const RING_ENTRIES: u32 = 4096;
@@ -89,6 +88,24 @@ const CMDLINE_SETTLE_GENS: u32 = 3;
 /// `(cur_gen + p) % N == 0`, so ~1/N settled PIDs refresh each cycle (no thundering herd).
 /// At `REFRESH_MS=500` and `N=16`, worst-case staleness ≈ 8 s. See [`cmdline_refresh_n`].
 const CMDLINE_REFRESH_N: u32 = 16;
+
+/// The generational `Cmd` string store (cmdlines), keyed off the gatherer's `u64`
+/// generation. Slots persist across cycles; an unchanged cmdline keeps its slot.
+type CmdStore = StrStore<CMD_SLOT, Cmd>;
+
+/// Largish initial slot count for the `Cmd` store, so it rarely grows after warmup
+/// (growth relocates + retires the old chunk via the lease — fine, but a cold path).
+const CMD_STORE_MIN_SLOTS: usize = 512;
+/// Largish initial slot count for the per-PID metadata store (covers all live PIDs,
+/// kthreads included). Grows via the arena if a box runs hotter.
+const PIDMETA_MIN_SLOTS: usize = 2048;
+
+/// How many generations a demoted `Cmd` slot is held before GC may reclaim it. The live
+/// window is two snapshots (double buffer), so a lag of 2 is the minimum safe value; the
+/// `u8` generation tag has ~127 generations of headroom, so this is purely conservative
+/// margin (reclaim one generation later than strictly required, never sooner). See the GC
+/// derivation in [`Gatherer::gather`].
+const GC_LAG: u64 = 2;
 
 /// Persistent-fd pool capacity: `min(RLIMIT_NOFILE.soft − RESERVED, MAX_POOL)`, or the
 /// `ATOP_POOL_CAP` override (exercise the overflow path without touching `ulimit`).
@@ -406,54 +423,58 @@ fn rate(ticks: u64, jiff: u64) -> u32 {
     u32::try_from(ticks.saturating_mul(10000) / jiff).unwrap_or(u32::MAX)
 }
 
-/// Slow-changing per-PID metadata that does **not** ride inside stat: the owner `uid`
-/// and the `/proc/<pid>/cmdline` argv. Kept across cycles so the hot path re-reads only
-/// stat. Refreshed via plain syscalls on a coarse, staggered cadence; kernel threads
-/// never touch cmdline (it is permanently empty) and are owned by root.
-struct Meta {
+/// Slow-changing per-PID metadata, stored on huge pages in a [`GenStore`] keyed by
+/// [`PidIndex`]. `Flat` (`Copy`) — no heap fields — so it lives in a THP arena chunk. It is
+/// **gatherer-internal**: no published snapshot references a `PidMeta` slot (the snapshot
+/// carries the resolved `uid`/`cmdline` handle), so slots are freed immediately on death
+/// (no lease). Only the cmdline *string* it points at is leased.
+#[derive(Clone, Copy)]
+struct PidMeta {
     /// Start time of the incarnation this metadata belongs to (PID-reuse discriminator).
     start_time: u64,
     uid: u32,
-    /// Cleaned, display-ready cmdline bytes (NUL→space); empty for kthreads / no argv.
-    cmdline: Vec<u8>,
-    /// `cmdline` contains a byte ≥ 0x80 (renderer unicode path).
+    /// Handle to this PID's cmdline in the `Cmd` store (empty for kthreads / no argv). The
+    /// slot persists across cycles; replaced (old demoted, new alive) only when the cmdline
+    /// bytes actually change — no per-cycle re-copy.
+    cmd: StringRef<Cmd>,
+    /// The cmdline contains a byte ≥ 0x80 (renderer unicode path).
     cmd_non_ascii: bool,
     /// Generation when first seen — drives the age-adaptive cmdline cadence.
-    first_seen_gen: u32,
+    first_seen_gen: u64,
     /// Generation when last seen, for evicting vanished PIDs.
-    seen_gen: u32,
+    seen_gen: u64,
 }
 
-impl Meta {
-    fn new(start_time: u64, cur_gen: u32) -> Self {
+impl PidMeta {
+    fn new(start_time: u64, cur_gen: u64) -> Self {
         Self {
             start_time,
             uid: u32::MAX,
-            cmdline: Vec::new(),
+            cmd: StringRef::EMPTY,
             cmd_non_ascii: false,
             first_seen_gen: cur_gen,
             seen_gen: cur_gen,
         }
     }
-
-    /// Re-baseline on PID reuse (a new incarnation took this PID number).
-    fn reset(&mut self, start_time: u64, cur_gen: u32) {
-        self.start_time = start_time;
-        self.uid = u32::MAX;
-        self.cmdline.clear();
-        self.cmd_non_ascii = false;
-        self.first_seen_gen = cur_gen;
-        self.seen_gen = cur_gen;
-    }
 }
+
+/// PID → its [`PidMeta`] slot. A plain `FxHashMap` for now; phase 6 replaces it with a
+/// THP-resident open-addressing `ThpMap` so even this lookup table is on huge pages.
+type PidIndex = PidMap<Ref<PidMeta>>;
 
 /// Owns the slow per-PID metadata (`uid`, `cmdline`) backend-agnostically. comm rides
 /// inside stat (re-read every cycle, free); this layer covers what does not. Each cycle
 /// it materializes the cmdline — fresh-read or cached — into the *current* arena so the
 /// `StringRef` stays valid across the double-buffer reset.
 struct ProcCache {
-    map: PidMap<Meta>,
-    cur_gen: u32,
+    /// PID → its [`PidMeta`] slot (gatherer-internal; phase 6 → THP `ThpMap`).
+    pid_index: PidIndex,
+    /// Per-PID metadata on huge pages (uid, cmdline handle, cadence bookkeeping). Freed
+    /// immediately on death — no snapshot leases it.
+    meta: GenStore<PidMeta>,
+    /// Generational cmdline storage, shared across snapshots (persistent). A `StringRef<Cmd>`
+    /// in a published snapshot stays valid until GC, which lags by [`GC_LAG`] generations.
+    cmd_store: CmdStore,
     refresh_n: u32,
     cmd_path: ProcPath,
     /// Reused read buffer for `/proc/<pid>/cmdline` (no per-cycle allocation).
@@ -461,83 +482,137 @@ struct ProcCache {
 }
 
 impl ProcCache {
-    fn new(refresh_n: u32) -> Self {
+    fn new(arena: &mut Arena, refresh_n: u32) -> Self {
         Self {
-            map: PidMap::default(),
-            cur_gen: 0,
+            pid_index: PidIndex::default(),
+            meta: GenStore::new(arena, PIDMETA_MIN_SLOTS),
+            cmd_store: CmdStore::new(arena, CMD_STORE_MIN_SLOTS),
             refresh_n,
             cmd_path: ProcPath::new(),
             scratch: vec![0u8; CMD_SLOT],
         }
     }
 
+    /// Read-only `Cmd`-store view to publish in the snapshot for UI-side resolution.
+    fn resolver(&self, arena: &Arena) -> ByteResolver<Cmd> {
+        self.cmd_store.resolver(arena)
+    }
+
+    /// Reclaim cmdline slots whose generation the live snapshot window has passed.
+    /// Cross-thread soundness: a published snapshot only references `ALIVE` or
+    /// recently-demoted slots; `min_live` (= current gen − [`GC_LAG`]) never reaches those,
+    /// so the UI thread's `resolve` reads of leased slots never race a reclaim. Demotion
+    /// flips only a slot's 1-byte tag (a distinct memory location from its data bytes), and
+    /// new interns target free/new slots no live snapshot references. (Arena region
+    /// retirement from a store relocate is reclaimed on the same lease — see
+    /// [`Gatherer::gather`].)
+    fn gc(&mut self, arena: &Arena, min_live: u64) {
+        self.cmd_store.gc(arena, min_live);
+    }
+
     /// Fill `uid` + `cmdline` on every live entry (stat fields are already set). Reads
-    /// fresh on first sighting, while settling, or on the staggered coarse tick; else
-    /// reuses the cache. Always re-materializes cmdline into `strings`.
+    /// fresh on first sighting, while settling, or on the staggered coarse tick; otherwise
+    /// reuses the cached handle (no I/O, no copy). A fresh read replaces the `Cmd` slot
+    /// **only when the bytes changed** — an unchanged cmdline keeps its slot, so the
+    /// per-cycle re-materialization of every PID's cmdline is gone. `gen` is the generation
+    /// of the snapshot being built; demotions/allocations key the generational lease to it.
     #[allow(clippy::cast_possible_truncation)] // cmdline len bounded by CMD_SLOT
-    fn update(&mut self, procs: &mut [ProcessEntry], strings: &mut HugePageBuf) {
-        self.cur_gen = self.cur_gen.wrapping_add(1);
-        let cur_gen = self.cur_gen;
+    fn update(&mut self, arena: &mut Arena, procs: &mut [ProcessEntry], cur_gen: u64) {
+        let Self {
+            pid_index,
+            meta,
+            cmd_store,
+            refresh_n,
+            cmd_path,
+            scratch,
+        } = self;
+        let refresh_n = *refresh_n;
+
         for e in procs.iter_mut() {
             let pid = e.pid;
-            // Decide whether to read fresh this cycle from a single cache peek (the
-            // borrow must drop before `read_cmdline_uid`, which needs `&mut self`).
-            let (present, reused, settling) = match self.map.get(&pid) {
-                Some(m) => {
-                    let reused = m.start_time != e.start_time;
-                    let settling =
-                        !reused && cur_gen.wrapping_sub(m.first_seen_gen) < CMDLINE_SETTLE_GENS;
+            // Copy the prior record out (`PidMeta` is `Copy`) so no `meta`/`arena` borrow is
+            // held across the `cmd_store` ops below, which also need the arena.
+            let prior = pid_index
+                .get(&pid)
+                .map(|&mref| (mref, *meta.get(arena, mref)));
+            let (present, reused, settling) = match prior {
+                Some((_, pm)) => {
+                    let reused = pm.start_time != e.start_time;
+                    let settling = !reused
+                        && cur_gen.wrapping_sub(pm.first_seen_gen) < u64::from(CMDLINE_SETTLE_GENS);
                     (true, reused, settling)
                 }
                 None => (false, false, true), // new → treat as settling
             };
-            let stagger = self.refresh_n <= 1 || cur_gen.wrapping_add(pid) % self.refresh_n == 0;
+            let stagger =
+                refresh_n <= 1 || cur_gen.wrapping_add(u64::from(pid)) % u64::from(refresh_n) == 0;
             let refresh = !present || reused || settling || stagger;
 
-            // Read fresh (kthreads cost zero syscalls: uid 0, cmdline empty).
+            // Read fresh into scratch (kthreads cost zero syscalls: uid 0, cmdline empty).
             let fresh = if refresh {
                 if e.is_kthread {
                     Some((0u32, 0usize, false))
                 } else {
-                    Some(read_cmdline_uid(pid, &mut self.cmd_path, &mut self.scratch))
+                    Some(read_cmdline_uid(pid, cmd_path, scratch))
                 }
             } else {
                 None
             };
 
-            let m = self
-                .map
-                .entry(pid)
-                .or_insert_with(|| Meta::new(e.start_time, cur_gen));
-            if reused {
-                m.reset(e.start_time, cur_gen);
+            // Build the record locally. On reuse, demote the prior incarnation's cmd slot and
+            // re-baseline; on a kept PID, carry its record forward.
+            let mut pm = match prior {
+                Some((_, pm)) if !reused => pm,
+                _ => PidMeta::new(e.start_time, cur_gen),
+            };
+            if reused && let Some((_, old)) = prior {
+                cmd_store.demote(arena, old.cmd, cur_gen);
             }
-            m.seen_gen = cur_gen;
+            pm.seen_gen = cur_gen;
+
             if let Some((uid, len, non_ascii)) = fresh {
-                m.uid = uid;
-                m.cmd_non_ascii = non_ascii;
-                m.cmdline.clear();
-                m.cmdline.extend_from_slice(&self.scratch[..len]);
+                pm.uid = uid;
+                let new_bytes = &scratch[..len];
+                if new_bytes.is_empty() {
+                    cmd_store.demote(arena, pm.cmd, cur_gen); // no-op if already empty
+                    pm.cmd = StringRef::EMPTY;
+                    pm.cmd_non_ascii = false;
+                } else if pm.cmd.is_empty() || cmd_store.get(arena, pm.cmd) != new_bytes {
+                    // Changed (or first non-empty argv): new slot alive, old slot demoted.
+                    cmd_store.demote(arena, pm.cmd, cur_gen);
+                    pm.cmd = cmd_store.intern(arena, Gen::ALIVE, new_bytes);
+                    pm.cmd_non_ascii = non_ascii;
+                }
+                // else: unchanged — keep the existing slot (the whole point of the store).
             }
 
-            e.uid = m.uid;
-            if m.cmdline.is_empty() {
-                e.cmdline = StringRef::EMPTY;
+            // Write back: overwrite the existing slot, or allocate one for a new PID + index.
+            if let Some((mref, _)) = prior {
+                meta.assign(arena, mref, pm);
             } else {
-                let off = strings.alloc(m.cmdline.len());
-                let ptr = strings.write_ptr(off);
-                // SAFETY: `off` was just allocated for exactly `m.cmdline.len()` bytes.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(m.cmdline.as_ptr(), ptr, m.cmdline.len());
-                }
-                e.cmdline = StringRef {
-                    offset: off as u32,
-                    len: m.cmdline.len() as u32,
-                };
-                e.non_ascii |= m.cmd_non_ascii;
+                let mref = meta.insert(arena, Gen::ALIVE, pm);
+                pid_index.insert(pid, mref);
+            }
+
+            e.uid = pm.uid;
+            e.cmdline = pm.cmd;
+            if !pm.cmd.is_empty() {
+                e.non_ascii |= pm.cmd_non_ascii;
             }
         }
-        self.map.retain(|_, m| m.seen_gen == cur_gen);
+
+        // Evict vanished PIDs: demote their cmd slot (leased) + free their PidMeta slot
+        // (gatherer-internal, immediate).
+        pid_index.retain(|_, &mut mref| {
+            let pm = *meta.get(arena, mref);
+            if pm.seen_gen == cur_gen {
+                true
+            } else {
+                cmd_store.demote(arena, pm.cmd, cur_gen);
+                meta.free(arena, mref);
+                false
+            }
+        });
     }
 }
 
@@ -648,6 +723,10 @@ pub struct Gatherer {
     sys_cpu: SysCpuAccum,
     tree_stack: Vec<u32>,
     tree_order: Vec<u32>,
+    /// Shared THP sub-allocator backing the gatherer's generational stores (currently the
+    /// `Cmd` store; phases 3–6 add per-PID/CPU/index stores). One per gatherer; growth is
+    /// lease-deferred so cross-thread readers stay valid.
+    arena: Arena,
     /// Persistent-fd pool capacity, retained for the mid-run `io_uring`→syscall downgrade.
     pool_cap: u32,
     config: Config,
@@ -669,6 +748,8 @@ impl Gatherer {
 
         let pool_cap = pool_capacity();
         let arc_swap = Arc::new(ArcSwap::from(front));
+        let mut arena = Arena::new(0);
+        let cache = ProcCache::new(&mut arena, cmdline_refresh_n());
         let gatherer = Self {
             arc_swap: arc_swap.clone(),
             recycled: Some(back),
@@ -676,10 +757,11 @@ impl Gatherer {
             pids: Vec::new(),
             dent_buf: vec![0u8; 64 * 1024],
             cpu: CpuTracker::new(clk_tck()),
-            cache: ProcCache::new(cmdline_refresh_n()),
+            cache,
             sys_cpu: SysCpuAccum::new(),
             tree_stack: Vec::new(),
             tree_order: Vec::new(),
+            arena,
             pool_cap,
             config: Config::from_env(),
             pid_max: sys::read_pid_max(),
@@ -807,8 +889,18 @@ impl Gatherer {
         self.pids.clear();
         self.pids.extend(snap.procs.iter().map(|p| p.pid));
 
-        // Fill uid + cmdline (slow fields) on the surviving entries, then CPU%.
-        self.cache.update(&mut snap.procs, &mut snap.strings);
+        // The generation of the snapshot we are building. `self.generation` only advances
+        // on a successful publish, so this is one past the last published generation; a
+        // skipped cycle (take_back failed above) never reaches here, keeping the generation
+        // clock in lock-step with published snapshots — the GC lease math depends on it.
+        let building_gen = self.generation + 1;
+        self.arena.set_gen(building_gen);
+
+        // Fill uid + cmdline handle (slow fields) on the surviving entries, then publish
+        // the Cmd-store view for UI resolution, then CPU%.
+        self.cache
+            .update(&mut self.arena, &mut snap.procs, building_gen);
+        snap.cmd = self.cache.resolver(&self.arena);
         self.cpu.update(&mut snap.procs, now);
         snap.first_root = tree::build(&mut snap.procs, &mut self.tree_stack, &mut self.tree_order);
         tree::aggregate(&mut snap.procs, &self.tree_order);
@@ -817,11 +909,21 @@ impl Gatherer {
         self.sys_cpu.update(&mut snap.sys);
         snap.count_tasks();
 
-        self.generation += 1;
-        snap.generation = self.generation;
+        self.generation = building_gen;
+        snap.generation = building_gen;
 
         let prev = self.arc_swap.swap(arc);
         self.recycled = Some(prev);
+
+        // Reclaim cmdline slots no live snapshot can reference. At end of generation N the
+        // live snapshots are N (just published) and possibly N−1 (UI not yet advanced);
+        // anything demoted at gen ≤ N−1 is referenced only by snapshots ≤ N−2, all dead
+        // (building N required the UI to have dropped N−2). `GC_LAG` (2) reclaims ≤ N−2 —
+        // one generation more conservative than strictly required. The arena GC frees any
+        // region a store relocate retired, on the same lease.
+        let min_live = self.generation.saturating_sub(GC_LAG);
+        self.cache.gc(&self.arena, min_live);
+        self.arena.gc(min_live);
     }
 
     /// Reset and pre-size the snapshot, seeding tombstones for every PID in sorted
@@ -1080,12 +1182,12 @@ mod tests {
             .find(|p| p.pid == std::process::id())
             .expect("self");
         assert!(!me.is_kthread, "the test process is not a kernel thread");
-        assert!(me.cmdline.len > 0, "self should have a cmdline");
+        assert!(!me.cmdline.is_empty(), "self should have a cmdline");
 
         for p in &snap.procs {
             if p.is_kthread {
-                assert_eq!(
-                    p.cmdline.len, 0,
+                assert!(
+                    p.cmdline.is_empty(),
                     "kthread {} must have empty cmdline",
                     p.pid
                 );
@@ -1123,8 +1225,8 @@ mod tests {
         assert_eq!(snap.pool_overflow, 0, "default pool should not overflow");
     }
 
-    /// cmdline survives the coarse cadence: a PID not refreshed this cycle still gets
-    /// its cached cmdline re-materialized into the current arena (valid `StringRef`).
+    /// cmdline survives the coarse cadence: a PID not refreshed this cycle keeps its
+    /// persistent `Cmd`-store slot, still resolvable through the new snapshot's view.
     #[test]
     fn cmdline_persists_across_coarse_cycles() {
         let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
@@ -1134,19 +1236,112 @@ mod tests {
         let snap1 = cell.load_full();
         let cmd1 = {
             let p = snap1.procs.iter().find(|p| p.pid == me).expect("self c1");
-            String::from_utf8_lossy(snap1.strings.get(p.cmdline)).into_owned()
+            String::from_utf8_lossy(snap1.cmdline(p)).into_owned()
         };
         assert!(!cmd1.is_empty(), "self cmdline should be present");
 
-        // A second cycle (no time for argv to change) must still show the cmdline,
-        // re-materialized from the cache into the new arena.
+        // A second cycle (no time for argv to change) must still resolve the cmdline from
+        // the persistent slot — no re-copy, but the new snapshot's resolver sees it.
         g.gather(&mut backend);
         let snap2 = cell.load_full();
         let cmd2 = {
             let p = snap2.procs.iter().find(|p| p.pid == me).expect("self c2");
-            String::from_utf8_lossy(snap2.strings.get(p.cmdline)).into_owned()
+            String::from_utf8_lossy(snap2.cmdline(p)).into_owned()
         };
         assert_eq!(cmd1, cmd2, "cmdline must persist across cycles");
+    }
+
+    /// Generational lease across the double buffer: a snapshot held by the "UI" must keep
+    /// resolving a PID's cmdline even after that PID dies and a later gather evicts it —
+    /// eviction *demotes* the slot, and GC (lagging by [`GC_LAG`]) must not reclaim it while
+    /// the older snapshot still references it. This is the safety property the shared,
+    /// persistent `Cmd` store rests on (the per-snapshot arena reset could never violate it,
+    /// but a shared store can if the lease is wrong).
+    #[test]
+    fn held_snapshot_resolves_dead_pid_cmdline() {
+        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let mut backend = g.build_backend();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let cpid = child.id();
+
+        g.gather(&mut backend); // gen 1: child alive, cmdline read fresh
+        let held = cell.load_full(); // UI leases gen 1 (and its Cmd-store slots)
+        let cmd_before = {
+            let p = held
+                .procs
+                .iter()
+                .find(|p| p.pid == cpid)
+                .expect("child in gen 1");
+            String::from_utf8_lossy(held.cmdline(p)).into_owned()
+        };
+        assert!(
+            cmd_before.contains("sleep"),
+            "child cmdline was {cmd_before:?}"
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        // gen 2: child gone → evicted from the cache, its cmd slot demoted at gen 2. GC runs
+        // at min_live = gen2 − GC_LAG, which cannot reach gen 2 → the slot is kept.
+        g.gather(&mut backend);
+
+        let p = held
+            .procs
+            .iter()
+            .find(|p| p.pid == cpid)
+            .expect("child still present in the held gen-1 snapshot");
+        assert_eq!(
+            String::from_utf8_lossy(held.cmdline(p)),
+            cmd_before,
+            "held snapshot must keep resolving the dead PID's cmdline (generational lease)"
+        );
+    }
+
+    /// The win: an unchanged cmdline is **not** re-interned each cycle, so the `Cmd` store's
+    /// high-water slot count stays proportional to live processes, not to cycle count. If
+    /// the old per-cycle re-materialization were still happening (or unchanged strings were
+    /// re-interned), the store would grow by ~one slot per userspace PID per cycle.
+    #[test]
+    fn cmd_store_does_not_grow_per_cycle() {
+        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let mut backend = g.build_backend();
+        let me = std::process::id();
+
+        // Warm up: settle cmdlines and let births/deaths reach steady state. Drop each
+        // snapshot so the gatherer recycles buffers freely (no lease stall).
+        for _ in 0..6 {
+            g.gather(&mut backend);
+            drop(cell.load_full());
+        }
+        let slots_warm = g.cache.cmd_store.slot_count();
+        let userspace = {
+            let s = cell.load_full();
+            s.procs.iter().filter(|p| !p.is_kthread).count()
+        };
+
+        for _ in 0..30 {
+            g.gather(&mut backend);
+            drop(cell.load_full());
+        }
+        let slots_after = g.cache.cmd_store.slot_count();
+
+        // Slack covers genuine churn (new userspace PIDs over ~18 s); the disaster mode
+        // would be `userspace × 30` extra slots.
+        let growth = slots_after - slots_warm;
+        assert!(
+            growth <= userspace.max(64),
+            "Cmd store grew by {growth} slots over 30 cycles (userspace pids ≈ {userspace}); \
+             unchanged cmdlines are being re-interned"
+        );
+
+        // And the latest snapshot still resolves self correctly.
+        let s = cell.load_full();
+        let p = s.procs.iter().find(|p| p.pid == me).expect("self");
+        assert!(!s.cmdline(p).is_empty(), "self cmdline must resolve");
     }
 
     /// §3a: a sequentially-allocated new process is caught by the skip-cycle birth probe

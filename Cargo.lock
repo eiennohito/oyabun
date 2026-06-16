@@ -26,6 +26,7 @@ dependencies = [
  "etch",
  "io-uring",
  "libc",
+ "thoop",
 ]
 
 [[package]]
@@ -330,6 +331,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "thoop"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

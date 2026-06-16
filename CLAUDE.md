@@ -61,6 +61,7 @@ crates/
   atop/     process-manager TUI: 2 threads, ArcSwap snapshot exchange
     gather/ gatherer thread: read /proc, parse, CPU%, tree, publish
   etch/     retained-mode, value-gated terminal renderer
+  thoop/    THP-backed generational storage primitives (MmapRegion, GenStore, …)
 docs/       ARCHITECTURE.md (design — read first), GOALS.md, plans/
 ```
 

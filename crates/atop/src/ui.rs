@@ -218,9 +218,9 @@ fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_
             );
             advance_guides(&mut guides, depth, has_next);
 
-            let cmdline = snap.strings.get(p.cmdline);
+            let cmdline = snap.cmdline(p);
             let (text, is_name) = if cmdline.is_empty() {
-                (snap.strings.get(p.name), true)
+                (snap.name(p), true)
             } else {
                 (cmdline, false)
             };

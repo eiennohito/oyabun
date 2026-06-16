@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 etch = { path = "../etch" }
+thoop = { path = "../thoop" }
 crossterm = "0.29"
 libc = "0.2"
 io-uring = "0.7.12"

@@ -127,7 +127,7 @@ mod tests {
             ticks: 0,
             start_time: 0,
             name: StringRef::EMPTY,
-            cmdline: StringRef::EMPTY,
+            cmdline: thoop::StringRef::EMPTY,
             non_ascii: false,
             is_kthread: false,
             parent_idx: NONE,

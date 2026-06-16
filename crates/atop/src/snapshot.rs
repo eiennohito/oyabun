@@ -96,7 +96,7 @@ pub struct ProcessEntry {
 
 impl ProcessEntry {
     /// A tombstone for a PID that vanished mid-scan; compacted out before publish.
-    const TOMBSTONE: ProcessEntry = ProcessEntry {
+    pub(crate) const TOMBSTONE: ProcessEntry = ProcessEntry {
         pid: 0,
         ppid: 0,
         uid: 0,
@@ -136,9 +136,6 @@ pub struct Snapshot {
     pub first_root: u32,
     /// Monotonic version; UI rebuilds its display list when this changes.
     pub generation: u64,
-    /// Stable `io_uring` registered-buffer index for `strings` (one per physical
-    /// buffer in the double-buffer pool). Ignored by the syscall backend.
-    pub buf_index: u16,
     /// Live PIDs this cycle that exceeded the persistent-fd pool and used the transient
     /// fallback read (0 in the common case). Non-zero ⇒ `RLIMIT_NOFILE` is the binding
     /// constraint; surfaced so the cap is never silent.
@@ -148,13 +145,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn new(min_buf: usize, buf_index: u16) -> Self {
+    pub fn new(min_buf: usize) -> Self {
         Self {
             procs: Vec::new(),
             strings: HugePageBuf::new(min_buf),
             first_root: NONE,
             generation: 0,
-            buf_index,
             pool_overflow: 0,
             sys: SystemStats::default(),
         }

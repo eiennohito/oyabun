@@ -43,8 +43,9 @@ The UI **must** use `load_full()` (a real `Arc`, bumping the strong count), not 
 cheap `load()` guard — otherwise `get_mut`'s uniqueness check would race the UI's
 read. If `get_mut` ever fails (UI still holding it — vanishingly rare given the
 500 ms interval vs ms-scale UI turnaround), the gatherer **skips that cycle** rather
-than allocate a third buffer (a third buffer would have no registered io_uring
-buffer index — see below).
+than allocate a third buffer (the landing pad is backend-owned and shared, so a
+third snapshot is no longer *impossible* — but the design keeps exactly two so the
+snapshot pool stays bounded and the recycling logic stays simple).
 
 ## Snapshot model
 
@@ -53,7 +54,7 @@ allocation. `Vec::clear` drops nothing, so reset is O(1).
 
 ```
 Snapshot { procs: Vec<ProcessEntry>, strings: HugePageBuf, first_root: u32,
-           generation: u64, buf_index: u16, sys: SystemStats }
+           generation: u64, sys: SystemStats }
 
 SystemStats {                        // Copy, per-cycle system-wide stats
   cpu_user_bp, cpu_sys_bp, cpu_iowait_bp,   // CPU deltas as basis points
@@ -94,24 +95,26 @@ Every failure path (open, read, reopen, parse) must re-mark the slot dead, or it
 compaction as a *phantom row* — a real PID with empty fields. This is load-bearing for the
 birth probe (below), where most speculative reads are meant to fail.
 
-## Arena (`HugePageBuf`)
+## Memory regions (`MmapRegion`, `HugePageBuf`)
 
-`mmap(MAP_ANONYMOUS|MAP_PRIVATE)` rounded to 2 MiB, `madvise(MADV_HUGEPAGE)` to cut
-TLB misses during both I/O fill and UI scan. A bump cursor; `reset()` rewinds it.
-`reserve()` grows by doubling (re-mmap + copy) and reports whether the base moved so
-the io_uring buffer registration can be refreshed. It is **both** the I/O target and
-the string store: the gatherer reads `/proc` stat text straight into it and `comm` is
-recorded as a `StringRef` pointing into that raw text — genuinely zero-copy. It also
-receives the per-cycle cmdline copies re-materialized from `ProcCache` (see below).
-`unsafe impl Send + Sync` is sound because mutation only happens under `get_mut`
-(unique access) and shared access is read-only.
+`MmapRegion` is the owned-`mmap` primitive (anonymous private mapping, rounded up to a
+2 MiB huge page, `MADV_HUGEPAGE`-hinted, unmapped on drop). It backs the string arena and
+the io_uring landing pad, and is the seed for the deferred move of the gatherer's
+persistent structures onto huge pages. When only part of a mapping should be *pinned*, the
+caller registers a sub-range — the landing pad pins only its read-slot prefix and uses the
+free huge-page tail for unpinned scratch (below), so locked memory never exceeds the prefix.
 
-**Reserve-up-front invariant**: the gatherer `reserve()`s the whole cycle's arena need
-(`pids × (STAT_SLOT + CMD_SLOT)` + long-stat headroom) before any read or io_uring
-submission, so `alloc` never grows the mapping mid-cycle. A mid-cycle grow would
-relocate the mapping and invalidate in-flight `ReadFixed` destinations *and* leave the
-registered buffer stale for the next cycle. All transient reads (overflow, reopen) reuse
-or fit within that budget — reopen reads into the failed read's already-claimed slot.
+`HugePageBuf` (a huge `MmapRegion` + bump cursor; `reset()` rewinds, `reserve()` grows
+by doubling) is the snapshot's **string store** — *not* an I/O target. After parsing,
+the gatherer copies each PID's `comm` (~15 B) into it, plus the per-cycle cmdline copies
+re-materialized from `ProcCache`. Cross-thread sharing is sound because mutation happens
+only under `get_mut` (unique access) and shared access is read-only.
+
+Because the arena is no longer an io_uring registered buffer, a mid-cycle grow can no
+longer race an in-flight read or stale a registration. The gatherer still `reserve()`s
+the cycle's need up front, but now purely to avoid a re-mmap+copy mid-fill — a
+performance choice, not a correctness invariant. Reads land elsewhere (the landing pad,
+below); only the small `comm`/cmdline copies hit the arena.
 
 ## `/proc` enumeration — maintained live set + cadence + birth probe
 
@@ -136,12 +139,16 @@ cost is kernel-side dirent materialization, so the only unprivileged lever is fr
 This enumeration cadence is the shared component the scale-observation plan's per-PID
 *sampling* cadence builds on — the two are independent knobs.
 
-## Zero-copy stat parse
+## Stat parse
 
-`parse_stat` works on `&[u8]` from the arena: first `(` … last `)` delimits `comm`
+`parse_stat` works on the `&[u8]` read slot: first `(` … last `)` delimits `comm`
 (handles spaces/parens); numeric fields are parsed byte-wise (no UTF-8 validation,
 overflow-checked). Field indices after `) `: 0 state, 1 ppid, **6 flags** (`PF_KTHREAD`
-→ `is_kthread`), 11 utime, 12 stime, 21 rss(pages), 19 starttime.
+→ `is_kthread`), 11 utime, 12 stime, 21 rss(pages), 19 starttime. `comm` is located as a
+slot-relative range and copied into the string arena (the read slot is reused
+immediately), so only the ~15 B name survives — raw stat text is never retained for the
+snapshot's life. A single fixed slot size covers any realistic line (max ~418 B), so the
+old two-tier long-stat promotion is gone.
 
 ## Linux I/O backends — persistent-fd pool
 
@@ -185,14 +192,20 @@ dead PID:    register_files_update(idx, -1)                    (eviction, low vo
 
 - **No Close in the chain** — the design's whole point. Cmdline and statx also left the
   chain (now `ProcCache`'s job), so a steady-state cached PID is a *single* `ReadFixed`.
-- **Registered buffers**: both snapshot arenas are registered at stable indices 0/1 =
-  `Snapshot::buf_index`; `ReadFixed` skips the per-read page-table walk. Re-registered
-  only when an arena grows (only ever in `prepare`, never mid-cycle — see the invariant).
+- **Landing pad (the single registered buffer)**: reads do not target the arena. They
+  target one huge-page mapping whose **read-slot prefix** (`read_slots × STAT_SLOT` bytes)
+  is the only registered — and so only pinned — region; each in-flight read claims a slot,
+  and `reap` parses it, copies `comm` into the arena, and frees the slot. `ReadFixed` still
+  skips the per-read page-table walk. The prefix never grows, so it is registered once at
+  probe and never re-registered. In-flight read depth is bounded by the slot count (a few
+  extra wait rounds at high PID counts; the count is the pinned-memory ↔ wakeups dial).
 - **`IO_LINK` on open**: if the process vanished before open the read cancels
   (`ECANCELED`); the slot was never installed, so it is freed without a close.
 - **Reopen / overflow** are deferred until the ring fully drains, then read transiently
-  (a non-fixed close hits `files->file_lock` briefly, never `uring_lock`). Reopen reuses
-  the failed read's slot; overflow allocates within the up-front reserve.
+  into a **dedicated scratch slot** carved from the huge page's free tail (past the
+  registered prefix — never a read slot, so always safe regardless of drain state; a
+  non-fixed close hits `files->file_lock` briefly, never `uring_lock`), copying `comm`
+  into the arena like any other read.
 - **Wait-batching (one wakeup/cycle)**: submit the whole batch, then wait for all its
   completions at once instead of draining one at a time. This collapsed ~51 blocking waits
   per cycle — each a scheduler context switch — to ~1, the largest remaining slice of pure
@@ -204,12 +217,13 @@ dead PID:    register_files_update(idx, -1)                    (eviction, low vo
 `RING_ENTRIES=4096` bounds in-flight concurrency (multiple fill/reap rounds per cycle
 when `pool_cap` is large). `submit_and_wait` retries on `EINTR`.
 
-**Known limitation — pinned memory scales with PID count.** Both arenas are registered as
-fixed io_uring buffers, so locked memory grows with the process count and counts against
-the per-process lock limit. Under a low limit (8 MiB is common) it is exceeded a few
-thousand PIDs in; registration then fails on growth and the backend silently downgrades to
-syscall. The fix — register only a small fixed read region sized to in-flight depth — is
-the THP-arena plan's, and also unblocks a fair backend A/B at scale (deferred until then).
+**Pinned memory is bounded.** Only the landing pad is a registered (pinned) buffer, and
+it is fixed-size — locked memory is a small constant, independent of PID count, so a low
+per-process lock limit (8 MiB is common) no longer downgrades io_uring as the process
+count grows. (A separate, **root-caused** symptom — `io_uring_setup` returning `ENOMEM` under a
+non-root `perf record` — is caused by perf's per-CPU ring buffers exhausting the
+per-user `user->locked_vm` counter that io_uring also checks against `RLIMIT_MEMLOCK`;
+the fix is raising `RLIMIT_MEMLOCK`. See `docs/plans/iouring-perf-fallback.md`.)
 
 ### syscall backend
 
@@ -348,13 +362,12 @@ with a small hand-rolled `FxHash`-style hasher (`FxBuildHasher`), since the defa
 
 - **Persistent-fd pool** replaced the per-cycle `open→read→close` chains — the
   close-storm fix. Cmdline/uid moved out of the io_uring chain into `ProcCache` (plain
-  syscalls, coarse cadence). The plan's section 1a (a registered read-buffer *prefix*,
-  decoupling I/O target from string store) is deliberately deferred: the persistent
-  pool needs none of it — `ReadFixed` just rotates its target between the two already-
-  registered arenas. The arena still holds per-cycle stat text (~`STAT_SLOT`/PID).
-- **Reopen reuses the failed read's slot** (no extra alloc) and is deferred until the
-  ring drains — preserving the reserve-up-front invariant so `alloc` never grows the
-  arena mid-cycle (which would corrupt in-flight reads / stale the registration).
+  syscalls, coarse cadence).
+- **I/O target decoupled from the string store** (the plan's §1a, implemented as a
+  separate fixed landing pad rather than a prefix carved from the arena): reads land in
+  the pad, then `comm` is copied into the arena. This bounds pinned memory and let the
+  two-tier long-stat slot mechanism go away (one fixed slot size with ample margin).
+- **Reopen / overflow** read transiently into a free landing slot after the ring drains.
 - **Bounded in-flight** (not fixed "waves") — more overlap, self-balancing.
 - **CpuTracker** and the fd pools are persistent `HashMap`s, not flat PID-indexed
   arrays (which would be ~32 MB).

@@ -2,7 +2,17 @@
 
 ## Core constraints
 
-- **Lightning fast**: sub-millisecond response to input, minimal render latency.
+- **Lowest possible footprint, on purpose**: a *full-featured* process manager **and** the
+  smallest CPU/memory cost we can engineer — a hard goal, not a nicety. The governing belief:
+  **nothing is free.** Every convenience has a price — a per-cycle copy, an allocation, a
+  syscall, a bounds check on the hot path — and we would rather build the careful primitive
+  once than pay that price every cycle forever. This is deliberately anti-pragmatic: when the
+  pragmatic choice is "just copy it, it's cheap," the default here is to ask whether a
+  primitive removes the cost entirely. The enabling strategy is **safe-ish primitives** —
+  confine the unavoidable `unsafe` (mmap-backed arenas, the lock-free snapshot exchange,
+  io_uring buffers) behind small, tested types so we can keep experimenting with
+  extreme-low-overhead techniques without the unsafe sprawling across the codebase.
+- **Lightning fast**: minimal render latency.
 - **Near-zero CPU at idle**: htop is considered heavy. Event-driven where possible, poll only when visible and only at display refresh rate.
 - **Robust process tree**: parent-child relationships, thread grouping, cgroup awareness.
 - **CEF/Chromium-based app awareness**: Chrome, Electron apps (Slack, Spotify, VS Code, etc.) — collapse and label their process forests intelligently. Collapse rules are persistable (e.g. "always collapse Spotify").

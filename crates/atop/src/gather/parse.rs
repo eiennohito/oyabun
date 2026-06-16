@@ -1,10 +1,12 @@
-//! Zero-copy `/proc/<pid>/stat` parsing.
+//! `/proc/<pid>/stat` parsing.
 //!
-//! Operates directly on the raw bytes the kernel wrote into the arena. The `comm`
-//! field is recorded as a [`StringRef`] into that same buffer (no copy); numeric
-//! fields are parsed from bytes without UTF-8 validation.
+//! Operates directly on the raw bytes read into the `io_uring` landing pad (or the
+//! syscall backend's scratch). `comm` is located as a relative [`StringRef`] into that
+//! read slot; [`StatFields::write_into`] copies just those ~15 bytes into the snapshot's
+//! string arena (the slot is reused by the next read). Numeric fields are parsed
+//! byte-wise without UTF-8 validation.
 
-use crate::arena::StringRef;
+use crate::arena::{HugePageBuf, StringRef};
 use crate::snapshot::ProcessEntry;
 
 /// `PF_KTHREAD` in the stat `flags` field — set for kernel threads, which have a
@@ -22,6 +24,8 @@ pub struct StatFields {
     /// Start time (jiffies since boot) — stat field 22.
     pub start_time: u64,
     pub rss_pages: u64,
+    /// `comm` location **relative to the start of the parsed read slot** — copied into
+    /// the string arena by [`write_into`](Self::write_into), since the slot is reused.
     pub comm: StringRef,
     /// `comm` has a byte ≥ 0x80 (a process can set a non-ASCII name via `prctl`).
     pub comm_non_ascii: bool,
@@ -30,10 +34,19 @@ pub struct StatFields {
 }
 
 impl StatFields {
-    /// Populate a process entry from these parsed stat fields. `uid` and `cmdline`
+    /// Populate a process entry from these parsed stat fields, copying `comm` out of
+    /// the transient read `slot` into the snapshot's string arena (the slot is reused
+    /// by the next read, so `comm` cannot stay borrowed from it). `uid` and `cmdline`
     /// are filled afterward by [`ProcCache`](crate::gather); `cpu_pct`/`cpu_peak` and
     /// the tree links by later stages; `pid` was set when the tombstone was pushed.
-    pub fn write_into(&self, e: &mut ProcessEntry, page_size: u64) {
+    #[allow(clippy::cast_possible_truncation)] // comm len ≤ TASK_COMM_LEN (16)
+    pub fn write_into(
+        &self,
+        e: &mut ProcessEntry,
+        page_size: u64,
+        slot: &[u8],
+        arena: &mut HugePageBuf,
+    ) {
         e.ppid = self.ppid;
         e.state = self.state;
         e.priority = self.priority;
@@ -42,30 +55,52 @@ impl StatFields {
         e.ticks = self.ticks;
         e.start_time = self.start_time;
         e.mem_bytes = self.rss_pages.saturating_mul(page_size);
-        e.name = self.comm;
         e.non_ascii = self.comm_non_ascii;
         e.is_kthread = self.is_kthread;
+
+        // `comm.offset`/`len` come from `parse_stat` positions within `slot`, so they are
+        // in range — but resolve defensively (checked add + `get`) so a malformed field can
+        // never index out of bounds, and key the stored `StringRef` to the bytes actually
+        // copied (never the parsed `len`), so a fallback to empty can't leave a dangling ref.
+        let start = self.comm.offset as usize;
+        let comm = self
+            .comm
+            .offset
+            .checked_add(self.comm.len)
+            .and_then(|end| slot.get(start..end as usize))
+            .unwrap_or(&[]);
+        let off = arena.alloc(comm.len());
+        let ptr = arena.write_ptr(off);
+        // SAFETY: `off` was just allocated for exactly `comm.len()` bytes; `comm`
+        // borrows the read slot, which is disjoint from `arena`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(comm.as_ptr(), ptr, comm.len());
+        }
+        e.name = StringRef {
+            offset: off as u32,
+            len: comm.len() as u32,
+        };
     }
 }
 
-/// Parse one stat record. `slot_offset` is the byte offset of `slot[0]` within the
-/// arena, so the returned `comm` `StringRef` is absolute.
+/// Parse one stat record from a read `slot`. The returned `comm` `StringRef` is
+/// **relative to `slot[0]`** (the caller relocates it into the arena).
 ///
 /// `comm` is wrapped in parens and may contain spaces/parens; we take everything
 /// between the first `(` and last `)`. Numeric field indices (0-based, after `) `):
 /// 0=state 1=ppid 6=flags 11=utime 12=stime 15=priority 16=nice 17=`num_threads`
 /// 19=starttime 21=rss(pages).
-// `open`/`close` are positions within a slot bounded by STAT_SLOT_LONG (≤ 1 KiB),
-// so the offset/len casts cannot truncate.
+// `open`/`close` are positions within a slot bounded by STAT_SLOT (≤ 1 KiB), so the
+// offset/len casts cannot truncate.
 #[allow(clippy::cast_possible_truncation)]
-pub fn parse_stat(slot: &[u8], slot_offset: u32) -> Option<StatFields> {
+pub fn parse_stat(slot: &[u8]) -> Option<StatFields> {
     let open = slot.iter().position(|&b| b == b'(')?;
     let close = slot.iter().rposition(|&b| b == b')')?;
     if close <= open + 1 {
         return None;
     }
     let comm = StringRef {
-        offset: slot_offset + (open + 1) as u32,
+        offset: (open + 1) as u32,
         len: (close - open - 1) as u32,
     };
     let comm_non_ascii = slot[open + 1..close].iter().any(|&b| b >= 0x80);
@@ -174,7 +209,7 @@ mod tests {
     #[test]
     fn parses_simple_record() {
         let raw = b"1234 (bash) S 1000 1234 1234 0 -1 4194560 100 200 0 0 7 8 0 0 20 0 1 0 999 12345 678 18446744073709551615 1 1 0 0\n";
-        let f = parse_stat(raw, 0).expect("parse");
+        let f = parse_stat(raw).expect("parse");
         assert_eq!(f.ppid, 1000);
         assert_eq!(f.state, b'S');
         assert_eq!(f.priority, 20);
@@ -184,7 +219,7 @@ mod tests {
         assert_eq!(f.start_time, 999);
         assert_eq!(f.rss_pages, 678);
         assert!(!f.is_kthread, "flags 4194560 lacks PF_KTHREAD");
-        // comm offset points at 'b' in "(bash)" → index 6.
+        // comm offset is relative to slot[0]; points at 'b' in "(bash)" → index 6.
         assert_eq!(
             &raw[f.comm.offset as usize..(f.comm.offset + f.comm.len) as usize],
             b"bash"
@@ -195,7 +230,7 @@ mod tests {
     fn parses_negative_nice() {
         // nice = -10, priority = 10, num_threads = 4
         let raw = b"99 (cc1) R 50 99 99 0 -1 0 0 0 0 0 100 50 0 0 10 -10 4 0 500 0 1024 0 0\n";
-        let f = parse_stat(raw, 0).expect("parse");
+        let f = parse_stat(raw).expect("parse");
         assert_eq!(f.priority, 10);
         assert_eq!(f.nice, -10);
         assert_eq!(f.num_threads, 4);
@@ -207,7 +242,7 @@ mod tests {
         // comm = "Web Content (tab)"
         let raw =
             b"42 (Web Content (tab)) R 7 42 42 0 -1 0 0 0 0 0 11 22 0 0 20 0 1 0 0 0 4096 0 0\n";
-        let f = parse_stat(raw, 0).expect("parse");
+        let f = parse_stat(raw).expect("parse");
         assert_eq!(f.ppid, 7);
         assert_eq!(f.state, b'R');
         assert_eq!(f.ticks, 33);
@@ -216,30 +251,41 @@ mod tests {
     }
 
     #[test]
-    fn slot_offset_makes_comm_absolute() {
+    fn comm_offset_is_slot_relative() {
         let raw = b"5 (x) S 1 5 5 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 4096 0 0\n";
-        let f = parse_stat(raw, 1000).expect("parse");
-        assert_eq!(f.comm.offset, 1000 + 3); // '(' at index 2, comm 'x' at 3
+        let f = parse_stat(raw).expect("parse");
+        assert_eq!(f.comm.offset, 3); // '(' at index 2, comm 'x' at 3
         assert_eq!(f.comm.len, 1);
+    }
+
+    #[test]
+    fn write_into_copies_comm_into_arena() {
+        let raw = b"5 (x) S 1 5 5 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 4096 0 0\n";
+        let f = parse_stat(raw).expect("parse");
+        let mut arena = HugePageBuf::new(0);
+        let mut e = ProcessEntry::TOMBSTONE;
+        f.write_into(&mut e, 4096, raw, &mut arena);
+        assert_eq!(arena.get(e.name), b"x", "comm copied into the arena");
+        assert_eq!(e.ppid, 1);
     }
 
     #[test]
     fn detects_kernel_thread_flag() {
         // flags field (index 6) = 0x00200000 (PF_KTHREAD) | 0x40 = 2097216.
         let raw = b"2 (kthreadd) S 0 0 0 0 -1 2097216 0 0 0 0 5 6 0 0 20 0 1 0 7 0 0 0 0\n";
-        let f = parse_stat(raw, 0).expect("parse");
+        let f = parse_stat(raw).expect("parse");
         assert!(f.is_kthread, "PF_KTHREAD must be detected");
         assert_eq!(f.ppid, 0);
         assert_eq!(f.ticks, 11);
         // A userspace flags value (PF_KTHREAD clear) must not be flagged.
         let user = b"3 (bash) S 1 3 3 0 -1 4194304 0 0 0 0 5 6 0 0 20 0 1 0 7 0 0 0 0\n";
-        assert!(!parse_stat(user, 0).expect("parse").is_kthread);
+        assert!(!parse_stat(user).expect("parse").is_kthread);
     }
 
     #[test]
     fn rejects_garbage() {
-        assert!(parse_stat(b"not a stat line", 0).is_none());
-        assert!(parse_stat(b"", 0).is_none());
+        assert!(parse_stat(b"not a stat line").is_none());
+        assert!(parse_stat(b"").is_none());
     }
 
     #[test]

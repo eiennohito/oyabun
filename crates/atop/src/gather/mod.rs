@@ -1,13 +1,13 @@
-//! The gatherer thread: enumerate `/proc`, read stat files (`io_uring` or syscall),
-//! parse zero-copy into the back snapshot, compute CPU%, build the tree, and
-//! publish via `ArcSwap` using a two-buffer recycling protocol.
+//! The gatherer thread: enumerate `/proc`, read stat files (`io_uring` or syscall)
+//! into a fixed landing pad, parse into the back snapshot (copying `comm` into its
+//! string arena), compute CPU%, build the tree, and publish via `ArcSwap` using a
+//! two-buffer recycling protocol.
 
 mod parse;
 mod syscall;
 mod uring;
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
@@ -23,18 +23,26 @@ use crate::tree;
 use syscall::SyscallBackend;
 use uring::UringBackend;
 
-/// `/proc/<pid>/stat` slot. Theoretical max through field 21 (rss) is 418 bytes;
-/// 512 covers all realistic lines. PIDs whose stat exceeds this get `STAT_SLOT_LONG`
-/// on subsequent cycles (tracked in `Gatherer::long_stat_pids`).
-pub const STAT_SLOT: usize = 512;
-/// Fallback slot for PIDs whose `/proc/<pid>/stat` was truncated at `STAT_SLOT`.
-pub const STAT_SLOT_LONG: usize = 1024;
+/// `/proc/<pid>/stat` read-slot size — a **hard bound** (we only parse through field 21,
+/// rss; the kernel may emit more, which we truncate-and-ignore). Derivation of the worst
+/// case we must capture: `comm` is `TASK_COMM_LEN`-bounded (16, so ≤ 15 printable chars in
+/// parens); fields 0–21 are ~22 small integers, each a `%d`/`%lu` whose widest (vsize,
+/// starttime, the fault counters) is ~20 digits → pid + `(comm)` + ~22×~20 ≈ 418 bytes. A
+/// single fixed 1 KiB slot covers that with large margin, so there is no two-tier promotion.
+/// Used for both the `io_uring` landing-pad slots and the syscall scratch.
+pub const STAT_SLOT: usize = 1024;
 /// `/proc/<pid>/cmdline` slot. We never display >200 chars; if full detail is needed
 /// later, re-read via a non-batched API.
 pub const CMD_SLOT: usize = 256;
-/// Arena bytes per PID at the default (non-long) slot sizes: a stat read slot plus a
-/// re-materialized cmdline copy (both bounded by these consts).
-const BYTES_PER_PID: usize = STAT_SLOT + CMD_SLOT;
+/// Typical `comm` size for the arena reserve hint (`TASK_COMM_LEN` = 16, name ≤ 15 chars).
+/// Unlike [`STAT_SLOT`] this is **not** a hard bound: the actual copy uses `comm.len()` and
+/// the arena grows freely — see [`ARENA_BYTES_PER_PID`].
+const COMM_SLOT: usize = 16;
+/// Arena bytes reserved per PID: the copied-out `comm` plus a re-materialized cmdline.
+/// Smaller than the old stat-text-retaining arena since raw stat now lands in the
+/// (separate, fixed) read pad. A **reserve sizing hint only** — the arena grows freely if
+/// exceeded, so the per-PID estimate need not be exact.
+const ARENA_BYTES_PER_PID: usize = COMM_SLOT + CMD_SLOT;
 /// `io_uring` SQ depth. A new PID costs 2 SQEs (open+read), a cached PID 1; the bounded
 /// fill/reap loop submits in rounds, so this only bounds in-flight concurrency.
 const RING_ENTRIES: u32 = 4096;
@@ -43,7 +51,7 @@ const RING_ENTRIES: u32 = 4096;
 const RESERVED_FDS: u64 = 64;
 /// Upper bound on the persistent-fd pool — caps held kernel `struct file`s (and the
 /// fixed-file table) even when `RLIMIT_NOFILE` is enormous.
-const MAX_POOL: u32 = 4096;
+pub(crate) const MAX_POOL: u32 = 4096;
 /// Initial arena size per snapshot buffer (grows by doubling if exceeded).
 /// 2 MiB ≈ 2700 PIDs at default slot sizes; grows automatically.
 const INIT_BUF: usize = 2 * 1024 * 1024;
@@ -126,6 +134,9 @@ struct Config {
     /// default a full ring ⇒ submit the batch and wait once for all of it (no overlap, since
     /// parse is now cheap). `ATOP_URING_BATCH_CAP` lowers it to re-enable overlap.
     batch_cap: usize,
+    /// `io_uring` landing-pad slot count — the in-flight read bound and the pinned-memory
+    /// ↔ wakeups dial (pad = `read_slots × STAT_SLOT`, fixed). `ATOP_READ_SLOTS`.
+    read_slots: usize,
 }
 
 impl Config {
@@ -139,6 +150,9 @@ impl Config {
             probe_width: env_u32("ATOP_PROBE_WIDTH").unwrap_or(PROBE_WIDTH).max(1),
             batch_cap: env_u32("ATOP_URING_BATCH_CAP")
                 .map_or(RING_ENTRIES as usize, |n| n.max(1) as usize),
+            read_slots: env_u32("ATOP_READ_SLOTS").map_or(uring::READ_SLOTS, |n| {
+                (n.max(1) as usize).min(RING_ENTRIES as usize)
+            }),
         }
     }
 }
@@ -615,11 +629,10 @@ impl Backend {
         pids: &[u32],
         snap: &mut Snapshot,
         page_size: u64,
-        long_stat: &mut HashSet<u32>,
     ) -> std::io::Result<u32> {
         match self {
-            Backend::Uring(u) => u.collect(pids, snap, page_size, long_stat),
-            Backend::Syscall(s) => Ok(s.collect(pids, snap, page_size, long_stat)),
+            Backend::Uring(u) => u.collect(pids, snap, page_size),
+            Backend::Syscall(s) => Ok(s.collect(pids, snap, page_size)),
         }
     }
 }
@@ -635,9 +648,6 @@ pub struct Gatherer {
     sys_cpu: SysCpuAccum,
     tree_stack: Vec<u32>,
     tree_order: Vec<u32>,
-    /// PIDs whose `/proc/<pid>/stat` filled the default `STAT_SLOT` — next cycle
-    /// allocates `STAT_SLOT_LONG` for them so the full line is captured.
-    long_stat_pids: HashSet<u32>,
     /// Persistent-fd pool capacity, retained for the mid-run `io_uring`→syscall downgrade.
     pool_cap: u32,
     config: Config,
@@ -654,8 +664,8 @@ impl Gatherer {
     /// gatherer thread, so the `io_uring` ring is owned by its sole submitter. Runs on the
     /// main thread; does no `/proc` I/O.
     pub fn new(page_size: u64) -> std::io::Result<(Self, Arc<ArcSwap<Snapshot>>)> {
-        let front = Arc::new(Snapshot::new(INIT_BUF, 0));
-        let back = Arc::new(Snapshot::new(INIT_BUF, 1));
+        let front = Arc::new(Snapshot::new(INIT_BUF));
+        let back = Arc::new(Snapshot::new(INIT_BUF));
 
         let pool_cap = pool_capacity();
         let arc_swap = Arc::new(ArcSwap::from(front));
@@ -670,7 +680,6 @@ impl Gatherer {
             sys_cpu: SysCpuAccum::new(),
             tree_stack: Vec::new(),
             tree_order: Vec::new(),
-            long_stat_pids: HashSet::new(),
             pool_cap,
             config: Config::from_env(),
             pid_max: sys::read_pid_max(),
@@ -705,17 +714,13 @@ impl Gatherer {
         if force_syscall() {
             return Backend::Syscall(SyscallBackend::new(self.pool_cap));
         }
-        let front = self.arc_swap.load_full();
-        let back = self
-            .recycled
-            .as_ref()
-            .expect("recycled buffer present before first gather");
+        // The backend owns its own fixed landing pad; it no longer registers the
+        // snapshot arenas, so probing needs nothing from the snapshots.
         match UringBackend::probe(
             self.pool_cap,
             RING_ENTRIES,
             self.config.batch_cap,
-            &front,
-            back,
+            self.config.read_slots,
         ) {
             Some(u) => Backend::Uring(Box::new(u)),
             None => Backend::Syscall(SyscallBackend::new(self.pool_cap)),
@@ -776,30 +781,20 @@ impl Gatherer {
         };
         let snap = Arc::get_mut(&mut arc).expect("recycled buffer is unique");
 
-        // Arena: STAT_SLOT (stat read) + CMD_SLOT (re-materialized cmdline) per PID,
-        // plus extra for long-stat PIDs. The long-stat set is empty on the vast majority
-        // of systems, so skip the O(n) scan entirely in that case.
-        let n_long = if self.long_stat_pids.is_empty() {
-            0
-        } else {
-            self.pids
-                .iter()
-                .filter(|p| self.long_stat_pids.contains(p))
-                .count()
-        };
-        let needed = self.pids.len() * BYTES_PER_PID + n_long * (STAT_SLOT_LONG - STAT_SLOT);
-        Self::prepare(snap, &self.pids, needed, backend);
+        // Arena holds only the copied-out comm + re-materialized cmdline per PID now
+        // (raw stat lands in the backend's fixed read pad). A reserve hint — the arena
+        // grows freely if exceeded, since it is no longer an io_uring target.
+        let needed = self.pids.len() * ARENA_BYTES_PER_PID;
+        Self::prepare(snap, &self.pids, needed);
 
-        let overflow = if let Ok(overflow) =
-            backend.collect(&self.pids, snap, self.page_size, &mut self.long_stat_pids)
-        {
+        let overflow = if let Ok(overflow) = backend.collect(&self.pids, snap, self.page_size) {
             overflow
         } else {
             // io_uring failed mid-cycle: drop to syscall permanently and redo.
             *backend = Backend::Syscall(SyscallBackend::new(self.pool_cap));
-            Self::prepare(snap, &self.pids, needed, backend);
+            Self::prepare(snap, &self.pids, needed);
             backend
-                .collect(&self.pids, snap, self.page_size, &mut self.long_stat_pids)
+                .collect(&self.pids, snap, self.page_size)
                 .unwrap_or(0)
         };
         snap.pool_overflow = overflow;
@@ -829,26 +824,16 @@ impl Gatherer {
         self.recycled = Some(prev);
     }
 
-    /// Reset and pre-size the snapshot, re-registering the `io_uring` buffer if it
-    /// grew (moved). Seeds tombstones for every PID in sorted order.
-    ///
-    /// `reserve` MUST happen before any `alloc` or `io_uring` submission that targets
-    /// this buffer — a grow relocates the mapping and would invalidate registered
-    /// buffer pointers and in-flight read destinations.
-    fn prepare(snap: &mut Snapshot, pids: &[u32], needed: usize, backend: &mut Backend) {
+    /// Reset and pre-size the snapshot, seeding tombstones for every PID in sorted
+    /// order. The arena is no longer an `io_uring` target, so `reserve` is a pure
+    /// performance hint (avoid mid-cycle re-mmap+copy) — a grow no longer races
+    /// in-flight reads or staleness any registered buffer.
+    fn prepare(snap: &mut Snapshot, pids: &[u32], needed: usize) {
         snap.reset();
         for &pid in pids {
             snap.push_tombstone(pid);
         }
-        if snap.strings.reserve(needed)
-            && let Backend::Uring(u) = backend
-        {
-            u.update_buffer(
-                snap.buf_index,
-                snap.strings.as_ptr(),
-                snap.strings.capacity(),
-            );
-        }
+        snap.strings.reserve(needed);
     }
 
     /// Reclaim the back buffer with unique access. Spins briefly if the UI still
@@ -951,38 +936,30 @@ mod tests {
         let pids = enum_pids();
         let pool_cap = pool_capacity();
 
-        let mut a = Snapshot::new(INIT_BUF, 0);
-        let mut b = Snapshot::new(INIT_BUF, 1);
+        let mut a = Snapshot::new(INIT_BUF);
+        let mut b = Snapshot::new(INIT_BUF);
 
-        let Some(mut uring) =
-            UringBackend::probe(pool_cap, RING_ENTRIES, RING_ENTRIES as usize, &a, &b)
-        else {
+        let Some(mut uring) = UringBackend::probe(
+            pool_cap,
+            RING_ENTRIES,
+            RING_ENTRIES as usize,
+            uring::READ_SLOTS,
+        ) else {
             eprintln!("io_uring unavailable — skipping oracle comparison");
             return;
         };
 
-        let mut long_stat = HashSet::new();
-
         for &pid in &pids {
             a.push_tombstone(pid);
         }
-        a.strings.reserve(pids.len() * BYTES_PER_PID);
-        SyscallBackend::new(pool_cap).collect(&pids, &mut a, page_size, &mut long_stat);
+        SyscallBackend::new(pool_cap).collect(&pids, &mut a, page_size);
         a.compact();
 
         for &pid in &pids {
             b.push_tombstone(pid);
         }
-        // Force growth past INIT_BUF to exercise the re-register-on-grow path even
-        // on machines with few processes.
-        let needed = (pids.len() * BYTES_PER_PID).max(INIT_BUF + 1);
-        if b.strings.reserve(needed) {
-            uring.update_buffer(b.buf_index, b.strings.as_ptr(), b.strings.capacity());
-        } else {
-            panic!("expected buffer growth to be forced");
-        }
         uring
-            .collect(&pids, &mut b, page_size, &mut long_stat)
+            .collect(&pids, &mut b, page_size)
             .expect("uring collect");
         b.compact();
 

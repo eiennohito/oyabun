@@ -114,6 +114,30 @@ Consequences:
   reset each cycle, so **carry-forward requires stable string storage** that is not reset.
   This is the cmdline-intern / stable-string-arena deferred from the THP plan: it becomes a
   prerequisite here. Comm and cmdline of unsampled PIDs are referenced, not re-read.
+
+  **Binding constraint — the stable-string primitive (so this stays safe-ish, per GOALS).**
+  Today the per-cycle copy of cmdline into the snapshot arena is a *price* we pay to keep each
+  snapshot a self-contained immutable value (the UI dereferences only memory inside the
+  published `Arc<Snapshot>`). Eliminating it means the UI reads a *persistent, gatherer-owned*
+  store across the thread boundary — which is exactly where this gets dangerous. The defect to
+  fix is that `StringRef` today has **implicit provenance** ("the snapshot's strings"); the
+  moment a ref can resolve against more than one buffer, a wrong-arena deref is a representable
+  invalid state. The required shape:
+  - **One resolver owns all string backing.** The UI only ever calls one `resolve(ref)`; raw
+    pointers never escape it — *all* the unsafe lives in that single tested type, not spread
+    across N arenas with bare offsets (the path to avoid).
+  - **`StringRef` carries explicit provenance** (a region tag) → wrong-arena resolution becomes
+    non-representable (one panic site, never silent corruption).
+  - **The persistent segment is non-relocating, append-only, generationally reclaimed.** It must
+    never move bytes already written (grow by adding chunks, never a realloc that copies-and-
+    moves), only append, and reclaim a dead incarnation's bytes only after no live snapshot can
+    reference them (lag the live snapshots by ≥ the buffer count — 2). Only then does a published
+    ref stay valid *and* visible: the gatherer writes before the `ArcSwap` release, the UI sees
+    it after the acquire (happens-before). Anything that relocates or eagerly frees breaks a live
+    UI read.
+  - **Forbidden:** several independently-lifetime'd raw arenas with untagged offsets and ad-hoc
+    cross-thread reads. That is the "wildly unsafe" failure mode; the single-resolver +
+    tagged-ref + non-relocating-append-only discipline is what keeps it a *safe-ish primitive*.
 - The tree build uses carried-forward `ppid` for cold PIDs (ppid is near-static; only changes
   on reparent — caught within N cycles, or promptly if we re-read a dead parent's former
   children).
@@ -183,8 +207,10 @@ only addition here:
   while the front may still be UI-referenced needs care (copy under unique access; the two-
   buffer model still holds, but the "reset + refill" assumption is replaced by "copy + patch").
 - **Stable string storage lifetime**: a carried-forward `StringRef` into a gatherer-owned stable
-  arena must outlive any snapshot referencing it — generation-eviction of that arena must lag
-  the live snapshots (≥1 generation). Cross-thread lifetime hazard; design explicitly.
+  arena must outlive any snapshot referencing it — reclaim must lag the live snapshots (≥ the
+  buffer count, i.e. 2, since a ref can be held by both the published front and the
+  about-to-publish back). Cross-thread lifetime hazard; design explicitly per the binding
+  constraint in §3 (single resolver, provenance-tagged ref, non-relocating append-only store).
 - **Gatherer ↔ UI coupling**: the gatherer becomes viewport-aware. Keep the dependency one-way
   and advisory so a missing/stale viewport only costs extra sampling, never correctness.
 - **Cold-tier staleness vs ranking**: bounded by the X-second SLA (`N = ceil(X/interval)`); X is

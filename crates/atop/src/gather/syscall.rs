@@ -8,15 +8,15 @@
 //! the PID was reused) the fd is reopened. When more PIDs are live than the pool can
 //! hold (low `RLIMIT_NOFILE`), the overflow falls back to transient open→read→close.
 //!
-//! `uid`/`cmdline` are **not** read here — they are slow-changing fields owned by
-//! `ProcCache` (plain syscalls on a coarse cadence). This backend produces only the
+//! Reads land in a reused scratch buffer (not the snapshot arena); `parse_stat` then
+//! copies the ~15 B `comm` into the arena. `uid`/`cmdline` are **not** read here — they
+//! are slow-changing fields owned by `ProcCache`. This backend produces only the
 //! volatile stat fields (comm + numerics, fresh every cycle).
 
-use std::collections::HashSet;
 use std::os::fd::RawFd;
 
 use crate::gather::parse::{self};
-use crate::gather::{PidMap, STAT_SLOT, STAT_SLOT_LONG};
+use crate::gather::{PidMap, STAT_SLOT};
 use crate::snapshot::Snapshot;
 use crate::sys::ProcPath;
 
@@ -35,6 +35,9 @@ pub struct SyscallBackend {
     pool_cap: usize,
     cur_gen: u32,
     stat_path: ProcPath,
+    /// Reused stat read buffer (no per-PID allocation); `comm` is copied out of it
+    /// into the arena by `parse`.
+    scratch: Vec<u8>,
 }
 
 impl SyscallBackend {
@@ -44,19 +47,14 @@ impl SyscallBackend {
             pool_cap: pool_cap as usize,
             cur_gen: 0,
             stat_path: ProcPath::new(),
+            scratch: vec![0u8; STAT_SLOT],
         }
     }
 
     /// Re-read every live PID's stat into the snapshot. `pids` is sorted; `snap` has a
     /// tombstone per PID at the matching index. Returns the count of PIDs that could
     /// not get a persistent slot and used the transient fallback (overflow).
-    pub fn collect(
-        &mut self,
-        pids: &[u32],
-        snap: &mut Snapshot,
-        page_size: u64,
-        long_stat: &mut HashSet<u32>,
-    ) -> u32 {
+    pub fn collect(&mut self, pids: &[u32], snap: &mut Snapshot, page_size: u64) -> u32 {
         self.cur_gen = self.cur_gen.wrapping_add(1);
         let cur_gen = self.cur_gen;
         let mut overflow = 0u32;
@@ -66,7 +64,7 @@ impl SyscallBackend {
                 Some(h) => {
                     // SAFETY: held fd is ours; rewind to regenerate the single-show file.
                     unsafe { libc::lseek(h.fd, 0, libc::SEEK_SET) };
-                    match fill_stat(h.fd, pid, i, snap, page_size, long_stat, None) {
+                    match fill_stat(h.fd, i, snap, page_size, &mut self.scratch) {
                         Some(start_time) if start_time == h.start_time => {
                             h.seen_gen = cur_gen;
                         }
@@ -79,7 +77,7 @@ impl SyscallBackend {
                             close_fd(h.fd);
                             self.held.remove(&pid);
                             if self
-                                .open_and_fill(pid, i, snap, page_size, long_stat, cur_gen)
+                                .open_and_fill(pid, i, snap, page_size, cur_gen)
                                 .is_none()
                             {
                                 snap.tombstone(i); // death/reopen-fail: no phantom row
@@ -90,7 +88,7 @@ impl SyscallBackend {
                 None => {
                     if self.held.len() < self.pool_cap {
                         if self
-                            .open_and_fill(pid, i, snap, page_size, long_stat, cur_gen)
+                            .open_and_fill(pid, i, snap, page_size, cur_gen)
                             .is_none()
                         {
                             snap.tombstone(i); // vanished before open
@@ -98,8 +96,14 @@ impl SyscallBackend {
                     } else {
                         // Pool full: transient read, no persistent slot.
                         overflow += 1;
-                        if !read_transient(pid, i, snap, page_size, long_stat, &mut self.stat_path)
-                        {
+                        if !read_transient(
+                            pid,
+                            i,
+                            snap,
+                            page_size,
+                            &mut self.stat_path,
+                            &mut self.scratch,
+                        ) {
                             snap.tombstone(i); // transient read failed
                         }
                     }
@@ -119,7 +123,6 @@ impl SyscallBackend {
         idx: usize,
         snap: &mut Snapshot,
         page_size: u64,
-        long_stat: &mut HashSet<u32>,
         cur_gen: u32,
     ) -> Option<u64> {
         let ptr = self.stat_path.write(pid, b"stat");
@@ -128,7 +131,7 @@ impl SyscallBackend {
         if fd < 0 {
             return None;
         }
-        if let Some(st) = fill_stat(fd, pid, idx, snap, page_size, long_stat, None) {
+        if let Some(st) = fill_stat(fd, idx, snap, page_size, &mut self.scratch) {
             self.held.insert(
                 pid,
                 HeldFd {
@@ -170,95 +173,45 @@ fn close_fd(fd: RawFd) {
     unsafe { libc::close(fd) };
 }
 
-/// Read an open stat `fd` (positioned at 0) into an arena slot and parse it into
-/// `snap.procs[idx]`. With `slot = None` a fresh slot is allocated; with
-/// `Some((off, cap))` it reads into that existing slot (no allocation — used by the
-/// uring reopen path so the up-front reserve is never exceeded). Returns the parsed
-/// `start_time`, or `None` on read failure (ESRCH/EOF) or parse failure. Does **not**
-/// close `fd`.
+/// Read an open stat `fd` (positioned at 0) into `scratch`, parse it, and write the
+/// result into `snap.procs[idx]` — copying `comm` out of `scratch` into `snap.strings`.
+/// Returns the parsed `start_time`, or `None` on read failure (ESRCH/EOF) or parse
+/// failure. Does **not** close `fd`.
 fn fill_stat(
     fd: RawFd,
-    pid: u32,
     idx: usize,
     snap: &mut Snapshot,
     page_size: u64,
-    long_stat: &mut HashSet<u32>,
-    slot: Option<(u32, usize)>,
+    scratch: &mut [u8],
 ) -> Option<u64> {
-    let (off, cap) = if let Some(oc) = slot {
-        oc
-    } else {
-        let cap = if long_stat.contains(&pid) {
-            STAT_SLOT_LONG
-        } else {
-            STAT_SLOT
-        };
-        let off = u32::try_from(snap.strings.alloc(cap)).expect("arena offset fits u32");
-        (off, cap)
-    };
-    let ptr = snap.strings.write_ptr(off as usize);
-    // SAFETY: ptr is a writable `cap`-byte region; fd is open.
-    let n = unsafe { libc::read(fd, ptr.cast(), cap) };
+    // SAFETY: scratch is a valid writable region; fd is open.
+    let n = unsafe { libc::read(fd, scratch.as_mut_ptr().cast(), scratch.len()) };
     if n <= 0 {
         return None;
     }
-    let len = u32::try_from(usize::try_from(n).unwrap_or(0).min(cap)).unwrap_or(0);
-    // Filled the slot exactly → the line was longer; promote next cycle.
-    if len as usize == cap && cap == STAT_SLOT {
-        long_stat.insert(pid);
-    }
-    let slice = snap.strings.bytes(off, len);
-    let f = parse::parse_stat(slice, off)?;
+    let len = usize::try_from(n).unwrap_or(0).min(scratch.len());
+    let f = parse::parse_stat(&scratch[..len])?;
     let start_time = f.start_time;
-    f.write_into(&mut snap.procs[idx], page_size);
+    f.write_into(
+        &mut snap.procs[idx],
+        page_size,
+        &scratch[..len],
+        &mut snap.strings,
+    );
     Some(start_time)
 }
 
 /// Transient open→read→close of `/proc/<pid>/stat` (the overflow path, shared with the
-/// uring backend when its persistent pool is full). Allocates a fresh slot. A non-fixed
-/// close hits `files->file_lock` briefly — never the `uring_lock` that drove the storm.
+/// `io_uring` backend for overflow and post-drain reopen). Reads into `scratch`. A
+/// non-fixed close hits `files->file_lock` briefly — never the `uring_lock` that drove
+/// the storm.
 pub(crate) fn read_transient(
     pid: u32,
     idx: usize,
     snap: &mut Snapshot,
     page_size: u64,
-    long_stat: &mut HashSet<u32>,
     path: &mut ProcPath,
-) -> bool {
-    read_stat(pid, idx, snap, page_size, long_stat, path, None)
-}
-
-/// Transient read into an **already-allocated** slot `(off, cap)` — the uring reopen
-/// path, where the failed cached read already claimed a slot. No new allocation, so the
-/// cycle's up-front arena reserve stays sufficient (no mid-cycle grow).
-pub(crate) fn reread_into(
-    pid: u32,
-    idx: usize,
-    snap: &mut Snapshot,
-    page_size: u64,
-    long_stat: &mut HashSet<u32>,
-    path: &mut ProcPath,
-    slot: (u32, u32),
-) -> bool {
-    read_stat(
-        pid,
-        idx,
-        snap,
-        page_size,
-        long_stat,
-        path,
-        Some((slot.0, slot.1 as usize)),
-    )
-}
-
-fn read_stat(
-    pid: u32,
-    idx: usize,
-    snap: &mut Snapshot,
-    page_size: u64,
-    long_stat: &mut HashSet<u32>,
-    path: &mut ProcPath,
-    slot: Option<(u32, usize)>,
+    scratch: &mut [u8],
 ) -> bool {
     let ptr = path.write(pid, b"stat");
     // SAFETY: valid C path, read-only.
@@ -266,7 +219,7 @@ fn read_stat(
     if fd < 0 {
         return false;
     }
-    let ok = fill_stat(fd, pid, idx, snap, page_size, long_stat, slot).is_some();
+    let ok = fill_stat(fd, idx, snap, page_size, scratch).is_some();
     close_fd(fd);
     ok
 }
@@ -274,7 +227,7 @@ fn read_stat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gather::{BYTES_PER_PID, INIT_BUF};
+    use crate::gather::INIT_BUF;
     use std::time::{Duration, Instant};
 
     fn enum_pids() -> Vec<u32> {
@@ -294,11 +247,10 @@ mod tests {
         let me = std::process::id();
         let pids = vec![me];
         let mut backend = SyscallBackend::new(64);
-        let mut long = HashSet::new();
 
-        let mut a = Snapshot::new(INIT_BUF, 0);
+        let mut a = Snapshot::new(INIT_BUF);
         a.push_tombstone(me);
-        backend.collect(&pids, &mut a, page_size, &mut long);
+        backend.collect(&pids, &mut a, page_size);
         a.compact();
         let ticks1 = a.procs.iter().find(|p| p.pid == me).expect("self c1").ticks;
         assert_eq!(backend.held.len(), 1, "self fd held after cycle 1");
@@ -311,9 +263,9 @@ mod tests {
         }
         std::hint::black_box(x);
 
-        let mut b = Snapshot::new(INIT_BUF, 1);
+        let mut b = Snapshot::new(INIT_BUF);
         b.push_tombstone(me);
-        backend.collect(&pids, &mut b, page_size, &mut long);
+        backend.collect(&pids, &mut b, page_size);
         b.compact();
         let ticks2 = b.procs.iter().find(|p| p.pid == me).expect("self c2").ticks;
         assert_eq!(backend.held.len(), 1, "fd reused, not reopened");
@@ -339,18 +291,17 @@ mod tests {
         let child_pid = child.id();
         let me = std::process::id();
         let mut backend = SyscallBackend::new(64);
-        let mut long = HashSet::new();
 
         let pids = {
             let mut v = vec![me, child_pid];
             v.sort_unstable();
             v
         };
-        let mut a = Snapshot::new(INIT_BUF, 0);
+        let mut a = Snapshot::new(INIT_BUF);
         for &p in &pids {
             a.push_tombstone(p);
         }
-        backend.collect(&pids, &mut a, page_size, &mut long);
+        backend.collect(&pids, &mut a, page_size);
         assert_eq!(backend.held.len(), 2, "both PIDs held");
 
         child.kill().unwrap();
@@ -358,9 +309,9 @@ mod tests {
 
         // Next cycle enumerates only self → the child's fd is evicted.
         let only_me = vec![me];
-        let mut b = Snapshot::new(INIT_BUF, 1);
+        let mut b = Snapshot::new(INIT_BUF);
         b.push_tombstone(me);
-        backend.collect(&only_me, &mut b, page_size, &mut long);
+        backend.collect(&only_me, &mut b, page_size);
         assert_eq!(backend.held.len(), 1, "vanished PID evicted");
         assert!(backend.held.contains_key(&me));
     }
@@ -372,13 +323,11 @@ mod tests {
         let page_size = crate::sys::page_size();
         let pids = enum_pids();
         let mut backend = SyscallBackend::new(4);
-        let mut long = HashSet::new();
-        let mut a = Snapshot::new(INIT_BUF, 0);
+        let mut a = Snapshot::new(INIT_BUF);
         for &p in &pids {
             a.push_tombstone(p);
         }
-        a.strings.reserve(pids.len() * BYTES_PER_PID);
-        let overflow = backend.collect(&pids, &mut a, page_size, &mut long);
+        let overflow = backend.collect(&pids, &mut a, page_size);
         a.compact();
 
         assert!(pids.len() > 10, "need a populated system for this test");
@@ -408,12 +357,11 @@ mod tests {
         let mut pids = vec![me, dead];
         pids.sort_unstable();
         let mut backend = SyscallBackend::new(64);
-        let mut long = HashSet::new();
-        let mut a = Snapshot::new(INIT_BUF, 0);
+        let mut a = Snapshot::new(INIT_BUF);
         for &p in &pids {
             a.push_tombstone(p);
         }
-        backend.collect(&pids, &mut a, page_size, &mut long);
+        backend.collect(&pids, &mut a, page_size);
         a.compact();
 
         assert!(

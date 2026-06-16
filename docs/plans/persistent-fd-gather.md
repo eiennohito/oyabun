@@ -53,6 +53,47 @@ not process *count*: **one stat read per live PID per cycle, ~zero opens, ~zero 
 ~zero statx**, with the lock contention gone — and do it within the **default 1024 fd
 soft limit** so no `setrlimit`, privilege, or container exception is needed.
 
+## Architecture: hybrid gather
+
+The persistent-fd optimization works with **both** backends. The architecture is a
+**shared fd pool** that the uring and syscall backends both consume, not an uring-only
+design. This matters because:
+
+- The syscall backend is the fallback and must remain correct and reasonably fast.
+- Some operations are better done synchronously (cmdline re-reads, uid refreshes) even
+  when uring is available — the volume is too low to justify SQE overhead.
+- Older kernels (5.4+) may lack io_uring features but still benefit from persistent fds
+  via the syscall backend.
+
+**Hybrid rule**: stat reads (the hot path, every PID every cycle) go through uring when
+available. Cmdline re-reads and uid refreshes (coarse cadence, ~1/N PIDs per cycle) use
+plain syscalls regardless — their volume is too low for batching to matter, and keeping
+them synchronous avoids complicating the SQE chains.
+
+### Kernel version support
+
+| feature | minimum kernel | fallback |
+|---|---|---|
+| io_uring basic (ring + submit) | 5.6 | syscall backend (existing) |
+| `IORING_REGISTER_FILES_SPARSE` | 5.19 | pre-allocate dense table (5.6+) or skip fixed files |
+| `IORING_OP_READ_FIXED` | 5.6 | ok |
+| fixed-file install via `OpenAt` + `file_index` | 5.15 | open via syscall, install via `IORING_REGISTER_FILES_UPDATE` (5.6+) |
+| direct descriptors don't count against `RLIMIT_NOFILE` | 5.12 | cap pool to soft limit minus headroom |
+
+**Target**: optimized path for 6.0+ (all features). Clean degradation to 5.4:
+
+- **5.4** (no io_uring): syscall backend with persistent fds (`lseek+read`). The pool
+  uses real fds capped to `RLIMIT_NOFILE - headroom`. Still eliminates open/close per
+  cycle. This is the floor — everything above is additive.
+- **5.6–5.14**: io_uring available but fixed-file install via openat may not work. Open
+  stat fds via syscall, register into the fixed-file table via
+  `IORING_REGISTER_FILES_UPDATE`, read via `ReadFixed`. Close via syscall on eviction.
+- **5.15+**: full direct-descriptor path. `OpenAt` with `file_index` installs directly.
+- **5.19+**: sparse file table (current code). No change needed.
+
+The probe already returns `None` on unsupported kernels; the new code just needs to
+probe each feature independently rather than all-or-nothing.
+
 ## Design
 
 ### 1. Persistent stat-fd pool (the core change)
@@ -60,9 +101,12 @@ soft limit** so no `setrlimit`, privilege, or container exception is needed.
 A gatherer-owned pool of open `/proc/<pid>/stat` fds, keyed by PID, reused across cycles
 (same lifecycle pattern as `CpuTracker`'s persistent `HashMap`).
 
-- **Capacity ≈ 960** (target 1024 default soft limit minus ~64 reserved for the `/proc`
-  dir fd, the ring, std{in,out,err}, kill pidfds, headroom).
-- First sighting of a PID → claim a slot, `openat` stat, install into a fixed-file slot.
+- **Capacity**: derived at startup from `getrlimit(RLIMIT_NOFILE).soft - RESERVED` (where
+  `RESERVED ≈ 64` covers the `/proc` dir fd, the ring, stdio, kill pidfds, headroom).
+  On uring with fixed-file slots (≥5.12), fixed slots don't count against the fd limit,
+  so the pool can be larger — but still capped to a sane max (~4096) to bound memory.
+- First sighting of a PID → claim a slot, open stat fd (syscall or uring depending on
+  kernel), install into the pool.
 - Every cycle → re-read the held fd (no open, no close). `do_task_stat` (the irreducible
   ~9%) is all that remains in the kernel read path.
 - PID disappears from enumeration → close its fd, free the slot (generation-tagged
@@ -80,6 +124,25 @@ A gatherer-owned pool of open `/proc/<pid>/stat` fds, keyed by PID, reused acros
 
 Per cached PID the io_uring chain collapses **7 SQEs → 1** (just the read).
 
+### 1a. Fixed read-buffer pool (registered prefix)
+
+Today the arena is both the I/O target and the string store — raw stat text (~500 bytes)
+stays allocated for the snapshot's lifetime even though only `comm` (~15 bytes) survives
+parsing. Decouple them:
+
+- **Read-buffer pool**: a fixed-size prefix of each arena, registered with io_uring.
+  `N_SLOTS` buffers of `STAT_SLOT` bytes each, recycled as each PID is parsed. Size TBD
+  (256–512 KiB); pinned memory is bounded regardless of PID count.
+- **String intern zone**: the rest of the arena (unregistered, grows as needed). After
+  parsing stat, copy `comm` into the intern zone; cmdline goes here too. Only display
+  strings are retained per-snapshot.
+- `ReadFixed` targets the registered prefix; after parse, the buffer slot is released for
+  the next PID. The intern zone is never an I/O target — it just receives copies.
+
+The arena remains one contiguous mmap (THP-friendly). Only the prefix is registered,
+keeping pinned memory small and stable. Broader arena restructuring (moving `ProcessEntry`
+structs and other hot data into the THP mapping) is future work.
+
 ### 2. comm is free; cmdline is coarse
 
 - **comm** (the process name) rides *inside* stat, which we re-read every cycle. So it is
@@ -89,14 +152,17 @@ Per cached PID the io_uring chain collapses **7 SQEs → 1** (just the read).
 - **cmdline** (the separate `access_remote_vm` read — the costly 4.2%) is *not* immutable:
   userspace daemons rewrite their own argv (`postgres: checkpointer`, `nginx: worker
   process`, `php-fpm: pool www`). So it can't be cached forever, but it changes slowly.
-  - Re-read it on a **coarse cadence** (every N cycles, ~2–5 s; a tunable like
-    `CPU_WINDOW_MS`), caching the string between.
-  - **Stagger** across PIDs to avoid a periodic spike: refresh PID `p` when
-    `(generation + p) % N == 0`, so ~1/N of processes refresh each cycle — smooth load,
-    no thundering herd.
+  - **Age-adaptive cadence**: fresh processes (first few cycles after first sighting) get
+    cmdline read every cycle — they may still be exec'ing or settling into their final
+    argv. After a settling window (~3 cycles / 1.5 s), drop to coarse refresh (every N
+    cycles, ~5–10 s). The per-PID `first_seen_gen` (already implicit in `CpuTracker`'s
+    generation tag) determines age.
+  - **Stagger** the coarse refreshes across PIDs to avoid a periodic spike: refresh PID
+    `p` when `(generation + p) % N == 0`, so ~1/N of settled processes refresh each
+    cycle — smooth load, no thundering herd.
   - cmdline stays **transient** (open→read→close on the refresh tick only); its close
-    volume is ~`userspace_PIDs / N` per cycle — far too low to contend, so it can keep the
-    existing chain (or use a normal fd; either is fine at this volume).
+    volume is ~`userspace_PIDs / N` per cycle — far too low to contend, so it uses plain
+    syscalls (the hybrid rule).
 - **uid** (via statx) is also near-static (privilege drops are rare) → refresh on the same
   coarse/staggered tick.
 
@@ -139,17 +205,27 @@ Expected: the ~43% contention (`osq_lock` + qspinlock + `mutex_spin_on_owner`) a
      real unknown** — assert the second read reflects updated `utime`. If it doesn't,
      decide: per-cycle `lseek`+`Read` (normal fd, not fixed), or periodic reopen.
 2. **Direct-descriptor `RLIMIT_NOFILE` accounting** (kernel-version dependent): do
-   installed fixed-file slots count against the 1024 limit? Either way target ≤960; this
-   only decides whether the fixed-file table shares the budget or has slack.
+   installed fixed-file slots count against the 1024 limit? Either way derive pool size
+   from the runtime soft limit; this decides whether the fixed-file table shares the
+   budget or has slack.
+3. **Feature-probe each io_uring capability independently** on a 5.6-era kernel (or
+   container with restricted seccomp) — verify the degradation path compiles, probes, and
+   falls through cleanly. Specifically: sparse file table (5.19), direct-descriptor
+   install via openat (5.15), and basic registered files (5.6).
 
 ## Touch points
 
 - `gather/mod.rs`: new persistent fd pool (PID→slot map + free list), generation eviction,
   the coarse/staggered cmdline-refresh decision, overflow policy. Sits beside `CpuTracker`.
-- `gather/uring.rs`: split the per-PID chain — cached PID = single `ReadFixed`; new PID =
-  open(install)+read, **no close**; death = `Close` the slot; cmdline/uid = transient on
-  the refresh tick. Persistent fixed-file table sized to the pool.
+  Pool capacity derived from `getrlimit` at startup. Cmdline/uid refresh uses plain
+  syscalls (the hybrid: low-volume ops stay synchronous regardless of backend).
+- `gather/uring.rs`: cached PID = single `ReadFixed` (1 SQE, no chain); new PID =
+  open(install)+read, **no close**; death = `Close` the slot. Feature probing becomes
+  granular: sparse table, direct-descriptor openat, basic registered files — each probed
+  independently with fallback.
 - `gather/syscall.rs`: same pool, `lseek(0)+read` for held fds; transient overflow/cmdline.
+  This is also the full-fallback backend for 5.4 (no io_uring) — persistent fds still
+  eliminate open/close churn via plain syscalls.
 - `gather/parse.rs`: parse the `flags` field, expose `PF_KTHREAD` (or an `is_kthread`
   bool on `StatFields`); already carries `non_ascii` and `start_time`.
 - `snapshot.rs` / `ProcessEntry`: cmdline + uid become carried-forward cached values
@@ -171,6 +247,14 @@ Expected: the ~43% contention (`osq_lock` + qspinlock + `mutex_spin_on_owner`) a
 - **Pool thrash under high churn** (fork bombs, build farms): if births/deaths exceed the
   pool each cycle, behaves like the overflow path — ensure that path is contention-free,
   not just the steady state.
+- **Container fd limits**: containers often set `RLIMIT_NOFILE` to 256 or 512. The pool
+  must derive its capacity from the runtime soft limit, not a compile-time constant.
+  With very low limits, the pool might only hold a fraction of PIDs — the overflow path
+  must be efficient enough for this to be acceptable.
+- **Kernel 5.4 regression**: the syscall-backend persistent-fd path (lseek+read) is the
+  floor for old kernels. It must be tested independently — don't let uring-only testing
+  mask a broken syscall path. The existing `uring_matches_syscall_backend` oracle test
+  pattern extends naturally.
 
 ## How to verify it worked
 

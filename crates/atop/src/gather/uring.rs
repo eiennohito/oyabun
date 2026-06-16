@@ -21,8 +21,10 @@ use std::io;
 
 use io_uring::{IoUring, opcode, squeue, types};
 
+use std::collections::HashSet;
+
 use crate::arena::StringRef;
-use crate::gather::{SLOT_SIZE, parse};
+use crate::gather::{CMD_SLOT, STAT_SLOT, STAT_SLOT_LONG, parse};
 use crate::snapshot::Snapshot;
 use crate::sys::ProcPath;
 
@@ -45,13 +47,13 @@ fn unpack(user_data: u64) -> (usize, u64) {
     ((user_data >> 2) as usize, user_data & 0b11)
 }
 
-#[allow(clippy::cast_possible_truncation)] // SLOT_SIZE is a small compile-time const
-const SLOT_SIZE_U32: u32 = SLOT_SIZE as u32;
-
 #[derive(Clone, Copy, Default)]
 struct SlotState {
     pid_idx: u32,
+    pid: u32,
     stat_off: u32,
+    /// Allocated stat slot size for this PID (STAT_SLOT or STAT_SLOT_LONG).
+    stat_cap: u32,
     stat_len: u32,
     cmd_off: u32,
     cmd_len: u32,
@@ -132,7 +134,13 @@ impl UringBackend {
         let _ = unsafe { self.ring.submitter().register_buffers(&self.bufs) };
     }
 
-    pub fn collect(&mut self, pids: &[u32], snap: &mut Snapshot, page_size: u64) -> io::Result<()> {
+    pub fn collect(
+        &mut self,
+        pids: &[u32],
+        snap: &mut Snapshot,
+        page_size: u64,
+        long_stat: &mut HashSet<u32>,
+    ) -> io::Result<()> {
         let total = pids.len();
         let mut next = 0usize;
         let mut completed = 0usize;
@@ -143,15 +151,22 @@ impl UringBackend {
         }
 
         while completed < total {
-            self.fill(pids, snap, &mut next);
+            self.fill(pids, snap, &mut next, long_stat);
             self.submit_and_wait()?;
-            self.reap(snap, page_size, &mut completed);
+            self.reap(snap, page_size, long_stat, &mut completed);
         }
         Ok(())
     }
 
     /// Submit linked chains for new PIDs until slots or SQ space run out.
-    fn fill(&mut self, pids: &[u32], snap: &mut Snapshot, next: &mut usize) {
+    #[allow(clippy::cast_possible_truncation)] // slot sizes are small compile-time consts
+    fn fill(
+        &mut self,
+        pids: &[u32],
+        snap: &mut Snapshot,
+        next: &mut usize,
+        long_stat: &HashSet<u32>,
+    ) {
         let Self {
             ring,
             free_slots,
@@ -174,12 +189,12 @@ impl UringBackend {
             let s = slot as usize;
             let pid = pids[*next];
 
-            // Two arena allocations per PID: stat + cmdline.
+            let stat_sz = if long_stat.contains(&pid) { STAT_SLOT_LONG } else { STAT_SLOT };
             let stat_off =
-                u32::try_from(snap.strings.alloc(SLOT_SIZE)).expect("arena offset fits u32");
+                u32::try_from(snap.strings.alloc(stat_sz)).expect("arena offset fits u32");
             let stat_ptr = snap.strings.write_ptr(stat_off as usize);
             let cmd_off =
-                u32::try_from(snap.strings.alloc(SLOT_SIZE)).expect("arena offset fits u32");
+                u32::try_from(snap.strings.alloc(CMD_SLOT)).expect("arena offset fits u32");
             let cmd_ptr = snap.strings.write_ptr(cmd_off as usize);
 
             let stat_path_ptr = stat_paths[s].write(pid, b"stat");
@@ -199,11 +214,15 @@ impl UringBackend {
                 .build()
                 .user_data(pack(slot, OP_OTHER))
                 .flags(squeue::Flags::IO_LINK);
-            let stat_read =
-                opcode::ReadFixed::new(types::Fixed(stat_fd), stat_ptr, SLOT_SIZE_U32, buf_index)
-                    .build()
-                    .user_data(pack(slot, OP_STAT_READ))
-                    .flags(squeue::Flags::IO_HARDLINK);
+            let stat_read = opcode::ReadFixed::new(
+                types::Fixed(stat_fd),
+                stat_ptr,
+                stat_sz as u32,
+                buf_index,
+            )
+            .build()
+            .user_data(pack(slot, OP_STAT_READ))
+            .flags(squeue::Flags::IO_HARDLINK);
             let stat_close = opcode::Close::new(types::Fixed(stat_fd))
                 .build()
                 .user_data(pack(slot, OP_OTHER));
@@ -215,11 +234,15 @@ impl UringBackend {
                 .build()
                 .user_data(pack(slot, OP_OTHER))
                 .flags(squeue::Flags::IO_LINK);
-            let cmd_read =
-                opcode::ReadFixed::new(types::Fixed(cmd_fd), cmd_ptr, SLOT_SIZE_U32, buf_index)
-                    .build()
-                    .user_data(pack(slot, OP_CMD_READ))
-                    .flags(squeue::Flags::IO_HARDLINK);
+            let cmd_read = opcode::ReadFixed::new(
+                types::Fixed(cmd_fd),
+                cmd_ptr,
+                CMD_SLOT as u32,
+                buf_index,
+            )
+            .build()
+            .user_data(pack(slot, OP_CMD_READ))
+            .flags(squeue::Flags::IO_HARDLINK);
             let cmd_close = opcode::Close::new(types::Fixed(cmd_fd))
                 .build()
                 .user_data(pack(slot, OP_OTHER));
@@ -247,7 +270,9 @@ impl UringBackend {
             }
             slots[s] = SlotState {
                 pid_idx: u32::try_from(*next).expect("pid index fits u32"),
+                pid,
                 stat_off,
+                stat_cap: stat_sz as u32,
                 cmd_off,
                 #[allow(clippy::cast_possible_truncation)] // OPS_PER_PID = 7
                 pending: OPS_PER_PID as u8,
@@ -268,7 +293,13 @@ impl UringBackend {
     }
 
     /// Drain ready completions; parse a PID once all seven of its CQEs arrive.
-    fn reap(&mut self, snap: &mut Snapshot, page_size: u64, completed: &mut usize) {
+    fn reap(
+        &mut self,
+        snap: &mut Snapshot,
+        page_size: u64,
+        long_stat: &mut HashSet<u32>,
+        completed: &mut usize,
+    ) {
         let Self {
             ring,
             free_slots,
@@ -282,11 +313,13 @@ impl UringBackend {
             let st = &mut slots[slot];
             match op {
                 OP_STAT_READ if res > 0 => {
-                    st.stat_len = u32::try_from(res).unwrap_or(0).min(SLOT_SIZE_U32);
+                    st.stat_len = u32::try_from(res).unwrap_or(0).min(st.stat_cap);
                     st.stat_ok = true;
                 }
                 OP_CMD_READ if res > 0 => {
-                    st.cmd_len = u32::try_from(res).unwrap_or(0).min(SLOT_SIZE_U32);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let cap = CMD_SLOT as u32;
+                    st.cmd_len = u32::try_from(res).unwrap_or(0).min(cap);
                     st.cmd_ok = true;
                 }
                 OP_STATX => st.statx_ok = res >= 0,
@@ -298,9 +331,14 @@ impl UringBackend {
             }
 
             let i = st.pid_idx as usize;
+
+            // Detect truncation: stat filled its slot exactly → promote to long.
+            #[allow(clippy::cast_possible_truncation)]
+            if st.stat_ok && st.stat_len == st.stat_cap && st.stat_cap == STAT_SLOT as u32 {
+                long_stat.insert(st.pid);
+            }
+
             if st.stat_ok && st.statx_ok {
-                // Trust stx_uid only if the kernel actually returned it; otherwise it's
-                // still zero-initialised and would mislabel the process as root-owned.
                 let uid = if statx[slot].stx_mask & libc::STATX_UID != 0 {
                     statx[slot].stx_uid
                 } else {

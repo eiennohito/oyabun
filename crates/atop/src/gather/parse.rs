@@ -49,8 +49,8 @@ impl StatFields {
 /// between the first `(` and last `)`. Numeric field indices (0-based, after `) `):
 /// 0=state 1=ppid 11=utime 12=stime 15=priority 16=nice 17=`num_threads`
 /// 19=starttime 21=rss(pages).
-// `open`/`close` are positions within a slot bounded by SLOT_SIZE (≤ 2 KiB), so
-// the offset/len casts cannot truncate.
+// `open`/`close` are positions within a slot bounded by STAT_SLOT_LONG (≤ 1 KiB),
+// so the offset/len casts cannot truncate.
 #[allow(clippy::cast_possible_truncation)]
 pub fn parse_stat(slot: &[u8], slot_offset: u32) -> Option<StatFields> {
     let open = slot.iter().position(|&b| b == b'(')?;

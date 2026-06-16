@@ -3,8 +3,10 @@
 //! The universal fallback (older kernels, restricted seccomp, containers) and the
 //! correctness oracle for the `io_uring` backend. Reads directly into the arena.
 
+use std::collections::HashSet;
+
 use crate::arena::StringRef;
-use crate::gather::{SLOT_SIZE, parse};
+use crate::gather::{CMD_SLOT, STAT_SLOT, STAT_SLOT_LONG, parse};
 use crate::snapshot::Snapshot;
 use crate::sys::ProcPath;
 
@@ -12,7 +14,13 @@ pub struct SyscallBackend;
 
 impl SyscallBackend {
     #[allow(clippy::unused_self)] // symmetric with UringBackend::collect(&mut self)
-    pub fn collect(&mut self, pids: &[u32], snap: &mut Snapshot, page_size: u64) {
+    pub fn collect(
+        &mut self,
+        pids: &[u32],
+        snap: &mut Snapshot,
+        page_size: u64,
+        long_stat: &mut HashSet<u32>,
+    ) {
         let mut stat_path = ProcPath::new();
         let mut cmd_path = ProcPath::new();
         for (i, &pid) in pids.iter().enumerate() {
@@ -25,12 +33,13 @@ impl SyscallBackend {
                 continue;
             }
 
-            let off = u32::try_from(snap.strings.alloc(SLOT_SIZE)).expect("arena offset fits u32");
+            let stat_sz = if long_stat.contains(&pid) { STAT_SLOT_LONG } else { STAT_SLOT };
+            let off = u32::try_from(snap.strings.alloc(stat_sz)).expect("arena offset fits u32");
             let ptr = snap.strings.write_ptr(off as usize);
 
-            // SAFETY: ptr is a writable SLOT_SIZE region; fd is open.
+            // SAFETY: ptr is a writable `stat_sz` region; fd is open.
             let (len, uid) = unsafe {
-                let n = libc::read(fd, ptr.cast(), SLOT_SIZE);
+                let n = libc::read(fd, ptr.cast(), stat_sz);
                 let mut st: libc::stat = std::mem::zeroed();
                 let uid = if libc::fstat(fd, &raw mut st) == 0 {
                     st.st_uid
@@ -41,9 +50,14 @@ impl SyscallBackend {
                 if n <= 0 {
                     continue;
                 }
-                let len = usize::try_from(n).unwrap_or(0).min(SLOT_SIZE);
+                let len = usize::try_from(n).unwrap_or(0).min(stat_sz);
                 (u32::try_from(len).unwrap_or(0), uid)
             };
+
+            // Detect truncation: if we filled the slot exactly, the line was longer.
+            if len as usize == stat_sz && stat_sz == STAT_SLOT {
+                long_stat.insert(pid);
+            }
 
             let slice = snap.strings.bytes(off, len);
             if let Some(f) = parse::parse_stat(slice, off) {
@@ -68,15 +82,15 @@ fn read_cmdline(pid: u32, path: &mut ProcPath, snap: &mut Snapshot) -> (StringRe
     if fd < 0 {
         return (StringRef::EMPTY, false);
     }
-    let off = u32::try_from(snap.strings.alloc(SLOT_SIZE)).expect("arena offset fits u32");
+    let off = u32::try_from(snap.strings.alloc(CMD_SLOT)).expect("arena offset fits u32");
     let ptr = snap.strings.write_ptr(off as usize);
-    // SAFETY: ptr is a writable SLOT_SIZE region.
-    let n = unsafe { libc::read(fd, ptr.cast(), SLOT_SIZE) };
+    // SAFETY: ptr is a writable CMD_SLOT region.
+    let n = unsafe { libc::read(fd, ptr.cast(), CMD_SLOT) };
     unsafe { libc::close(fd) };
     if n <= 0 {
         return (StringRef::EMPTY, false);
     }
-    let raw_len = usize::try_from(n).unwrap_or(0).min(SLOT_SIZE);
+    let raw_len = usize::try_from(n).unwrap_or(0).min(CMD_SLOT);
     let buf = snap
         .strings
         .bytes_mut(off, u32::try_from(raw_len).unwrap_or(0));

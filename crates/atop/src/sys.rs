@@ -24,6 +24,23 @@ pub fn num_cpus() -> u32 {
     u32::try_from(v).unwrap_or(1).max(1)
 }
 
+/// Soft `RLIMIT_NOFILE` — the ceiling on open fds for this process, which bounds the
+/// persistent-fd pool (a held fd per tracked PID). Containers commonly cap this at
+/// 256/512; tests can lower it with `ulimit -n`. Falls back to 1024 (the historic
+/// default) if the query fails.
+pub fn nofile_soft_limit() -> u64 {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: valid resource id and a writable rlimit out-param.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) } == 0 {
+        rlim.rlim_cur
+    } else {
+        1024
+    }
+}
+
 // ---------------------------------------------------------------------------
 // System-wide stat readers (tiny files, read into stack buffers)
 // ---------------------------------------------------------------------------

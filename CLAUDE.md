@@ -56,15 +56,16 @@ crates/       Rust workspace crates
     app.rs      UI-thread state: selection, collapse, cached display rows
     ui.rs       rendering via etch: column Schema + per-frame value binding; sys-stat
                 header, htop-style tree, Pct/Mem value-formatters (Display+Hash gates)
-    snapshot.rs Snapshot / ProcessEntry / SystemStats (index-based, POD)
+    snapshot.rs Snapshot / ProcessEntry / SystemStats (index-based, POD; is_kthread, pool_overflow)
     arena.rs    HugePageBuf + StringRef (mmap/THP arena)
     tree.rs     index-based intrusive tree build + subtree aggregation
-    sys.rs      sysconf, getdents64 enumeration, uid map, /proc/stat|meminfo|loadavg readers
+    sys.rs      sysconf, getrlimit(NOFILE), getdents64 enumeration, uid map, /proc/stat|meminfo|loadavg readers
     gather/     gatherer thread
-      mod.rs    Gatherer, CpuTracker, Backend dispatch, double-buffer recycling
-      parse.rs  zero-copy /proc/<pid>/stat parse + cmdline cleanup (+ non_ascii flag)
-      syscall.rs  open/read/fstat fallback backend (+ test oracle)
-      uring.rs    io_uring backend (two linked chains per PID: stat+cmdline, + statx)
+      mod.rs    Gatherer, CpuTracker, ProcCache (uid+cmdline cache), Backend dispatch,
+                pool capacity + env knobs (ATOP_POOL_CAP/FORCE_SYSCALL/CMDLINE_REFRESH_N), recycling
+      parse.rs  zero-copy /proc/<pid>/stat parse (+ non_ascii, PF_KTHREAD), cmdline cleanup
+      syscall.rs  persistent stat-fd pool (lseek+read), transient/reopen helpers, test oracle
+      uring.rs    io_uring persistent fixed-fd pool: cached=1 ReadFixed, new=open+read (no close)
   etch/src/     retained-mode, value-gated terminal renderer (no atop types)
     lib.rs      public API: Display/Frame/Table/Row, Schema/ColSpec, Cell, Line, Style/Color
     display.rs  Display + Frame/Table/Row builders + paint routines (the gate lives here)

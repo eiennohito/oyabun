@@ -7,6 +7,10 @@
 use crate::arena::StringRef;
 use crate::snapshot::ProcessEntry;
 
+/// `PF_KTHREAD` in the stat `flags` field — set for kernel threads, which have a
+/// permanently empty `/proc/<pid>/cmdline` (so we skip reading it for them).
+const PF_KTHREAD: u64 = 0x0020_0000;
+
 pub struct StatFields {
     pub ppid: u32,
     pub state: u8,
@@ -21,13 +25,15 @@ pub struct StatFields {
     pub comm: StringRef,
     /// `comm` has a byte ≥ 0x80 (a process can set a non-ASCII name via `prctl`).
     pub comm_non_ascii: bool,
+    /// `PF_KTHREAD` is set — a kernel thread with permanently empty cmdline.
+    pub is_kthread: bool,
 }
 
 impl StatFields {
-    /// Populate a process entry from these parsed fields plus the file-owner `uid`.
-    /// `cpu_pct`/`cpu_peak` and the tree links are filled by later stages; `pid` was
-    /// set when the tombstone was pushed.
-    pub fn write_into(&self, e: &mut ProcessEntry, uid: u32, page_size: u64) {
+    /// Populate a process entry from these parsed stat fields. `uid` and `cmdline`
+    /// are filled afterward by [`ProcCache`](crate::gather); `cpu_pct`/`cpu_peak` and
+    /// the tree links by later stages; `pid` was set when the tombstone was pushed.
+    pub fn write_into(&self, e: &mut ProcessEntry, page_size: u64) {
         e.ppid = self.ppid;
         e.state = self.state;
         e.priority = self.priority;
@@ -37,8 +43,8 @@ impl StatFields {
         e.start_time = self.start_time;
         e.mem_bytes = self.rss_pages.saturating_mul(page_size);
         e.name = self.comm;
-        e.uid = uid;
         e.non_ascii = self.comm_non_ascii;
+        e.is_kthread = self.is_kthread;
     }
 }
 
@@ -47,7 +53,7 @@ impl StatFields {
 ///
 /// `comm` is wrapped in parens and may contain spaces/parens; we take everything
 /// between the first `(` and last `)`. Numeric field indices (0-based, after `) `):
-/// 0=state 1=ppid 11=utime 12=stime 15=priority 16=nice 17=`num_threads`
+/// 0=state 1=ppid 6=flags 11=utime 12=stime 15=priority 16=nice 17=`num_threads`
 /// 19=starttime 21=rss(pages).
 // `open`/`close` are positions within a slot bounded by STAT_SLOT_LONG (≤ 1 KiB),
 // so the offset/len casts cannot truncate.
@@ -70,7 +76,9 @@ pub fn parse_stat(slot: &[u8], slot_offset: u32) -> Option<StatFields> {
 
     let state = *it.next()?.first()?; // 0
     let ppid = u32::try_from(parse_u64(it.next()?)?).ok()?; // 1
-    skip(&mut it, 9)?; // 2..=10
+    skip(&mut it, 4)?; // 2..=5 (pgrp, session, tty_nr, tpgid)
+    let flags = parse_u64(it.next()?)?; // 6 (kernel %u)
+    skip(&mut it, 4)?; // 7..=10 (minflt, cminflt, majflt, cmajflt)
     let utime = parse_u64(it.next()?)?; // 11
     let stime = parse_u64(it.next()?)?; // 12
     skip(&mut it, 2)?; // 13..=14
@@ -93,6 +101,7 @@ pub fn parse_stat(slot: &[u8], slot_offset: u32) -> Option<StatFields> {
         rss_pages,
         comm,
         comm_non_ascii,
+        is_kthread: flags & PF_KTHREAD != 0,
     })
 }
 
@@ -174,6 +183,7 @@ mod tests {
         assert_eq!(f.ticks, 7 + 8);
         assert_eq!(f.start_time, 999);
         assert_eq!(f.rss_pages, 678);
+        assert!(!f.is_kthread, "flags 4194560 lacks PF_KTHREAD");
         // comm offset points at 'b' in "(bash)" → index 6.
         assert_eq!(
             &raw[f.comm.offset as usize..(f.comm.offset + f.comm.len) as usize],
@@ -211,6 +221,19 @@ mod tests {
         let f = parse_stat(raw, 1000).expect("parse");
         assert_eq!(f.comm.offset, 1000 + 3); // '(' at index 2, comm 'x' at 3
         assert_eq!(f.comm.len, 1);
+    }
+
+    #[test]
+    fn detects_kernel_thread_flag() {
+        // flags field (index 6) = 0x00200000 (PF_KTHREAD) | 0x40 = 2097216.
+        let raw = b"2 (kthreadd) S 0 0 0 0 -1 2097216 0 0 0 0 5 6 0 0 20 0 1 0 7 0 0 0 0\n";
+        let f = parse_stat(raw, 0).expect("parse");
+        assert!(f.is_kthread, "PF_KTHREAD must be detected");
+        assert_eq!(f.ppid, 0);
+        assert_eq!(f.ticks, 11);
+        // A userspace flags value (PF_KTHREAD clear) must not be flagged.
+        let user = b"3 (bash) S 1 3 3 0 -1 4194304 0 0 0 0 5 6 0 0 20 0 1 0 7 0 0 0 0\n";
+        assert!(!parse_stat(user, 0).expect("parse").is_kthread);
     }
 
     #[test]

@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 
+use crate::arena::{HugePageBuf, StringRef};
 use crate::snapshot::{ProcessEntry, Snapshot, SystemStats};
-use crate::sys::{self, ProcDir, RawCpuCounters, clk_tck};
+use crate::sys::{self, ProcDir, ProcPath, RawCpuCounters, clk_tck, nofile_soft_limit};
 use crate::tree;
 use syscall::SyscallBackend;
 use uring::UringBackend;
@@ -31,13 +32,18 @@ pub const STAT_SLOT_LONG: usize = 1024;
 /// `/proc/<pid>/cmdline` slot. We never display >200 chars; if full detail is needed
 /// later, re-read via a non-batched API.
 pub const CMD_SLOT: usize = 256;
-/// Arena bytes per PID at the default (non-long) slot sizes.
+/// Arena bytes per PID at the default (non-long) slot sizes: a stat read slot plus a
+/// re-materialized cmdline copy (both bounded by these consts).
 const BYTES_PER_PID: usize = STAT_SLOT + CMD_SLOT;
-/// Max PIDs in flight concurrently in the `io_uring` backend (also the registered
-/// direct-descriptor / statx slot count).
-const N_SLOTS: u32 = 512;
-/// `io_uring` SQ depth. 7 SQEs per PID × `N_SLOTS` fits.
+/// `io_uring` SQ depth. A new PID costs 2 SQEs (open+read), a cached PID 1; the bounded
+/// fill/reap loop submits in rounds, so this only bounds in-flight concurrency.
 const RING_ENTRIES: u32 = 4096;
+/// fds reserved outside the persistent pool: the `/proc` dir fd, the ring, stdio, the
+/// transient kill pidfd + cmdline/uid reads, and headroom.
+const RESERVED_FDS: u64 = 64;
+/// Upper bound on the persistent-fd pool — caps held kernel `struct file`s (and the
+/// fixed-file table) even when `RLIMIT_NOFILE` is enormous.
+const MAX_POOL: u32 = 4096;
 /// Initial arena size per snapshot buffer (grows by doubling if exceeded).
 /// 2 MiB ≈ 2700 PIDs at default slot sizes; grows automatically.
 const INIT_BUF: usize = 2 * 1024 * 1024;
@@ -66,6 +72,43 @@ const CPU_WINDOW: usize = {
 /// Below this elapsed interval the rate is too quantized (sub-jiffy) to be
 /// meaningful — carry the windowed values forward instead of sampling.
 const MIN_SAMPLE: Duration = Duration::from_millis(100);
+
+/// A freshly-seen PID reads cmdline/uid every cycle for this many cycles (exec/argv
+/// still settling — `nginx`/`postgres` rewrite their argv after exec) before dropping
+/// to the coarse staggered cadence.
+const CMDLINE_SETTLE_GENS: u32 = 3;
+/// Default coarse cmdline/uid refresh cadence: PID `p` refreshes when
+/// `(cur_gen + p) % N == 0`, so ~1/N settled PIDs refresh each cycle (no thundering herd).
+/// At `REFRESH_MS=500` and `N=16`, worst-case staleness ≈ 8 s. See [`cmdline_refresh_n`].
+const CMDLINE_REFRESH_N: u32 = 16;
+
+/// Persistent-fd pool capacity: `min(RLIMIT_NOFILE.soft − RESERVED, MAX_POOL)`, or the
+/// `ATOP_POOL_CAP` override (exercise the overflow path without touching `ulimit`).
+fn pool_capacity() -> u32 {
+    if let Some(n) = env_u32("ATOP_POOL_CAP") {
+        return n.max(1);
+    }
+    let soft = nofile_soft_limit().saturating_sub(RESERVED_FDS);
+    u32::try_from(soft).unwrap_or(MAX_POOL).clamp(1, MAX_POOL)
+}
+
+/// `ATOP_FORCE_SYSCALL` forces the syscall backend even when `io_uring` is available
+/// (exercises the fallback / persistent-fd floor on a modern kernel).
+fn force_syscall() -> bool {
+    std::env::var_os("ATOP_FORCE_SYSCALL").is_some()
+}
+
+/// Coarse cmdline/uid refresh cadence, overridable via `ATOP_CMDLINE_REFRESH_N`
+/// (1 = refresh every PID every cycle).
+fn cmdline_refresh_n() -> u32 {
+    env_u32("ATOP_CMDLINE_REFRESH_N")
+        .unwrap_or(CMDLINE_REFRESH_N)
+        .max(1)
+}
+
+fn env_u32(key: &str) -> Option<u32> {
+    std::env::var(key).ok()?.parse().ok()
+}
 
 /// One measured interval: tick delta and the per-core jiffies it spanned.
 #[derive(Clone, Copy, Default)]
@@ -312,6 +355,171 @@ fn rate(ticks: u64, jiff: u64) -> u32 {
     u32::try_from(ticks.saturating_mul(10000) / jiff).unwrap_or(u32::MAX)
 }
 
+/// Slow-changing per-PID metadata that does **not** ride inside stat: the owner `uid`
+/// and the `/proc/<pid>/cmdline` argv. Kept across cycles so the hot path re-reads only
+/// stat. Refreshed via plain syscalls on a coarse, staggered cadence; kernel threads
+/// never touch cmdline (it is permanently empty) and are owned by root.
+struct Meta {
+    /// Start time of the incarnation this metadata belongs to (PID-reuse discriminator).
+    start_time: u64,
+    uid: u32,
+    /// Cleaned, display-ready cmdline bytes (NUL→space); empty for kthreads / no argv.
+    cmdline: Vec<u8>,
+    /// `cmdline` contains a byte ≥ 0x80 (renderer unicode path).
+    cmd_non_ascii: bool,
+    /// Generation when first seen — drives the age-adaptive cmdline cadence.
+    first_seen_gen: u32,
+    /// Generation when last seen, for evicting vanished PIDs.
+    seen_gen: u32,
+}
+
+impl Meta {
+    fn new(start_time: u64, cur_gen: u32) -> Self {
+        Self {
+            start_time,
+            uid: u32::MAX,
+            cmdline: Vec::new(),
+            cmd_non_ascii: false,
+            first_seen_gen: cur_gen,
+            seen_gen: cur_gen,
+        }
+    }
+
+    /// Re-baseline on PID reuse (a new incarnation took this PID number).
+    fn reset(&mut self, start_time: u64, cur_gen: u32) {
+        self.start_time = start_time;
+        self.uid = u32::MAX;
+        self.cmdline.clear();
+        self.cmd_non_ascii = false;
+        self.first_seen_gen = cur_gen;
+        self.seen_gen = cur_gen;
+    }
+}
+
+/// Owns the slow per-PID metadata (`uid`, `cmdline`) backend-agnostically. comm rides
+/// inside stat (re-read every cycle, free); this layer covers what does not. Each cycle
+/// it materializes the cmdline — fresh-read or cached — into the *current* arena so the
+/// `StringRef` stays valid across the double-buffer reset.
+struct ProcCache {
+    map: PidMap<Meta>,
+    cur_gen: u32,
+    refresh_n: u32,
+    cmd_path: ProcPath,
+    /// Reused read buffer for `/proc/<pid>/cmdline` (no per-cycle allocation).
+    scratch: Vec<u8>,
+}
+
+impl ProcCache {
+    fn new(refresh_n: u32) -> Self {
+        Self {
+            map: PidMap::default(),
+            cur_gen: 0,
+            refresh_n,
+            cmd_path: ProcPath::new(),
+            scratch: vec![0u8; CMD_SLOT],
+        }
+    }
+
+    /// Fill `uid` + `cmdline` on every live entry (stat fields are already set). Reads
+    /// fresh on first sighting, while settling, or on the staggered coarse tick; else
+    /// reuses the cache. Always re-materializes cmdline into `strings`.
+    #[allow(clippy::cast_possible_truncation)] // cmdline len bounded by CMD_SLOT
+    fn update(&mut self, procs: &mut [ProcessEntry], strings: &mut HugePageBuf) {
+        self.cur_gen = self.cur_gen.wrapping_add(1);
+        let cur_gen = self.cur_gen;
+        for e in procs.iter_mut() {
+            let pid = e.pid;
+            // Decide whether to read fresh this cycle from a single cache peek (the
+            // borrow must drop before `read_cmdline_uid`, which needs `&mut self`).
+            let (present, reused, settling) = match self.map.get(&pid) {
+                Some(m) => {
+                    let reused = m.start_time != e.start_time;
+                    let settling =
+                        !reused && cur_gen.wrapping_sub(m.first_seen_gen) < CMDLINE_SETTLE_GENS;
+                    (true, reused, settling)
+                }
+                None => (false, false, true), // new → treat as settling
+            };
+            let stagger = self.refresh_n <= 1 || cur_gen.wrapping_add(pid) % self.refresh_n == 0;
+            let refresh = !present || reused || settling || stagger;
+
+            // Read fresh (kthreads cost zero syscalls: uid 0, cmdline empty).
+            let fresh = if refresh {
+                if e.is_kthread {
+                    Some((0u32, 0usize, false))
+                } else {
+                    Some(read_cmdline_uid(pid, &mut self.cmd_path, &mut self.scratch))
+                }
+            } else {
+                None
+            };
+
+            let m = self
+                .map
+                .entry(pid)
+                .or_insert_with(|| Meta::new(e.start_time, cur_gen));
+            if reused {
+                m.reset(e.start_time, cur_gen);
+            }
+            m.seen_gen = cur_gen;
+            if let Some((uid, len, non_ascii)) = fresh {
+                m.uid = uid;
+                m.cmd_non_ascii = non_ascii;
+                m.cmdline.clear();
+                m.cmdline.extend_from_slice(&self.scratch[..len]);
+            }
+
+            e.uid = m.uid;
+            if m.cmdline.is_empty() {
+                e.cmdline = StringRef::EMPTY;
+            } else {
+                let off = strings.alloc(m.cmdline.len());
+                let ptr = strings.write_ptr(off);
+                // SAFETY: `off` was just allocated for exactly `m.cmdline.len()` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(m.cmdline.as_ptr(), ptr, m.cmdline.len());
+                }
+                e.cmdline = StringRef {
+                    offset: off as u32,
+                    len: m.cmdline.len() as u32,
+                };
+                e.non_ascii |= m.cmd_non_ascii;
+            }
+        }
+        self.map.retain(|_, m| m.seen_gen == cur_gen);
+    }
+}
+
+/// Read `/proc/<pid>/cmdline` into `scratch` and the owner `uid` from the same fd's
+/// `fstat`. Returns `(uid, cleaned_len, non_ascii)`; `uid` is still valid when the
+/// cmdline is empty. The cleaned bytes live in `scratch[..len]`.
+fn read_cmdline_uid(pid: u32, path: &mut ProcPath, scratch: &mut [u8]) -> (u32, usize, bool) {
+    let ptr = path.write(pid, b"cmdline");
+    // SAFETY: valid C path, read-only.
+    let fd = unsafe { libc::open(ptr, libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return (u32::MAX, 0, false);
+    }
+    // SAFETY: scratch is a valid writable region; fd is open.
+    let (n, uid) = unsafe {
+        let n = libc::read(fd, scratch.as_mut_ptr().cast(), scratch.len());
+        let mut st: libc::stat = std::mem::zeroed();
+        let uid = if libc::fstat(fd, &raw mut st) == 0 {
+            st.st_uid
+        } else {
+            u32::MAX
+        };
+        libc::close(fd);
+        (n, uid)
+    };
+    if n <= 0 {
+        return (uid, 0, false);
+    }
+    let raw = usize::try_from(n).unwrap_or(0).min(scratch.len());
+    let (clean_len, non_ascii) = parse::clean_cmdline(&mut scratch[..raw]);
+    (uid, clean_len as usize, non_ascii)
+}
+
 /// Tracks cumulative `/proc/stat` CPU counters to compute deltas.
 struct SysCpuAccum {
     prev: Option<RawCpuCounters>,
@@ -363,19 +571,18 @@ enum Backend {
 }
 
 impl Backend {
+    /// Re-read every live PID's stat into `snap`. Returns the overflow count (PIDs that
+    /// exceeded the persistent-fd pool and used the transient fallback).
     fn collect(
         &mut self,
         pids: &[u32],
         snap: &mut Snapshot,
         page_size: u64,
         long_stat: &mut HashSet<u32>,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<u32> {
         match self {
             Backend::Uring(u) => u.collect(pids, snap, page_size, long_stat),
-            Backend::Syscall(s) => {
-                s.collect(pids, snap, page_size, long_stat);
-                Ok(())
-            }
+            Backend::Syscall(s) => Ok(s.collect(pids, snap, page_size, long_stat)),
         }
     }
 }
@@ -388,12 +595,15 @@ pub struct Gatherer {
     pids: Vec<u32>,
     dent_buf: Vec<u8>,
     cpu: CpuTracker,
+    cache: ProcCache,
     sys_cpu: SysCpuAccum,
     tree_stack: Vec<u32>,
     tree_order: Vec<u32>,
     /// PIDs whose `/proc/<pid>/stat` filled the default `STAT_SLOT` — next cycle
     /// allocates `STAT_SLOT_LONG` for them so the full line is captured.
     long_stat_pids: HashSet<u32>,
+    /// Persistent-fd pool capacity, retained for the mid-run `io_uring`→syscall downgrade.
+    pool_cap: u32,
     page_size: u64,
     generation: u64,
 }
@@ -405,9 +615,14 @@ impl Gatherer {
         let front = Arc::new(Snapshot::new(INIT_BUF, 0));
         let back = Arc::new(Snapshot::new(INIT_BUF, 1));
 
-        let backend = match UringBackend::probe(N_SLOTS, RING_ENTRIES, &front, &back) {
-            Some(u) => Backend::Uring(Box::new(u)),
-            None => Backend::Syscall(SyscallBackend),
+        let pool_cap = pool_capacity();
+        let backend = if force_syscall() {
+            Backend::Syscall(SyscallBackend::new(pool_cap))
+        } else {
+            match UringBackend::probe(pool_cap, RING_ENTRIES, &front, &back) {
+                Some(u) => Backend::Uring(Box::new(u)),
+                None => Backend::Syscall(SyscallBackend::new(pool_cap)),
+            }
         };
 
         let arc_swap = Arc::new(ArcSwap::from(front));
@@ -419,10 +634,12 @@ impl Gatherer {
             pids: Vec::new(),
             dent_buf: vec![0u8; 64 * 1024],
             cpu: CpuTracker::new(clk_tck()),
+            cache: ProcCache::new(cmdline_refresh_n()),
             sys_cpu: SysCpuAccum::new(),
             tree_stack: Vec::new(),
             tree_order: Vec::new(),
             long_stat_pids: HashSet::new(),
+            pool_cap,
             page_size,
             generation: 0,
         };
@@ -457,25 +674,38 @@ impl Gatherer {
         };
         let snap = Arc::get_mut(&mut arc).expect("recycled buffer is unique");
 
-        // Arena: STAT_SLOT + CMD_SLOT per PID, plus extra for long-stat PIDs.
-        let n_long = self.pids.iter().filter(|p| self.long_stat_pids.contains(p)).count();
+        // Arena: STAT_SLOT (stat read) + CMD_SLOT (re-materialized cmdline) per PID,
+        // plus extra for long-stat PIDs. The long-stat set is empty on the vast majority
+        // of systems, so skip the O(n) scan entirely in that case.
+        let n_long = if self.long_stat_pids.is_empty() {
+            0
+        } else {
+            self.pids
+                .iter()
+                .filter(|p| self.long_stat_pids.contains(p))
+                .count()
+        };
         let needed = self.pids.len() * BYTES_PER_PID + n_long * (STAT_SLOT_LONG - STAT_SLOT);
         Self::prepare(snap, &self.pids, needed, &mut self.backend);
 
-        if self
-            .backend
-            .collect(&self.pids, snap, self.page_size, &mut self.long_stat_pids)
-            .is_err()
+        let overflow = if let Ok(overflow) =
+            self.backend
+                .collect(&self.pids, snap, self.page_size, &mut self.long_stat_pids)
         {
+            overflow
+        } else {
             // io_uring failed mid-cycle: drop to syscall permanently and redo.
-            self.backend = Backend::Syscall(SyscallBackend);
+            self.backend = Backend::Syscall(SyscallBackend::new(self.pool_cap));
             Self::prepare(snap, &self.pids, needed, &mut self.backend);
-            let _ = self
-                .backend
-                .collect(&self.pids, snap, self.page_size, &mut self.long_stat_pids);
-        }
+            self.backend
+                .collect(&self.pids, snap, self.page_size, &mut self.long_stat_pids)
+                .unwrap_or(0)
+        };
+        snap.pool_overflow = overflow;
 
         snap.compact();
+        // Fill uid + cmdline (slow fields) on the surviving entries, then CPU%.
+        self.cache.update(&mut snap.procs, &mut snap.strings);
         self.cpu.update(&mut snap.procs, now);
         snap.first_root = tree::build(&mut snap.procs, &mut self.tree_stack, &mut self.tree_order);
         tree::aggregate(&mut snap.procs, &self.tree_order);
@@ -602,19 +832,21 @@ mod tests {
         String::from_utf8_lossy(snap.strings.get(p.name)).into_owned()
     }
 
-    /// The `io_uring` backend must agree with the syscall oracle on stable fields for
-    /// processes both scans observed. (CPU/ticks/mem can drift between scans; PID
-    /// reuse can churn the set — so we anchor on PID 1 and self, and require broad
-    /// agreement on the overlap.)
+    /// The `io_uring` backend must agree with the syscall oracle on stable **stat**
+    /// fields for processes both scans observed. (uid/cmdline are no longer backend
+    /// fields — `ProcCache` owns them; CPU/ticks/mem can drift between scans; PID reuse
+    /// can churn the set — so we anchor on PID 1 and self, and require broad agreement
+    /// on the overlap.)
     #[test]
     fn uring_matches_syscall_backend() {
         let page_size = crate::sys::page_size();
         let pids = enum_pids();
+        let pool_cap = pool_capacity();
 
         let mut a = Snapshot::new(INIT_BUF, 0);
         let mut b = Snapshot::new(INIT_BUF, 1);
 
-        let Some(mut uring) = UringBackend::probe(N_SLOTS, RING_ENTRIES, &a, &b) else {
+        let Some(mut uring) = UringBackend::probe(pool_cap, RING_ENTRIES, &a, &b) else {
             eprintln!("io_uring unavailable — skipping oracle comparison");
             return;
         };
@@ -625,7 +857,7 @@ mod tests {
             a.push_tombstone(pid);
         }
         a.strings.reserve(pids.len() * BYTES_PER_PID);
-        SyscallBackend.collect(&pids, &mut a, page_size, &mut long_stat);
+        SyscallBackend::new(pool_cap).collect(&pids, &mut a, page_size, &mut long_stat);
         a.compact();
 
         for &pid in &pids {
@@ -658,7 +890,11 @@ mod tests {
                 }
                 if pa.pid == 1 || pa.pid == std::process::id() {
                     assert_eq!(pa.ppid, pb.ppid, "ppid mismatch for pid {}", pa.pid);
-                    assert_eq!(pa.uid, pb.uid, "uid mismatch for pid {}", pa.pid);
+                    assert_eq!(
+                        pa.is_kthread, pb.is_kthread,
+                        "is_kthread mismatch for pid {}",
+                        pa.pid
+                    );
                     assert_eq!(
                         name_of(&a, pa),
                         name_of(&b, pb),
@@ -741,5 +977,84 @@ mod tests {
                 assert_eq!(parent.pid, p.ppid, "parent_idx points at wrong pid");
             }
         }
+
+        assert_eq!(snap.pool_overflow, 0, "default pool should not overflow");
+
+        // ProcCache filled the slow fields: pid 1 is root-owned; this test process has
+        // a non-empty cmdline; kernel threads are flagged and have no cmdline.
+        let init = snap.procs.iter().find(|p| p.pid == 1).expect("pid 1");
+        assert_eq!(init.uid, 0, "pid 1 is owned by root");
+
+        let me = snap
+            .procs
+            .iter()
+            .find(|p| p.pid == std::process::id())
+            .expect("self");
+        assert!(!me.is_kthread, "the test process is not a kernel thread");
+        assert!(me.cmdline.len > 0, "self should have a cmdline");
+
+        for p in &snap.procs {
+            if p.is_kthread {
+                assert_eq!(
+                    p.cmdline.len, 0,
+                    "kthread {} must have empty cmdline",
+                    p.pid
+                );
+            }
+        }
+    }
+
+    /// Steady-state throughput sanity / profiling target. Ignored by default (timing
+    /// is machine-dependent); run with:
+    /// `cargo test -p atop --release gather_steady_state -- --ignored --nocapture`.
+    /// After warmup, cached PIDs cost one stat read each — no opens, no closes.
+    #[test]
+    #[ignore = "timing-dependent; run manually for profiling"]
+    #[allow(clippy::cast_precision_loss)] // a print, not a measurement
+    fn gather_steady_state_is_cheap() {
+        const ITERS: u32 = 400;
+        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        g.gather();
+        g.gather(); // warm up the persistent-fd pool
+
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            g.gather();
+        }
+        let elapsed = start.elapsed();
+        let snap = cell.load_full();
+        let per_cycle_us = elapsed.as_micros() as f64 / f64::from(ITERS);
+        eprintln!(
+            "pids={} kthreads={} overflow={} per_cycle={per_cycle_us:.1}µs",
+            snap.procs.len(),
+            snap.procs.iter().filter(|p| p.is_kthread).count(),
+            snap.pool_overflow,
+        );
+        assert_eq!(snap.pool_overflow, 0, "default pool should not overflow");
+    }
+
+    /// cmdline survives the coarse cadence: a PID not refreshed this cycle still gets
+    /// its cached cmdline re-materialized into the current arena (valid `StringRef`).
+    #[test]
+    fn cmdline_persists_across_coarse_cycles() {
+        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let me = std::process::id();
+        g.gather();
+        let snap1 = cell.load_full();
+        let cmd1 = {
+            let p = snap1.procs.iter().find(|p| p.pid == me).expect("self c1");
+            String::from_utf8_lossy(snap1.strings.get(p.cmdline)).into_owned()
+        };
+        assert!(!cmd1.is_empty(), "self cmdline should be present");
+
+        // A second cycle (no time for argv to change) must still show the cmdline,
+        // re-materialized from the cache into the new arena.
+        g.gather();
+        let snap2 = cell.load_full();
+        let cmd2 = {
+            let p = snap2.procs.iter().find(|p| p.pid == me).expect("self c2");
+            String::from_utf8_lossy(snap2.strings.get(p.cmdline)).into_owned()
+        };
+        assert_eq!(cmd1, cmd2, "cmdline must persist across cycles");
     }
 }

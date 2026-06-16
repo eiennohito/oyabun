@@ -73,6 +73,9 @@ pub struct ProcessEntry {
     /// needs unicode-aware width. False for the ~99% ASCII case (renderer fast path).
     /// Computed for free during the byte-walks that already scan both fields.
     pub non_ascii: bool,
+    /// `PF_KTHREAD` set in stat `flags` — a kernel thread. Its `/proc/<pid>/cmdline`
+    /// is permanently empty, so the gatherer never reads it (parsed free from stat).
+    pub is_kthread: bool,
 
     // --- tree links (filled by `tree::build`) ---
     /// Index of parent in `procs`, or [`NONE`] for roots.
@@ -109,6 +112,7 @@ impl ProcessEntry {
         name: StringRef::EMPTY,
         cmdline: StringRef::EMPTY,
         non_ascii: false,
+        is_kthread: false,
         parent_idx: NONE,
         first_child: NONE,
         next_sibling: NONE,
@@ -135,6 +139,10 @@ pub struct Snapshot {
     /// Stable `io_uring` registered-buffer index for `strings` (one per physical
     /// buffer in the double-buffer pool). Ignored by the syscall backend.
     pub buf_index: u16,
+    /// Live PIDs this cycle that exceeded the persistent-fd pool and used the transient
+    /// fallback read (0 in the common case). Non-zero ⇒ `RLIMIT_NOFILE` is the binding
+    /// constraint; surfaced so the cap is never silent.
+    pub pool_overflow: u32,
     /// System-wide stats collected this cycle.
     pub sys: SystemStats,
 }
@@ -147,6 +155,7 @@ impl Snapshot {
             first_root: NONE,
             generation: 0,
             buf_index,
+            pool_overflow: 0,
             sys: SystemStats::default(),
         }
     }
@@ -157,6 +166,7 @@ impl Snapshot {
         self.procs.clear();
         self.strings.reset();
         self.first_root = NONE;
+        self.pool_overflow = 0;
     }
 
     /// Push a tombstone slot for a PID, to be filled in place by a backend and

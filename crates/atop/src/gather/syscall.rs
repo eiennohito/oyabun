@@ -1,108 +1,379 @@
-//! Synchronous `open`/`read`/`fstat`/`close` backend.
+//! Synchronous backend with a **persistent stat-fd pool**.
 //!
 //! The universal fallback (older kernels, restricted seccomp, containers) and the
-//! correctness oracle for the `io_uring` backend. Reads directly into the arena.
+//! correctness oracle for the `io_uring` backend. A `/proc/<pid>/stat` fd is held
+//! open across cycles and re-read with `lseek(0)+read` — eliminating the per-cycle
+//! open/close churn. PIDs that vanish from enumeration have their fd closed
+//! (generation eviction). On a held read returning `ESRCH` (the incarnation died or
+//! the PID was reused) the fd is reopened. When more PIDs are live than the pool can
+//! hold (low `RLIMIT_NOFILE`), the overflow falls back to transient open→read→close.
+//!
+//! `uid`/`cmdline` are **not** read here — they are slow-changing fields owned by
+//! `ProcCache` (plain syscalls on a coarse cadence). This backend produces only the
+//! volatile stat fields (comm + numerics, fresh every cycle).
 
 use std::collections::HashSet;
+use std::os::fd::RawFd;
 
-use crate::arena::StringRef;
-use crate::gather::{CMD_SLOT, STAT_SLOT, STAT_SLOT_LONG, parse};
+use crate::gather::parse::{self};
+use crate::gather::{PidMap, STAT_SLOT, STAT_SLOT_LONG};
 use crate::snapshot::Snapshot;
 use crate::sys::ProcPath;
 
-pub struct SyscallBackend;
+/// A held `/proc/<pid>/stat` fd plus the incarnation it was opened against.
+struct HeldFd {
+    fd: RawFd,
+    /// Start time of the incarnation this fd belongs to (PID-reuse discriminator).
+    start_time: u64,
+    /// Tracker generation when last re-read, for evicting vanished PIDs.
+    seen_gen: u32,
+}
+
+pub struct SyscallBackend {
+    held: PidMap<HeldFd>,
+    /// Max held fds (real fds count against `RLIMIT_NOFILE`).
+    pool_cap: usize,
+    cur_gen: u32,
+    stat_path: ProcPath,
+}
 
 impl SyscallBackend {
-    #[allow(clippy::unused_self)] // symmetric with UringBackend::collect(&mut self)
+    pub fn new(pool_cap: u32) -> Self {
+        Self {
+            held: PidMap::default(),
+            pool_cap: pool_cap as usize,
+            cur_gen: 0,
+            stat_path: ProcPath::new(),
+        }
+    }
+
+    /// Re-read every live PID's stat into the snapshot. `pids` is sorted; `snap` has a
+    /// tombstone per PID at the matching index. Returns the count of PIDs that could
+    /// not get a persistent slot and used the transient fallback (overflow).
     pub fn collect(
         &mut self,
         pids: &[u32],
         snap: &mut Snapshot,
         page_size: u64,
         long_stat: &mut HashSet<u32>,
-    ) {
-        let mut stat_path = ProcPath::new();
-        let mut cmd_path = ProcPath::new();
+    ) -> u32 {
+        self.cur_gen = self.cur_gen.wrapping_add(1);
+        let cur_gen = self.cur_gen;
+        let mut overflow = 0u32;
+
         for (i, &pid) in pids.iter().enumerate() {
-            // --- /proc/<pid>/stat ---
-            let path_ptr = stat_path.write(pid, b"stat");
-
-            // SAFETY: valid C path, read-only.
-            let fd = unsafe { libc::open(path_ptr, libc::O_RDONLY | libc::O_CLOEXEC) };
-            if fd < 0 {
-                continue;
-            }
-
-            let stat_sz = if long_stat.contains(&pid) { STAT_SLOT_LONG } else { STAT_SLOT };
-            let off = u32::try_from(snap.strings.alloc(stat_sz)).expect("arena offset fits u32");
-            let ptr = snap.strings.write_ptr(off as usize);
-
-            // SAFETY: ptr is a writable `stat_sz` region; fd is open.
-            let (len, uid) = unsafe {
-                let n = libc::read(fd, ptr.cast(), stat_sz);
-                let mut st: libc::stat = std::mem::zeroed();
-                let uid = if libc::fstat(fd, &raw mut st) == 0 {
-                    st.st_uid
-                } else {
-                    u32::MAX
-                };
-                libc::close(fd);
-                if n <= 0 {
-                    continue;
+            match self.held.get_mut(&pid) {
+                Some(h) => {
+                    // SAFETY: held fd is ours; rewind to regenerate the single-show file.
+                    unsafe { libc::lseek(h.fd, 0, libc::SEEK_SET) };
+                    match fill_stat(h.fd, pid, i, snap, page_size, long_stat, None) {
+                        Some(start_time) if start_time == h.start_time => {
+                            h.seen_gen = cur_gen;
+                        }
+                        _ => {
+                            // ESRCH / parse-fail / reuse (start_time changed): drop the
+                            // stale fd and reopen the current incarnation by path. (The
+                            // start_time check is belt-and-suspenders: a held fd pins the
+                            // kernel struct pid, so a successful read is always the same
+                            // incarnation and a dead task reads as ESRCH.)
+                            close_fd(h.fd);
+                            self.held.remove(&pid);
+                            self.open_and_fill(pid, i, snap, page_size, long_stat, cur_gen);
+                        }
+                    }
                 }
-                let len = usize::try_from(n).unwrap_or(0).min(stat_sz);
-                (u32::try_from(len).unwrap_or(0), uid)
-            };
-
-            // Detect truncation: if we filled the slot exactly, the line was longer.
-            if len as usize == stat_sz && stat_sz == STAT_SLOT {
-                long_stat.insert(pid);
+                None => {
+                    if self.held.len() < self.pool_cap {
+                        self.open_and_fill(pid, i, snap, page_size, long_stat, cur_gen);
+                    } else {
+                        // Pool full: transient read, no persistent slot.
+                        overflow += 1;
+                        read_transient(pid, i, snap, page_size, long_stat, &mut self.stat_path);
+                    }
+                }
             }
+        }
 
-            let slice = snap.strings.bytes(off, len);
-            if let Some(f) = parse::parse_stat(slice, off) {
-                f.write_into(&mut snap.procs[i], uid, page_size);
+        self.evict(cur_gen);
+        overflow
+    }
+
+    /// Open `/proc/<pid>/stat`, fill the snapshot, and install the fd into the pool.
+    /// Returns the parsed `start_time` on success.
+    fn open_and_fill(
+        &mut self,
+        pid: u32,
+        idx: usize,
+        snap: &mut Snapshot,
+        page_size: u64,
+        long_stat: &mut HashSet<u32>,
+        cur_gen: u32,
+    ) -> Option<u64> {
+        let ptr = self.stat_path.write(pid, b"stat");
+        // SAFETY: valid C path, read-only.
+        let fd = unsafe { libc::open(ptr, libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        if let Some(st) = fill_stat(fd, pid, idx, snap, page_size, long_stat, None) {
+            self.held.insert(
+                pid,
+                HeldFd {
+                    fd,
+                    start_time: st,
+                    seen_gen: cur_gen,
+                },
+            );
+            Some(st)
+        } else {
+            close_fd(fd);
+            None
+        }
+    }
+
+    /// Close fds for PIDs not seen this generation (vanished from `/proc`).
+    fn evict(&mut self, cur_gen: u32) {
+        self.held.retain(|_, h| {
+            if h.seen_gen == cur_gen {
+                true
+            } else {
+                close_fd(h.fd);
+                false
             }
+        });
+    }
+}
 
-            // --- /proc/<pid>/cmdline ---
-            let (cmdline, cmd_non_ascii) = read_cmdline(pid, &mut cmd_path, snap);
-            snap.procs[i].cmdline = cmdline;
-            snap.procs[i].non_ascii |= cmd_non_ascii;
+impl Drop for SyscallBackend {
+    fn drop(&mut self) {
+        for h in self.held.values() {
+            close_fd(h.fd);
         }
     }
 }
 
-/// Read and process `/proc/<pid>/cmdline` into the arena. Returns the `StringRef`
-/// for the cleaned command line (or `EMPTY` on any failure) and whether it contained
-/// non-ASCII bytes.
-fn read_cmdline(pid: u32, path: &mut ProcPath, snap: &mut Snapshot) -> (StringRef, bool) {
-    let path_ptr = path.write(pid, b"cmdline");
-    // SAFETY: valid C path, read-only.
-    let fd = unsafe { libc::open(path_ptr, libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return (StringRef::EMPTY, false);
-    }
-    let off = u32::try_from(snap.strings.alloc(CMD_SLOT)).expect("arena offset fits u32");
-    let ptr = snap.strings.write_ptr(off as usize);
-    // SAFETY: ptr is a writable CMD_SLOT region.
-    let n = unsafe { libc::read(fd, ptr.cast(), CMD_SLOT) };
+fn close_fd(fd: RawFd) {
+    // SAFETY: our fd, closed exactly once (removed from the map at the same time).
     unsafe { libc::close(fd) };
+}
+
+/// Read an open stat `fd` (positioned at 0) into an arena slot and parse it into
+/// `snap.procs[idx]`. With `slot = None` a fresh slot is allocated; with
+/// `Some((off, cap))` it reads into that existing slot (no allocation — used by the
+/// uring reopen path so the up-front reserve is never exceeded). Returns the parsed
+/// `start_time`, or `None` on read failure (ESRCH/EOF) or parse failure. Does **not**
+/// close `fd`.
+fn fill_stat(
+    fd: RawFd,
+    pid: u32,
+    idx: usize,
+    snap: &mut Snapshot,
+    page_size: u64,
+    long_stat: &mut HashSet<u32>,
+    slot: Option<(u32, usize)>,
+) -> Option<u64> {
+    let (off, cap) = if let Some(oc) = slot {
+        oc
+    } else {
+        let cap = if long_stat.contains(&pid) {
+            STAT_SLOT_LONG
+        } else {
+            STAT_SLOT
+        };
+        let off = u32::try_from(snap.strings.alloc(cap)).expect("arena offset fits u32");
+        (off, cap)
+    };
+    let ptr = snap.strings.write_ptr(off as usize);
+    // SAFETY: ptr is a writable `cap`-byte region; fd is open.
+    let n = unsafe { libc::read(fd, ptr.cast(), cap) };
     if n <= 0 {
-        return (StringRef::EMPTY, false);
+        return None;
     }
-    let raw_len = usize::try_from(n).unwrap_or(0).min(CMD_SLOT);
-    let buf = snap
-        .strings
-        .bytes_mut(off, u32::try_from(raw_len).unwrap_or(0));
-    let (clean_len, non_ascii) = parse::clean_cmdline(buf);
-    if clean_len == 0 {
-        return (StringRef::EMPTY, false);
+    let len = u32::try_from(usize::try_from(n).unwrap_or(0).min(cap)).unwrap_or(0);
+    // Filled the slot exactly → the line was longer; promote next cycle.
+    if len as usize == cap && cap == STAT_SLOT {
+        long_stat.insert(pid);
     }
-    (
-        StringRef {
-            offset: off,
-            len: clean_len,
-        },
-        non_ascii,
+    let slice = snap.strings.bytes(off, len);
+    let f = parse::parse_stat(slice, off)?;
+    let start_time = f.start_time;
+    f.write_into(&mut snap.procs[idx], page_size);
+    Some(start_time)
+}
+
+/// Transient open→read→close of `/proc/<pid>/stat` (the overflow path, shared with the
+/// uring backend when its persistent pool is full). Allocates a fresh slot. A non-fixed
+/// close hits `files->file_lock` briefly — never the `uring_lock` that drove the storm.
+pub(crate) fn read_transient(
+    pid: u32,
+    idx: usize,
+    snap: &mut Snapshot,
+    page_size: u64,
+    long_stat: &mut HashSet<u32>,
+    path: &mut ProcPath,
+) -> bool {
+    read_stat(pid, idx, snap, page_size, long_stat, path, None)
+}
+
+/// Transient read into an **already-allocated** slot `(off, cap)` — the uring reopen
+/// path, where the failed cached read already claimed a slot. No new allocation, so the
+/// cycle's up-front arena reserve stays sufficient (no mid-cycle grow).
+pub(crate) fn reread_into(
+    pid: u32,
+    idx: usize,
+    snap: &mut Snapshot,
+    page_size: u64,
+    long_stat: &mut HashSet<u32>,
+    path: &mut ProcPath,
+    slot: (u32, u32),
+) -> bool {
+    read_stat(
+        pid,
+        idx,
+        snap,
+        page_size,
+        long_stat,
+        path,
+        Some((slot.0, slot.1 as usize)),
     )
+}
+
+fn read_stat(
+    pid: u32,
+    idx: usize,
+    snap: &mut Snapshot,
+    page_size: u64,
+    long_stat: &mut HashSet<u32>,
+    path: &mut ProcPath,
+    slot: Option<(u32, usize)>,
+) -> bool {
+    let ptr = path.write(pid, b"stat");
+    // SAFETY: valid C path, read-only.
+    let fd = unsafe { libc::open(ptr, libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return false;
+    }
+    let ok = fill_stat(fd, pid, idx, snap, page_size, long_stat, slot).is_some();
+    close_fd(fd);
+    ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gather::{BYTES_PER_PID, INIT_BUF};
+    use std::time::{Duration, Instant};
+
+    fn enum_pids() -> Vec<u32> {
+        let dir = crate::sys::ProcDir::open().unwrap();
+        let mut dent = vec![0u8; 64 * 1024];
+        let mut pids = Vec::new();
+        dir.read_pids(&mut dent, &mut pids);
+        pids.sort_unstable();
+        pids
+    }
+
+    /// A held fd re-read with `lseek(0)+read` regenerates fresh content across cycles
+    /// (the persistent-fd floor for kernels without `io_uring`).
+    #[test]
+    fn persistent_fd_rereads_fresh_content() {
+        let page_size = crate::sys::page_size();
+        let me = std::process::id();
+        let pids = vec![me];
+        let mut backend = SyscallBackend::new(64);
+        let mut long = HashSet::new();
+
+        let mut a = Snapshot::new(INIT_BUF, 0);
+        a.push_tombstone(me);
+        backend.collect(&pids, &mut a, page_size, &mut long);
+        a.compact();
+        let ticks1 = a.procs.iter().find(|p| p.pid == me).expect("self c1").ticks;
+        assert_eq!(backend.held.len(), 1, "self fd held after cycle 1");
+        let fd1 = backend.held[&me].fd;
+
+        let start = Instant::now();
+        let mut x = 0u64;
+        while start.elapsed() < Duration::from_millis(300) {
+            x = std::hint::black_box(x.wrapping_mul(2_654_435_761).wrapping_add(1));
+        }
+        std::hint::black_box(x);
+
+        let mut b = Snapshot::new(INIT_BUF, 1);
+        b.push_tombstone(me);
+        backend.collect(&pids, &mut b, page_size, &mut long);
+        b.compact();
+        let ticks2 = b.procs.iter().find(|p| p.pid == me).expect("self c2").ticks;
+        assert_eq!(backend.held.len(), 1, "fd reused, not reopened");
+        assert_eq!(
+            backend.held[&me].fd, fd1,
+            "same persistent fd across cycles"
+        );
+        assert!(
+            ticks2 > ticks1,
+            "held fd must re-read fresh ticks: {ticks1} -> {ticks2}"
+        );
+    }
+
+    /// Vanished PIDs are evicted (their held fds closed); the pool tracks only the
+    /// PIDs still present.
+    #[test]
+    fn evicts_vanished_pids() {
+        let page_size = crate::sys::page_size();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id();
+        let me = std::process::id();
+        let mut backend = SyscallBackend::new(64);
+        let mut long = HashSet::new();
+
+        let pids = {
+            let mut v = vec![me, child_pid];
+            v.sort_unstable();
+            v
+        };
+        let mut a = Snapshot::new(INIT_BUF, 0);
+        for &p in &pids {
+            a.push_tombstone(p);
+        }
+        backend.collect(&pids, &mut a, page_size, &mut long);
+        assert_eq!(backend.held.len(), 2, "both PIDs held");
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        // Next cycle enumerates only self → the child's fd is evicted.
+        let only_me = vec![me];
+        let mut b = Snapshot::new(INIT_BUF, 1);
+        b.push_tombstone(me);
+        backend.collect(&only_me, &mut b, page_size, &mut long);
+        assert_eq!(backend.held.len(), 1, "vanished PID evicted");
+        assert!(backend.held.contains_key(&me));
+    }
+
+    /// Pool smaller than the live PID count → surplus uses the transient fallback,
+    /// reported as overflow; the snapshot stays complete.
+    #[test]
+    fn overflow_falls_back_and_stays_correct() {
+        let page_size = crate::sys::page_size();
+        let pids = enum_pids();
+        let mut backend = SyscallBackend::new(4);
+        let mut long = HashSet::new();
+        let mut a = Snapshot::new(INIT_BUF, 0);
+        for &p in &pids {
+            a.push_tombstone(p);
+        }
+        a.strings.reserve(pids.len() * BYTES_PER_PID);
+        let overflow = backend.collect(&pids, &mut a, page_size, &mut long);
+        a.compact();
+
+        assert!(pids.len() > 10, "need a populated system for this test");
+        assert!(overflow > 0, "pool_cap=4 must overflow");
+        assert_eq!(backend.held.len(), 4, "pool holds exactly its capacity");
+        assert!(
+            a.procs.iter().any(|p| p.pid == 1),
+            "pid 1 present despite overflow"
+        );
+    }
 }

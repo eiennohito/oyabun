@@ -1,21 +1,25 @@
-//! `io_uring` backend: batched, zero-copy `/proc` reads with continuous I/O↔parse
-//! overlap.
+//! `io_uring` backend with a **persistent stat-fd pool** — the close-storm killer.
 //!
-//! Per PID we submit two linked chains plus an independent statx:
+//! A `/proc/<pid>/stat` fd is installed once as an `io_uring` **direct (fixed)
+//! descriptor** and re-read every cycle with a single `ReadFixed` at offset 0 (a
+//! procfs single-show file regenerates fresh content on a repeated offset-0 read —
+//! validated). No per-cycle open, no per-cycle close: the `osq_lock`/`uring_lock`
+//! storm that fixed-fd closes drove from `io-wq` is gone.
+//!
 //! ```text
-//!   OpenAt(/stat, fd=2s)  -[IO_LINK]->  ReadFixed(→ arena) -[IO_HARDLINK]-> Close(fd=2s)
-//!   OpenAt(/cmdline, fd=2s+1) -[IO_LINK]-> ReadFixed(→ arena) -[IO_HARDLINK]-> Close(fd=2s+1)
-//!   Statx(→ uid)
+//!   cached PID:  ReadFixed(fixed_idx, off 0)                         (1 SQE)
+//!   new PID:     OpenAt(/stat, file_index) -[IO_LINK]-> ReadFixed    (2 SQEs, no Close)
+//!   dead PID:    register_files_update(idx, -1)  (eviction, low volume)
 //! ```
-//! `IO_LINK` on open cancels the chain if the process vanished before open.
-//! `IO_HARDLINK` on read guarantees `Close` runs even if the read errors, so an
-//! installed direct descriptor is never leaked.
 //!
-//! Concurrency is a bounded in-flight window over a slot free-list: we keep filling
-//! the submission queue while slots are free, then reap whatever completed and parse
-//! it — so the kernel reads the next PIDs while we parse the last ones. Each PID's
-//! arena regions persist for the snapshot (names/cmdline point into them); only the
-//! direct-fd slots and statx buffers recycle.
+//! A held read returning `ESRCH` (the incarnation died / the PID was reused) closes
+//! the slot and reads the current incarnation transiently this cycle; it gets a fresh
+//! persistent slot next cycle. When more PIDs are live than the pool holds (low
+//! `RLIMIT_NOFILE`), the overflow uses the shared transient read (a non-fixed close
+//! hits `files->file_lock` briefly, never `uring_lock`).
+//!
+//! `uid`/`cmdline` are not read here — they are `ProcCache`'s job (plain syscalls on a
+//! coarse cadence). This backend produces only the volatile stat fields.
 
 use std::io;
 
@@ -23,56 +27,79 @@ use io_uring::{IoUring, opcode, squeue, types};
 
 use std::collections::HashSet;
 
-use crate::arena::StringRef;
-use crate::gather::{CMD_SLOT, STAT_SLOT, STAT_SLOT_LONG, parse};
+use crate::gather::syscall::{read_transient, reread_into};
+use crate::gather::{PidMap, STAT_SLOT, STAT_SLOT_LONG, parse};
 use crate::snapshot::Snapshot;
 use crate::sys::ProcPath;
 
-// CQE `user_data` packs `(slot << 2) | op` — 2-bit op tag below the slot index.
-// We only need to distinguish: stat read, cmdline read, statx, and everything else.
-const OP_STAT_READ: u64 = 0;
-const OP_CMD_READ: u64 = 1;
-const OP_STATX: u64 = 2;
-const OP_OTHER: u64 = 3;
+// CQE `user_data` packs `(fixed_idx << 1) | op`.
+const OP_OPEN: u64 = 0;
+const OP_READ: u64 = 1;
 
-/// `io_uring` ops per PID: stat(open+read+close) + cmd(open+read+close) + statx = 7.
-/// Each SQE produces exactly one CQE, so SQ capacity and pending count are the same.
-const OPS_PER_PID: usize = 7;
-
-fn pack(slot: u32, op: u64) -> u64 {
-    (u64::from(slot) << 2) | op
+fn pack(fixed: u32, op: u64) -> u64 {
+    (u64::from(fixed) << 1) | op
 }
 
 fn unpack(user_data: u64) -> (usize, u64) {
-    ((user_data >> 2) as usize, user_data & 0b11)
+    ((user_data >> 1) as usize, user_data & 1)
 }
 
-#[derive(Clone, Copy, Default)]
-struct SlotState {
-    pid_idx: u32,
+/// A held direct descriptor for one PID's `/proc/<pid>/stat`.
+struct Held {
+    fixed_idx: u32,
+    /// Tracker generation when last submitted, for evicting vanished PIDs.
+    seen_gen: u32,
+}
+
+/// A deferred re-read for a PID whose held read hit `ESRCH` (death/reuse): re-read the
+/// current incarnation transiently, into the slot the failed read already claimed.
+#[derive(Clone, Copy)]
+struct ReopenJob {
+    pid_idx: usize,
     pid: u32,
     stat_off: u32,
-    /// Allocated stat slot size for this PID (STAT_SLOT or STAT_SLOT_LONG).
+    stat_cap: u32,
+}
+
+/// Per-cycle scratch for an in-flight stat chain, indexed by `fixed_idx`.
+#[derive(Clone, Copy, Default)]
+struct Ctx {
+    pid: u32,
+    pid_idx: u32,
+    stat_off: u32,
     stat_cap: u32,
     stat_len: u32,
-    cmd_off: u32,
-    cmd_len: u32,
     pending: u8,
-    stat_ok: bool,
-    cmd_ok: bool,
-    statx_ok: bool,
+    /// The `OpenAt` of a new chain failed (process gone before open) — the slot was
+    /// never installed, so it is freed without a close.
+    open_failed: bool,
+    /// The `ReadFixed` returned data.
+    read_ok: bool,
 }
 
 pub struct UringBackend {
     ring: IoUring,
-    n_slots: u32,
-    free_slots: Vec<u32>,
-    slots: Vec<SlotState>,
-    statx: Vec<libc::statx>,
-    /// Per-slot path storage for `/proc/<pid>/stat`.
-    stat_paths: Vec<ProcPath>,
-    /// Per-slot path storage for `/proc/<pid>/cmdline`.
-    cmd_paths: Vec<ProcPath>,
+    /// PID → held direct descriptor.
+    held: PidMap<Held>,
+    /// Free fixed-file indices (`0..pool_cap`).
+    free_fixed: Vec<u32>,
+    /// Per-`fixed_idx` in-flight scratch.
+    ctxs: Vec<Ctx>,
+    /// Per-`fixed_idx` path storage for `OpenAt` (must outlive the open completion).
+    paths: Vec<ProcPath>,
+    /// Path scratch for transient (overflow / reopen) reads.
+    stat_path: ProcPath,
+    /// Per-cycle scratch queues, kept on `self` only to reuse their capacity across
+    /// cycles (cleared at the start of `collect`). They are drained by index so the
+    /// drain can borrow other `self` fields (the stat path, the ring) without a
+    /// take-and-restore dance.
+    done_buf: Vec<u32>,
+    overflow_buf: Vec<(usize, u32)>,
+    /// PIDs whose held read hit `ESRCH` (reuse/death): re-read transiently into the
+    /// already-claimed slot after the ring drains — no new alloc, so the up-front
+    /// reserve is never exceeded mid-cycle.
+    reopen_buf: Vec<ReopenJob>,
+    cur_gen: u32,
     /// Registered buffer descriptors, one per snapshot (index = `buf_index`).
     bufs: [libc::iovec; 2],
 }
@@ -89,37 +116,41 @@ fn iovec_of(snap: &Snapshot) -> libc::iovec {
 }
 
 impl UringBackend {
-    /// Probe `io_uring`: build a ring, register a sparse direct-descriptor table, and
-    /// register both snapshot arenas as fixed buffers. Returns `None` if any step
-    /// is unsupported (old kernel, restricted seccomp) — caller falls back.
+    /// Probe `io_uring`: build a ring, register a sparse direct-descriptor table sized
+    /// to the pool, and register both snapshot arenas as fixed buffers. Returns `None`
+    /// if any step is unsupported (old kernel, restricted seccomp) — caller falls back.
     pub fn probe(
-        n_slots: u32,
+        pool_cap: u32,
         ring_entries: u32,
         front: &Snapshot,
         back: &Snapshot,
     ) -> Option<Self> {
         let ring = IoUring::new(ring_entries).ok()?;
-        // Two direct-fd slots per PID slot: one for stat, one for cmdline.
-        ring.submitter()
-            .register_files_sparse(n_slots.checked_mul(2)?)
-            .ok()?;
+        // One direct-fd slot per held PID (stat only — cmdline left the chain).
+        ring.submitter().register_files_sparse(pool_cap).ok()?;
 
         let bufs = [iovec_of(front), iovec_of(back)];
-        // SAFETY: both iovecs point at live, mmap'd snapshot arenas that outlive
-        // the backend (the snapshots are kept alive for the whole program).
+        // SAFETY: both iovecs point at live, mmap'd snapshot arenas that outlive the
+        // backend (the snapshots are kept alive for the whole program).
         unsafe { ring.submitter().register_buffers(&bufs) }.ok()?;
 
-        let z: libc::statx = unsafe { std::mem::zeroed() };
-        let ns = n_slots as usize;
+        let cap = pool_cap as usize;
+        let mut free_fixed = Vec::with_capacity(cap);
+        for s in (0..pool_cap).rev() {
+            free_fixed.push(s);
+        }
         Some(Self {
-            free_slots: Vec::with_capacity(ns),
-            slots: vec![SlotState::default(); ns],
-            statx: vec![z; ns],
-            stat_paths: vec![ProcPath::new(); ns],
-            cmd_paths: vec![ProcPath::new(); ns],
-            bufs,
-            n_slots,
             ring,
+            held: PidMap::default(),
+            free_fixed,
+            ctxs: vec![Ctx::default(); cap],
+            paths: vec![ProcPath::new(); cap],
+            stat_path: ProcPath::new(),
+            done_buf: Vec::new(),
+            overflow_buf: Vec::new(),
+            reopen_buf: Vec::new(),
+            cur_gen: 0,
+            bufs,
         })
     }
 
@@ -134,152 +165,154 @@ impl UringBackend {
         let _ = unsafe { self.ring.submitter().register_buffers(&self.bufs) };
     }
 
+    /// Re-read every live PID's stat into the snapshot. Returns the overflow count
+    /// (PIDs that exceeded the pool and used the transient fallback).
     pub fn collect(
         &mut self,
         pids: &[u32],
         snap: &mut Snapshot,
         page_size: u64,
         long_stat: &mut HashSet<u32>,
-    ) -> io::Result<()> {
-        let total = pids.len();
+    ) -> io::Result<u32> {
+        self.cur_gen = self.cur_gen.wrapping_add(1);
+        let cur_gen = self.cur_gen;
         let mut next = 0usize;
-        let mut completed = 0usize;
+        let mut inflight = 0usize;
+        self.overflow_buf.clear();
+        self.reopen_buf.clear();
 
-        self.free_slots.clear();
-        for s in (0..self.n_slots).rev() {
-            self.free_slots.push(s);
-        }
-
-        while completed < total {
-            self.fill(pids, snap, &mut next, long_stat);
+        while next < pids.len() || inflight > 0 {
+            inflight += self.fill(pids, snap, &mut next, cur_gen, long_stat);
+            if inflight == 0 {
+                break; // only overflow PIDs remain (pool was full)
+            }
             self.submit_and_wait()?;
-            self.reap(snap, page_size, long_stat, &mut completed);
+            inflight -= self.reap_and_process(snap, page_size, long_stat);
         }
-        Ok(())
+
+        // The ring is fully drained: no ReadFixed targets the arena, so the transient
+        // reads below can safely grow it. Reopen (reuse/death) reads, then the overflow
+        // tail (PIDs that never got a persistent slot). Drained by index so each read
+        // can borrow `self.stat_path`.
+        for i in 0..self.reopen_buf.len() {
+            let job = self.reopen_buf[i];
+            reread_into(
+                job.pid,
+                job.pid_idx,
+                snap,
+                page_size,
+                long_stat,
+                &mut self.stat_path,
+                (job.stat_off, job.stat_cap),
+            );
+        }
+
+        for i in 0..self.overflow_buf.len() {
+            let (idx, pid) = self.overflow_buf[i];
+            read_transient(pid, idx, snap, page_size, long_stat, &mut self.stat_path);
+        }
+        let overflow = u32::try_from(self.overflow_buf.len()).unwrap_or(u32::MAX);
+
+        self.evict(cur_gen);
+        Ok(overflow)
     }
 
-    /// Submit linked chains for new PIDs until slots or SQ space run out.
+    /// Submit stat chains for PIDs until the SQ fills or the pool is exhausted.
+    /// Returns the number of chains submitted (each completes independently).
     #[allow(clippy::cast_possible_truncation)] // slot sizes are small compile-time consts
     fn fill(
         &mut self,
         pids: &[u32],
         snap: &mut Snapshot,
         next: &mut usize,
+        cur_gen: u32,
         long_stat: &HashSet<u32>,
-    ) {
-        let Self {
-            ring,
-            free_slots,
-            slots,
-            statx,
-            stat_paths,
-            cmd_paths,
-            ..
-        } = self;
+    ) -> usize {
         let buf_index = snap.buf_index;
-        let mut sq = ring.submission();
+        let mut submitted = 0usize;
+        let mut sq = self.ring.submission();
 
         while *next < pids.len() {
-            if sq.capacity() - sq.len() < OPS_PER_PID {
+            // A new chain needs 2 SQEs; require room for the larger case.
+            if sq.capacity() - sq.len() < 2 {
                 break;
             }
-            let Some(slot) = free_slots.pop() else {
-                break;
+            let idx = *next;
+            let pid = pids[idx];
+
+            let stat_sz = if long_stat.contains(&pid) {
+                STAT_SLOT_LONG
+            } else {
+                STAT_SLOT
             };
-            let s = slot as usize;
-            let pid = pids[*next];
 
-            let stat_sz = if long_stat.contains(&pid) { STAT_SLOT_LONG } else { STAT_SLOT };
-            let stat_off =
-                u32::try_from(snap.strings.alloc(stat_sz)).expect("arena offset fits u32");
-            let stat_ptr = snap.strings.write_ptr(stat_off as usize);
-            let cmd_off =
-                u32::try_from(snap.strings.alloc(CMD_SLOT)).expect("arena offset fits u32");
-            let cmd_ptr = snap.strings.write_ptr(cmd_off as usize);
-
-            let stat_path_ptr = stat_paths[s].write(pid, b"stat");
-            let cmd_path_ptr = cmd_paths[s].write(pid, b"cmdline");
-
-            // Direct-fd slots: slot*2 for stat, slot*2+1 for cmdline.
-            let stat_fd = slot * 2;
-            let cmd_fd = slot * 2 + 1;
-            let stat_dest =
-                types::DestinationSlot::try_from_slot_target(stat_fd).expect("slot fits");
-            let cmd_dest = types::DestinationSlot::try_from_slot_target(cmd_fd).expect("slot fits");
-
-            // Chain 1: stat open → read → close
-            let stat_open = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), stat_path_ptr)
-                .flags(libc::O_RDONLY)
-                .file_index(Some(stat_dest))
-                .build()
-                .user_data(pack(slot, OP_OTHER))
-                .flags(squeue::Flags::IO_LINK);
-            let stat_read = opcode::ReadFixed::new(
-                types::Fixed(stat_fd),
-                stat_ptr,
-                stat_sz as u32,
-                buf_index,
-            )
-            .build()
-            .user_data(pack(slot, OP_STAT_READ))
-            .flags(squeue::Flags::IO_HARDLINK);
-            let stat_close = opcode::Close::new(types::Fixed(stat_fd))
-                .build()
-                .user_data(pack(slot, OP_OTHER));
-
-            // Chain 2: cmdline open → read → close
-            let cmd_open = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), cmd_path_ptr)
-                .flags(libc::O_RDONLY)
-                .file_index(Some(cmd_dest))
-                .build()
-                .user_data(pack(slot, OP_OTHER))
-                .flags(squeue::Flags::IO_LINK);
-            let cmd_read = opcode::ReadFixed::new(
-                types::Fixed(cmd_fd),
-                cmd_ptr,
-                CMD_SLOT as u32,
-                buf_index,
-            )
-            .build()
-            .user_data(pack(slot, OP_CMD_READ))
-            .flags(squeue::Flags::IO_HARDLINK);
-            let cmd_close = opcode::Close::new(types::Fixed(cmd_fd))
-                .build()
-                .user_data(pack(slot, OP_OTHER));
-
-            // Independent: statx for uid
-            let stx = opcode::Statx::new(
-                types::Fd(libc::AT_FDCWD),
-                stat_path_ptr,
-                std::ptr::from_mut(&mut statx[s]).cast(),
-            )
-            .mask(libc::STATX_UID)
-            .build()
-            .user_data(pack(slot, OP_STATX));
-
-            // SAFETY: path/arena/statx buffers all outlive completion; SQ has room
-            // for OPS_PER_PID entries (checked above), so no chain is split.
-            unsafe {
-                let _ = sq.push(&stat_open);
-                let _ = sq.push(&stat_read);
-                let _ = sq.push(&stat_close);
-                let _ = sq.push(&cmd_open);
-                let _ = sq.push(&cmd_read);
-                let _ = sq.push(&cmd_close);
-                let _ = sq.push(&stx);
+            if let Some(h) = self.held.get_mut(&pid) {
+                // Cached: single ReadFixed at offset 0 on the held descriptor.
+                h.seen_gen = cur_gen;
+                let fixed = h.fixed_idx;
+                let off = u32::try_from(snap.strings.alloc(stat_sz)).expect("arena offset fits");
+                let ptr = snap.strings.write_ptr(off as usize);
+                let read =
+                    opcode::ReadFixed::new(types::Fixed(fixed), ptr, stat_sz as u32, buf_index)
+                        .offset(0)
+                        .build()
+                        .user_data(pack(fixed, OP_READ));
+                // SAFETY: arena slot outlives completion; SQ has room (checked).
+                unsafe { sq.push(&read).expect("sq push") };
+                self.ctxs[fixed as usize] = Ctx {
+                    pid,
+                    pid_idx: idx as u32,
+                    stat_off: off,
+                    stat_cap: stat_sz as u32,
+                    pending: 1,
+                    ..Ctx::default()
+                };
+                submitted += 1;
+            } else if let Some(fixed) = self.free_fixed.pop() {
+                // New: OpenAt installs the direct descriptor, linked ReadFixed reads it.
+                let off = u32::try_from(snap.strings.alloc(stat_sz)).expect("arena offset fits");
+                let ptr = snap.strings.write_ptr(off as usize);
+                let path_ptr = self.paths[fixed as usize].write(pid, b"stat");
+                let dest = types::DestinationSlot::try_from_slot_target(fixed).expect("slot fits");
+                let open = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
+                    .flags(libc::O_RDONLY)
+                    .file_index(Some(dest))
+                    .build()
+                    .user_data(pack(fixed, OP_OPEN))
+                    .flags(squeue::Flags::IO_LINK);
+                let read =
+                    opcode::ReadFixed::new(types::Fixed(fixed), ptr, stat_sz as u32, buf_index)
+                        .offset(0)
+                        .build()
+                        .user_data(pack(fixed, OP_READ));
+                // SAFETY: path + arena slot outlive completion; SQ room checked (≥2).
+                unsafe {
+                    sq.push(&open).expect("sq push");
+                    sq.push(&read).expect("sq push");
+                }
+                self.held.insert(
+                    pid,
+                    Held {
+                        fixed_idx: fixed,
+                        seen_gen: cur_gen,
+                    },
+                );
+                self.ctxs[fixed as usize] = Ctx {
+                    pid,
+                    pid_idx: idx as u32,
+                    stat_off: off,
+                    stat_cap: stat_sz as u32,
+                    pending: 2,
+                    ..Ctx::default()
+                };
+                submitted += 1;
+            } else {
+                // Pool full: defer to the transient overflow pass.
+                self.overflow_buf.push((idx, pid));
             }
-            slots[s] = SlotState {
-                pid_idx: u32::try_from(*next).expect("pid index fits u32"),
-                pid,
-                stat_off,
-                stat_cap: stat_sz as u32,
-                cmd_off,
-                #[allow(clippy::cast_possible_truncation)] // OPS_PER_PID = 7
-                pending: OPS_PER_PID as u8,
-                ..SlotState::default()
-            };
             *next += 1;
         }
+        submitted
     }
 
     fn submit_and_wait(&self) -> io::Result<()> {
@@ -292,77 +325,190 @@ impl UringBackend {
         }
     }
 
-    /// Drain ready completions; parse a PID once all seven of its CQEs arrive.
-    fn reap(
+    /// Drain ready completions; process each PID once both its CQEs land. Returns the
+    /// number of chains completed.
+    #[allow(clippy::cast_possible_truncation)] // STAT_SLOT is a small const
+    fn reap_and_process(
         &mut self,
         snap: &mut Snapshot,
         page_size: u64,
         long_stat: &mut HashSet<u32>,
-        completed: &mut usize,
-    ) {
+    ) -> usize {
+        self.done_buf.clear();
+        for cqe in self.ring.completion() {
+            let (fixed, op) = unpack(cqe.user_data());
+            let res = cqe.result();
+            let ctx = &mut self.ctxs[fixed];
+            if op == OP_OPEN {
+                if res < 0 {
+                    ctx.open_failed = true;
+                }
+            } else if res > 0 {
+                ctx.stat_len = u32::try_from(res).unwrap_or(0).min(ctx.stat_cap);
+                ctx.read_ok = true;
+            }
+            ctx.pending -= 1;
+            if ctx.pending == 0 {
+                self.done_buf.push(u32::try_from(fixed).unwrap_or(0));
+            }
+        }
+
+        // Drain by index so the reopen branch can borrow `self.ring`/`self.held` while
+        // `done_buf` keeps its capacity. `Ctx` is `Copy`, so the indexed read takes no
+        // lasting borrow.
+        let n = self.done_buf.len();
+        for i in 0..n {
+            let fixed = self.done_buf[i];
+            let ctx = self.ctxs[fixed as usize];
+            let idx = ctx.pid_idx as usize;
+            if ctx.read_ok {
+                // No `start_time` re-check is needed here (unlike a re-open-by-path
+                // backend). An open `/proc/<pid>/stat` fd pins the kernel `struct pid`,
+                // so the PID number cannot be recycled while we hold the descriptor:
+                // a successful read is always the same incarnation, and a dead task
+                // yields `ESRCH` (the read-fail branch below), never another process's
+                // stat. Reuse only becomes possible after we close the slot on `ESRCH`.
+                if ctx.stat_len == ctx.stat_cap && ctx.stat_cap == STAT_SLOT as u32 {
+                    long_stat.insert(ctx.pid);
+                }
+                let slice = snap.strings.bytes(ctx.stat_off, ctx.stat_len);
+                if let Some(f) = parse::parse_stat(slice, ctx.stat_off) {
+                    f.write_into(&mut snap.procs[idx], page_size);
+                }
+            } else if ctx.open_failed {
+                // New PID vanished before open — slot never installed.
+                self.held.remove(&ctx.pid);
+                self.free_fixed.push(fixed);
+            } else {
+                // Installed fd read failed (`ESRCH`: the incarnation exited; closing the
+                // fd now unpins the PID, so a reused incarnation is read fresh below).
+                // The transient re-read is *deferred* to after the ring fully drains —
+                // calling it here could grow the arena (relocating the registered
+                // buffer) while other ReadFixeds are still in flight.
+                let _ = self.ring.submitter().register_files_update(fixed, &[-1]);
+                self.held.remove(&ctx.pid);
+                self.free_fixed.push(fixed);
+                self.reopen_buf.push(ReopenJob {
+                    pid_idx: idx,
+                    pid: ctx.pid,
+                    stat_off: ctx.stat_off,
+                    stat_cap: ctx.stat_cap,
+                });
+            }
+        }
+        n
+    }
+
+    /// Close direct descriptors for PIDs not submitted this generation (vanished).
+    fn evict(&mut self, cur_gen: u32) {
         let Self {
             ring,
-            free_slots,
-            slots,
-            statx,
+            held,
+            free_fixed,
             ..
         } = self;
-        for cqe in ring.completion() {
-            let (slot, op) = unpack(cqe.user_data());
-            let res = cqe.result();
-            let st = &mut slots[slot];
-            match op {
-                OP_STAT_READ if res > 0 => {
-                    st.stat_len = u32::try_from(res).unwrap_or(0).min(st.stat_cap);
-                    st.stat_ok = true;
-                }
-                OP_CMD_READ if res > 0 => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let cap = CMD_SLOT as u32;
-                    st.cmd_len = u32::try_from(res).unwrap_or(0).min(cap);
-                    st.cmd_ok = true;
-                }
-                OP_STATX => st.statx_ok = res >= 0,
-                _ => {}
+        held.retain(|_, h| {
+            if h.seen_gen == cur_gen {
+                true
+            } else {
+                let _ = ring.submitter().register_files_update(h.fixed_idx, &[-1]);
+                free_fixed.push(h.fixed_idx);
+                false
             }
-            st.pending -= 1;
-            if st.pending != 0 {
-                continue;
-            }
+        });
+    }
+}
 
-            let i = st.pid_idx as usize;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gather::{BYTES_PER_PID, INIT_BUF, RING_ENTRIES};
+    use std::time::{Duration, Instant};
 
-            // Detect truncation: stat filled its slot exactly → promote to long.
-            #[allow(clippy::cast_possible_truncation)]
-            if st.stat_ok && st.stat_len == st.stat_cap && st.stat_cap == STAT_SLOT as u32 {
-                long_stat.insert(st.pid);
-            }
+    fn enum_pids() -> Vec<u32> {
+        let dir = crate::sys::ProcDir::open().unwrap();
+        let mut dent = vec![0u8; 64 * 1024];
+        let mut pids = Vec::new();
+        dir.read_pids(&mut dent, &mut pids);
+        pids.sort_unstable();
+        pids
+    }
 
-            if st.stat_ok && st.statx_ok {
-                let uid = if statx[slot].stx_mask & libc::STATX_UID != 0 {
-                    statx[slot].stx_uid
-                } else {
-                    u32::MAX
-                };
-                if let Some(f) =
-                    parse::parse_stat(snap.strings.bytes(st.stat_off, st.stat_len), st.stat_off)
-                {
-                    f.write_into(&mut snap.procs[i], uid, page_size);
-                }
-            }
-            if st.cmd_ok && st.cmd_len > 0 {
-                let buf = snap.strings.bytes_mut(st.cmd_off, st.cmd_len);
-                let (clean_len, non_ascii) = parse::clean_cmdline(buf);
-                if clean_len > 0 {
-                    snap.procs[i].cmdline = StringRef {
-                        offset: st.cmd_off,
-                        len: clean_len,
-                    };
-                }
-                snap.procs[i].non_ascii |= non_ascii;
-            }
-            free_slots.push(u32::try_from(slot).unwrap_or(0));
-            *completed += 1;
+    fn name_of(snap: &Snapshot, pid: u32) -> Option<String> {
+        snap.procs
+            .iter()
+            .find(|p| p.pid == pid)
+            .map(|p| String::from_utf8_lossy(snap.strings.get(p.name)).into_owned())
+    }
+
+    /// The core invariant the design rests on: a held fixed descriptor, re-read with
+    /// `ReadFixed(offset=0)` on a later cycle, regenerates *fresh* stat content — no
+    /// reopen. We burn CPU between cycles and assert our own ticks advanced.
+    #[test]
+    fn persistent_fd_rereads_fresh_content() {
+        let page_size = crate::sys::page_size();
+        let me = std::process::id();
+        let pids = vec![me];
+        let mut a = Snapshot::new(INIT_BUF, 0);
+        let mut b = Snapshot::new(INIT_BUF, 1);
+        let Some(mut uring) = UringBackend::probe(64, RING_ENTRIES, &a, &b) else {
+            eprintln!("io_uring unavailable — skipping");
+            return;
+        };
+        let mut long = HashSet::new();
+
+        a.push_tombstone(me);
+        uring.collect(&pids, &mut a, page_size, &mut long).unwrap();
+        a.compact();
+        let ticks1 = a.procs.iter().find(|p| p.pid == me).expect("self c1").ticks;
+        assert_eq!(uring.held.len(), 1, "self fd held after cycle 1");
+        let fixed1 = uring.held[&me].fixed_idx;
+
+        // Burn CPU to advance our utime.
+        let start = Instant::now();
+        let mut x = 0u64;
+        while start.elapsed() < Duration::from_millis(300) {
+            x = std::hint::black_box(x.wrapping_mul(2_654_435_761).wrapping_add(1));
         }
+        std::hint::black_box(x);
+
+        b.push_tombstone(me);
+        uring.collect(&pids, &mut b, page_size, &mut long).unwrap();
+        b.compact();
+        let ticks2 = b.procs.iter().find(|p| p.pid == me).expect("self c2").ticks;
+        assert_eq!(uring.held.len(), 1, "fd reused, not reopened");
+        assert_eq!(uring.held[&me].fixed_idx, fixed1, "same persistent slot");
+        assert!(
+            ticks2 > ticks1,
+            "persistent fd must re-read fresh ticks: {ticks1} -> {ticks2}"
+        );
+    }
+
+    /// With a pool smaller than the live PID count, the surplus uses the transient
+    /// fallback — `pool_overflow` is reported and the snapshot is still complete.
+    #[test]
+    fn overflow_falls_back_and_stays_correct() {
+        let page_size = crate::sys::page_size();
+        let pids = enum_pids();
+        let mut a = Snapshot::new(INIT_BUF, 0);
+        let b = Snapshot::new(INIT_BUF, 1);
+        let Some(mut uring) = UringBackend::probe(4, RING_ENTRIES, &a, &b) else {
+            eprintln!("io_uring unavailable — skipping");
+            return;
+        };
+        let mut long = HashSet::new();
+        for &p in &pids {
+            a.push_tombstone(p);
+        }
+        if a.strings.reserve(pids.len() * BYTES_PER_PID) {
+            uring.update_buffer(a.buf_index, a.strings.as_ptr(), a.strings.capacity());
+        }
+        let overflow = uring.collect(&pids, &mut a, page_size, &mut long).unwrap();
+        a.compact();
+
+        assert!(pids.len() > 10, "need a populated system for this test");
+        assert!(overflow > 0, "pool_cap=4 must overflow on a real system");
+        assert!(a.procs.len() > 10, "overflow path still collects all PIDs");
+        assert!(name_of(&a, 1).is_some(), "pid 1 present despite overflow");
     }
 }

@@ -100,8 +100,54 @@ pub struct UringBackend {
     /// reserve is never exceeded mid-cycle.
     reopen_buf: Vec<ReopenJob>,
     cur_gen: u32,
+    /// Max CQEs to wait for per round (the I/O↔parse overlap dial, §1). Default = a full
+    /// ring (`RING_ENTRIES`), so each round submits the batch and waits for **all** of it
+    /// once (no overlap; parse is now cheap). Lowering it reaps+parses a chunk while later
+    /// reads complete. Since a single `fill` submits ≤ `RING_ENTRIES` SQEs and each SQE
+    /// yields one CQE, outstanding CQEs ≤ `RING_ENTRIES`, so the default never under-waits.
+    batch_cap: usize,
     /// Registered buffer descriptors, one per snapshot (index = `buf_index`).
     bufs: [libc::iovec; 2],
+}
+
+/// Build the ring with modern single-issuer flags, probing a descending ladder and
+/// falling back cleanly. `io_uring_setup` accepts or rejects a whole flag set (`EINVAL`
+/// on an unknown flag), so we probe richest-first rather than per-flag. The gatherer
+/// thread is the **sole** submitter — it creates *and* enters the ring — which is exactly
+/// what `SINGLE_ISSUER`/`DEFER_TASKRUN` require: they bind the submitter task to the ring
+/// **creator**, so the ring MUST be built on the gatherer thread (in `Gatherer::run`).
+///
+/// - `SINGLE_ISSUER` (6.0): assert one submitter → enables related fast paths.
+/// - `DEFER_TASKRUN` (6.1, needs `SINGLE_ISSUER`): defer completion task-work to the
+///   `enter`-to-wait call instead of running it async / via IPI. Safe here because every
+///   `collect` round reaches `submit_and_wait` — the flag's "must periodically wait"
+///   invariant holds by construction.
+/// - `COOP_TASKRUN` (5.19): don't IPI the submitter task for task-work; run it on the
+///   next ring exit. Cheaper wakeups.
+///
+/// The ladder must stay ordered by **descending kernel-version requirement** (6.1 → 6.0 →
+/// 5.19 → none) so the first rung an old kernel accepts is the richest one it supports; a
+/// new flag is added to the top, not spliced into the middle.
+fn build_ring(entries: u32) -> io::Result<IoUring> {
+    if let Ok(r) = IoUring::builder()
+        .setup_single_issuer()
+        .setup_defer_taskrun()
+        .setup_coop_taskrun()
+        .build(entries)
+    {
+        return Ok(r);
+    }
+    if let Ok(r) = IoUring::builder()
+        .setup_single_issuer()
+        .setup_coop_taskrun()
+        .build(entries)
+    {
+        return Ok(r);
+    }
+    if let Ok(r) = IoUring::builder().setup_coop_taskrun().build(entries) {
+        return Ok(r);
+    }
+    IoUring::new(entries)
 }
 
 // SAFETY: the backend is owned solely by the gatherer thread and never shared. Its
@@ -122,10 +168,11 @@ impl UringBackend {
     pub fn probe(
         pool_cap: u32,
         ring_entries: u32,
+        batch_cap: usize,
         front: &Snapshot,
         back: &Snapshot,
     ) -> Option<Self> {
-        let ring = IoUring::new(ring_entries).ok()?;
+        let ring = build_ring(ring_entries).ok()?;
         // One direct-fd slot per held PID (stat only — cmdline left the chain).
         ring.submitter().register_files_sparse(pool_cap).ok()?;
 
@@ -150,6 +197,7 @@ impl UringBackend {
             overflow_buf: Vec::new(),
             reopen_buf: Vec::new(),
             cur_gen: 0,
+            batch_cap,
             bufs,
         })
     }
@@ -177,17 +225,24 @@ impl UringBackend {
         self.cur_gen = self.cur_gen.wrapping_add(1);
         let cur_gen = self.cur_gen;
         let mut next = 0usize;
-        let mut inflight = 0usize;
+        // Outstanding **CQEs**, not chains: a cached read emits 1, a new chain 2 (the
+        // linked open + read — and a failed open still posts an `ECANCELED` read CQE, so
+        // 2 is exact either way). Waiting on this count is what collapses ~51 wakeups/cycle
+        // to ~1: submit the whole batch, wait once for all of it, drain, parse.
+        let mut outstanding = 0usize;
         self.overflow_buf.clear();
         self.reopen_buf.clear();
 
-        while next < pids.len() || inflight > 0 {
-            inflight += self.fill(pids, snap, &mut next, cur_gen, long_stat);
-            if inflight == 0 {
+        while next < pids.len() || outstanding > 0 {
+            outstanding += self.fill(pids, snap, &mut next, cur_gen, long_stat);
+            if outstanding == 0 {
                 break; // only overflow PIDs remain (pool was full)
             }
-            self.submit_and_wait()?;
-            inflight -= self.reap_and_process(snap, page_size, long_stat);
+            // Default `batch_cap` = a full ring ⇒ wait for the entire outstanding batch
+            // (one wakeup/round). A smaller cap re-enables I/O↔parse overlap (the dial).
+            let want = outstanding.min(self.batch_cap);
+            self.submit_and_wait(want)?;
+            outstanding -= self.reap_and_process(snap, page_size, long_stat);
         }
 
         // The ring is fully drained: no ReadFixed targets the arena, so the transient
@@ -196,7 +251,7 @@ impl UringBackend {
         // can borrow `self.stat_path`.
         for i in 0..self.reopen_buf.len() {
             let job = self.reopen_buf[i];
-            reread_into(
+            if !reread_into(
                 job.pid,
                 job.pid_idx,
                 snap,
@@ -204,12 +259,16 @@ impl UringBackend {
                 long_stat,
                 &mut self.stat_path,
                 (job.stat_off, job.stat_cap),
-            );
+            ) {
+                snap.tombstone(job.pid_idx); // incarnation truly gone — no phantom row
+            }
         }
 
         for i in 0..self.overflow_buf.len() {
             let (idx, pid) = self.overflow_buf[i];
-            read_transient(pid, idx, snap, page_size, long_stat, &mut self.stat_path);
+            if !read_transient(pid, idx, snap, page_size, long_stat, &mut self.stat_path) {
+                snap.tombstone(idx); // transient overflow read failed
+            }
         }
         let overflow = u32::try_from(self.overflow_buf.len()).unwrap_or(u32::MAX);
 
@@ -218,7 +277,8 @@ impl UringBackend {
     }
 
     /// Submit stat chains for PIDs until the SQ fills or the pool is exhausted.
-    /// Returns the number of chains submitted (each completes independently).
+    /// Returns the number of **CQEs** the submitted chains will produce (cached read = 1,
+    /// new open+read chain = 2) — the count [`collect`](Self::collect) waits on.
     #[allow(clippy::cast_possible_truncation)] // slot sizes are small compile-time consts
     fn fill(
         &mut self,
@@ -229,7 +289,7 @@ impl UringBackend {
         long_stat: &HashSet<u32>,
     ) -> usize {
         let buf_index = snap.buf_index;
-        let mut submitted = 0usize;
+        let mut cqes = 0usize;
         let mut sq = self.ring.submission();
 
         while *next < pids.len() {
@@ -267,7 +327,7 @@ impl UringBackend {
                     pending: 1,
                     ..Ctx::default()
                 };
-                submitted += 1;
+                cqes += 1;
             } else if let Some(fixed) = self.free_fixed.pop() {
                 // New: OpenAt installs the direct descriptor, linked ReadFixed reads it.
                 let off = u32::try_from(snap.strings.alloc(stat_sz)).expect("arena offset fits");
@@ -305,19 +365,21 @@ impl UringBackend {
                     pending: 2,
                     ..Ctx::default()
                 };
-                submitted += 1;
+                cqes += 2;
             } else {
                 // Pool full: defer to the transient overflow pass.
                 self.overflow_buf.push((idx, pid));
             }
             *next += 1;
         }
-        submitted
+        cqes
     }
 
-    fn submit_and_wait(&self) -> io::Result<()> {
+    /// Submit the queued SQEs and block until `want` CQEs are ready (`io_uring_enter`
+    /// with `GETEVENTS`, `min_complete = want`), retrying on `EINTR`.
+    fn submit_and_wait(&self, want: usize) -> io::Result<()> {
         loop {
-            match self.ring.submit_and_wait(1) {
+            match self.ring.submit_and_wait(want) {
                 Ok(_) => return Ok(()),
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
                 Err(e) => return Err(e),
@@ -326,7 +388,8 @@ impl UringBackend {
     }
 
     /// Drain ready completions; process each PID once both its CQEs land. Returns the
-    /// number of chains completed.
+    /// number of **CQEs** reaped (what [`collect`](Self::collect) subtracts from the
+    /// outstanding-CQE counter — chains complete in 1 or 2 CQEs).
     #[allow(clippy::cast_possible_truncation)] // STAT_SLOT is a small const
     fn reap_and_process(
         &mut self,
@@ -335,7 +398,9 @@ impl UringBackend {
         long_stat: &mut HashSet<u32>,
     ) -> usize {
         self.done_buf.clear();
+        let mut reaped = 0usize;
         for cqe in self.ring.completion() {
+            reaped += 1;
             let (fixed, op) = unpack(cqe.user_data());
             let res = cqe.result();
             let ctx = &mut self.ctxs[fixed];
@@ -374,11 +439,14 @@ impl UringBackend {
                 let slice = snap.strings.bytes(ctx.stat_off, ctx.stat_len);
                 if let Some(f) = parse::parse_stat(slice, ctx.stat_off) {
                     f.write_into(&mut snap.procs[idx], page_size);
+                } else {
+                    snap.tombstone(idx); // unparseable read → no phantom row
                 }
             } else if ctx.open_failed {
                 // New PID vanished before open — slot never installed.
                 self.held.remove(&ctx.pid);
                 self.free_fixed.push(fixed);
+                snap.tombstone(idx); // speculative/new PID gone before open
             } else {
                 // Installed fd read failed (`ESRCH`: the incarnation exited; closing the
                 // fd now unpins the PID, so a reused incarnation is read fresh below).
@@ -396,7 +464,7 @@ impl UringBackend {
                 });
             }
         }
-        n
+        reaped
     }
 
     /// Close direct descriptors for PIDs not submitted this generation (vanished).
@@ -451,7 +519,8 @@ mod tests {
         let pids = vec![me];
         let mut a = Snapshot::new(INIT_BUF, 0);
         let mut b = Snapshot::new(INIT_BUF, 1);
-        let Some(mut uring) = UringBackend::probe(64, RING_ENTRIES, &a, &b) else {
+        let Some(mut uring) = UringBackend::probe(64, RING_ENTRIES, RING_ENTRIES as usize, &a, &b)
+        else {
             eprintln!("io_uring unavailable — skipping");
             return;
         };
@@ -492,7 +561,8 @@ mod tests {
         let pids = enum_pids();
         let mut a = Snapshot::new(INIT_BUF, 0);
         let b = Snapshot::new(INIT_BUF, 1);
-        let Some(mut uring) = UringBackend::probe(4, RING_ENTRIES, &a, &b) else {
+        let Some(mut uring) = UringBackend::probe(4, RING_ENTRIES, RING_ENTRIES as usize, &a, &b)
+        else {
             eprintln!("io_uring unavailable — skipping");
             return;
         };
@@ -510,5 +580,48 @@ mod tests {
         assert!(overflow > 0, "pool_cap=4 must overflow on a real system");
         assert!(a.procs.len() > 10, "overflow path still collects all PIDs");
         assert!(name_of(&a, 1).is_some(), "pid 1 present despite overflow");
+    }
+
+    /// Hygiene (§3b, load-bearing for the birth probe): a PID whose open/read fails —
+    /// here a reaped-then-requested dead PID — must be re-tombstoned, never left as a
+    /// phantom row (real pid, `state '?'`, empty everything) that `compact` keeps.
+    #[test]
+    fn failed_read_leaves_no_phantom_row() {
+        let page_size = crate::sys::page_size();
+        let me = std::process::id();
+        // Reap a child so its PID number is genuinely dead (open → ENOENT).
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let dead = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let mut pids = vec![me, dead];
+        pids.sort_unstable();
+        let mut a = Snapshot::new(INIT_BUF, 0);
+        let b = Snapshot::new(INIT_BUF, 1);
+        let Some(mut uring) = UringBackend::probe(64, RING_ENTRIES, RING_ENTRIES as usize, &a, &b)
+        else {
+            eprintln!("io_uring unavailable — skipping");
+            return;
+        };
+        let mut long = HashSet::new();
+        for &p in &pids {
+            a.push_tombstone(p);
+        }
+        uring.collect(&pids, &mut a, page_size, &mut long).unwrap();
+        a.compact();
+
+        assert!(name_of(&a, me).is_some(), "live self must survive");
+        assert!(
+            !a.procs.iter().any(|p| p.pid == dead),
+            "dead PID must be tombstoned, not left as a phantom row"
+        );
+        assert!(
+            a.procs.iter().all(|p| p.state != b'?'),
+            "no phantom row (state '?') may survive compact"
+        );
     }
 }

@@ -48,6 +48,37 @@ and which provides the stable storage this plan's incremental snapshot needs.
 - **Promote on navigation / becomes-visible:** force an immediate fresh read of newly-visible
   PIDs so what you are looking at is never stale (see §5, the hard part).
 
+**Staleness SLA (wall-clock — the load-bearing guarantee).** Express the cold-tier rotation as
+a wall-clock bound **X**, not a raw cycle count: *every PID is fully sampled within X seconds.*
+Derive `N = ceil(X / interval)` (e.g. X = 2 s at 500 ms ⇒ N = 4) — X is what a user reasons
+about ("nothing is staler than X"), N is implementation. This SLA is the **safety net** for
+volatility prioritization (§1b): however the sampling budget is steered toward likely-changers,
+no process — not even a surprise spiker that was demoted to coldest — is ever staler than X.
+
+### 1b. Prioritize by volatility, not only by visibility
+
+The hot tier in §1 is *display-relevance* (visible / collapsed-ancestor → fresh for the UX).
+Add a second, **orthogonal** axis: **volatility** — which PIDs are *likely to change* their
+CPU/mem, and therefore where frequent sampling actually buys information. The purpose of
+sampling is to catch change: a process flat at 0% or steady at 100% is predictable and can
+rotate coarsely; a recently-changing / bursty one should stay hot **regardless of visibility**,
+because it is where the next spike — the "find the hog" job — will appear.
+
+Two axes feed "sample this cycle":
+- *display-relevance* → freshness for what the user is looking at (UX).
+- *volatility* → freshness for ranking / spike-catching (the monitor's core job).
+
+Coldest = stable **and** hidden — still bounded by the X-second SLA above. The volatility
+signal is already on hand in `CpuHistory`: recent Δticks, the peak-vs-average spread,
+time-since-last-significant-change. A cheap proxy: "nonzero or changed activity within the last
+few windows" ⇒ volatile. Keep it a **derived hint**, not new heavyweight state.
+
+There is an exploration/exploitation wrinkle: you cannot *know* a process is volatile without
+sampling it. The X-second SLA resolves it — volatility steers the *surplus* budget toward
+likely-changers, while the SLA guarantees the unknowns (long-idle, then surprise-spike) are
+still swept within X. Volatility makes the common case fresher; the SLA makes the worst case
+bounded.
+
 ### 2. Per-PID CPU window
 
 Today `CpuTracker` has a single global `last: Instant` and assumes every PID is sampled
@@ -62,6 +93,11 @@ across it. Acceptable default: **averages exact, peaks under-reported for the co
 
 Impl: the per-PID ring depth should be **wall-clock-based** (so a cold PID's ~10 s window
 holds fewer, wider samples) rather than a fixed sample count.
+
+This dovetails with volatility prioritization (§1b): peak under-report happens precisely on the
+cold tier, which by definition is the *stable / predictable* set — so the metric that degrades
+is the one that matters least where it degrades. A PID that starts spiking promotes out of the
+cold tier (volatile), regaining fine-grained buckets within ≤ N cycles (the SLA bound).
 
 ### 3. Incremental snapshot (the big structural change)
 
@@ -87,13 +123,13 @@ partitioning and can introduce stable string storage) comes first.
 
 ### 4. Enumeration cadence decoupled from sampling
 
-`/proc` is scanned every cycle today only to catch **births**. Deaths are nearly free: a
-held-fd read returns `ESRCH` (the persistent-fd pool already relies on this). So:
-- Enumerate every **K** cycles (a tunable, default small, e.g. 2–4). A new process appears
-  within K×interval — fine for a monitor. Scan cost drops K×.
+**Implemented — see `ARCHITECTURE.md`, "`/proc` enumeration".** Enumeration is a maintained
+live set: full re-scan only every ~1 s, a birth probe between scans, hygiene that keeps the
+snapshot phantom-free, deaths dropped the same cycle. **Reuse it** — do not re-implement. The
+only addition here:
+- Enumeration cadence (births, K) and per-PID sampling cadence (load, N from the X-second SLA)
+  are **independent knobs**. K bounds *birth* latency; X/N bounds *sampling* staleness.
 - Deaths of sampled PIDs are caught immediately by the pool; the rest at the next scan.
-- This composes with §1: enumeration cadence (births) and per-PID sampling cadence (load)
-  are independent knobs.
 
 ### 5. Viewport channel + navigation fast-path
 
@@ -130,8 +166,10 @@ held-fd read returns `ESRCH` (the persistent-fd pool already relies on this). So
 
 ## Touch points
 
-- `gather/mod.rs`: `CpuTracker` → per-PID `last`/wall-clock ring; the hot/cold tier decision;
-  rotation selection; enumeration cadence (K); the incremental-snapshot seeding.
+- `gather/mod.rs`: `CpuTracker` → per-PID `last`/wall-clock ring; the **two-axis** tier decision
+  (display-relevance ∪ volatility, §1/§1b); a `CpuHistory`-derived volatility hint; rotation by
+  the X-second SLA (`N = ceil(X/interval)`); the incremental-snapshot seeding. Enumeration
+  cadence (K) + birth probe are reused from the coordination plan (§4 here), not re-built.
 - `gather/mod.rs` (`Ctrl`): `Ctrl::Viewport { visible, collapsed }`; subset-carrying `Refresh`.
 - `snapshot.rs`: incremental seed-from-previous; per-entry last-sampled generation (for the
   tier logic / debugging); carried-forward string validity.
@@ -149,9 +187,13 @@ held-fd read returns `ESRCH` (the persistent-fd pool already relies on this). So
   the live snapshots (≥1 generation). Cross-thread lifetime hazard; design explicitly.
 - **Gatherer ↔ UI coupling**: the gatherer becomes viewport-aware. Keep the dependency one-way
   and advisory so a missing/stale viewport only costs extra sampling, never correctness.
-- **Cold-tier staleness vs ranking**: bounded to N cycles; make N tunable; default conservative.
-  Re-evaluate whether "find the hog" needs a guaranteed-fresh global pass at some coarse cadence
-  (a periodic full sample — the "full refresh when needed").
+- **Cold-tier staleness vs ranking**: bounded by the X-second SLA (`N = ceil(X/interval)`); X is
+  the user-facing knob, default conservative. The SLA *is* the "guaranteed-fresh global pass" —
+  every PID is swept within X regardless of how volatility steers the surplus.
+- **Volatility hint cost / churn**: the hint must stay cheap (derived from `CpuHistory` already
+  in hand) and not thrash the tier each cycle (a PID flapping between hot/cold wastes the
+  promotion). Use hysteresis (e.g. demote only after M stable windows); the SLA bounds the
+  downside of mis-classifying a sleeper as cold, so the hint can be simple.
 - **Reparent detection**: a cold PID's `ppid` is stale until its next sample; a parent's death
   reparents its children immediately in the kernel but our tree lags ≤ N cycles unless we
   re-read a dead parent's former children on its death. Decide whether that targeted re-read is

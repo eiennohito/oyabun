@@ -31,14 +31,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     let page_size = sys::page_size();
-    let (mut gatherer, cell) = Gatherer::new(page_size)?;
-    gatherer.prime(); // first snapshot ready before the UI reads it — no startup poll
+    let (gatherer, cell) = Gatherer::new(page_size)?;
     let uid_names = sys::read_uid_names();
 
     let (tx, rx) = mpsc::channel::<Ctrl>();
+    // The gatherer owns the io_uring ring and is its sole submitter, so it builds the
+    // backend and produces the first snapshot itself. `ready` is the rendezvous: main blocks
+    // until the gatherer signals its first publish (or until it exits early, dropping the
+    // sender → `recv` returns `Err`). main never gathers.
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
     let gather_handle = std::thread::Builder::new()
         .name("gatherer".into())
-        .spawn(move || gatherer.run(&rx, REFRESH_INTERVAL))?;
+        .spawn(move || gatherer.run(&rx, REFRESH_INTERVAL, &ready_tx))?;
+    let _ = ready_rx.recv();
 
     let app = App::new(cell, tx.clone(), uid_names);
 

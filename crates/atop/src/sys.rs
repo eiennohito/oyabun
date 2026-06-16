@@ -219,6 +219,31 @@ fn parse_u64_bytes(b: &[u8]) -> Option<u64> {
 /// reject a pathologically long numeric dirent name that would otherwise wrap.
 const PID_MAX_LIMIT: u32 = 1 << 22;
 
+/// `/proc/sys/kernel/ns_last_pid` — the last PID the kernel allocated in this namespace
+/// (the allocation frontier). New PIDs appear just above it (allocation is near-monotonic,
+/// wrapping at [`read_pid_max`]). The gatherer's skip-cycle birth probe reads this to bound
+/// the probe window — in steady state it equals our highest live PID, so the window is
+/// empty and the probe costs zero opens. `None` if the file is unreadable (older kernel /
+/// restricted), in which case the probe falls back to a blind fixed-width window.
+pub fn read_ns_last_pid() -> Option<u32> {
+    let mut buf = [0u8; 32];
+    let data = read_proc_file(c"/proc/sys/kernel/ns_last_pid".as_ptr(), &mut buf);
+    let line = data.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    u32::try_from(parse_u64_bytes(line)?).ok()
+}
+
+/// `/proc/sys/kernel/pid_max` — the value at which the PID counter wraps back to the low
+/// range. Read once at startup; bounds the birth-probe window so it never generates an
+/// impossible PID. Falls back to [`PID_MAX_LIMIT`] if unreadable.
+pub fn read_pid_max() -> u32 {
+    let mut buf = [0u8; 32];
+    let data = read_proc_file(c"/proc/sys/kernel/pid_max".as_ptr(), &mut buf);
+    let line = data.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    parse_u64_bytes(line)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(PID_MAX_LIMIT)
+}
+
 /// Stack buffer for building `/proc/<pid>/<suffix>` C-string paths with no heap
 /// allocation. 64 bytes fits `/proc/` (6) + a 10-digit PID + `/` + suffix + NUL.
 #[derive(Clone)]
@@ -524,6 +549,20 @@ mod tests {
     #[test]
     fn uptime_positive() {
         assert!(read_uptime_secs() > 0);
+    }
+
+    #[test]
+    fn pid_max_and_ns_last_pid_are_plausible() {
+        let pid_max = read_pid_max();
+        assert!(pid_max >= 1 << 15, "pid_max implausibly small: {pid_max}");
+        // ns_last_pid may be unreadable in odd environments; if present it must be sane.
+        if let Some(last) = read_ns_last_pid() {
+            assert!(last >= 1, "ns_last_pid should be positive");
+            assert!(
+                last <= pid_max,
+                "ns_last_pid {last} should not exceed pid_max {pid_max}"
+            );
+        }
     }
 
     #[test]

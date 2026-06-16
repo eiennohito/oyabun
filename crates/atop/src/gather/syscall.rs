@@ -78,17 +78,30 @@ impl SyscallBackend {
                             // incarnation and a dead task reads as ESRCH.)
                             close_fd(h.fd);
                             self.held.remove(&pid);
-                            self.open_and_fill(pid, i, snap, page_size, long_stat, cur_gen);
+                            if self
+                                .open_and_fill(pid, i, snap, page_size, long_stat, cur_gen)
+                                .is_none()
+                            {
+                                snap.tombstone(i); // death/reopen-fail: no phantom row
+                            }
                         }
                     }
                 }
                 None => {
                     if self.held.len() < self.pool_cap {
-                        self.open_and_fill(pid, i, snap, page_size, long_stat, cur_gen);
+                        if self
+                            .open_and_fill(pid, i, snap, page_size, long_stat, cur_gen)
+                            .is_none()
+                        {
+                            snap.tombstone(i); // vanished before open
+                        }
                     } else {
                         // Pool full: transient read, no persistent slot.
                         overflow += 1;
-                        read_transient(pid, i, snap, page_size, long_stat, &mut self.stat_path);
+                        if !read_transient(pid, i, snap, page_size, long_stat, &mut self.stat_path)
+                        {
+                            snap.tombstone(i); // transient read failed
+                        }
                     }
                 }
             }
@@ -374,6 +387,46 @@ mod tests {
         assert!(
             a.procs.iter().any(|p| p.pid == 1),
             "pid 1 present despite overflow"
+        );
+    }
+
+    /// Hygiene (§3b): a dead PID requested from the backend must be re-tombstoned, never
+    /// left as a phantom row (real pid, `state '?'`) that `compact` keeps. Mirrors the
+    /// uring backend's assertion so the oracle agrees on the failure path.
+    #[test]
+    fn failed_read_leaves_no_phantom_row() {
+        let page_size = crate::sys::page_size();
+        let me = std::process::id();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let dead = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let mut pids = vec![me, dead];
+        pids.sort_unstable();
+        let mut backend = SyscallBackend::new(64);
+        let mut long = HashSet::new();
+        let mut a = Snapshot::new(INIT_BUF, 0);
+        for &p in &pids {
+            a.push_tombstone(p);
+        }
+        backend.collect(&pids, &mut a, page_size, &mut long);
+        a.compact();
+
+        assert!(
+            a.procs.iter().any(|p| p.pid == me),
+            "live self must survive"
+        );
+        assert!(
+            !a.procs.iter().any(|p| p.pid == dead),
+            "dead PID must be tombstoned, not left as a phantom row"
+        );
+        assert!(
+            a.procs.iter().all(|p| p.state != b'?'),
+            "no phantom row (state '?') may survive compact"
         );
     }
 }

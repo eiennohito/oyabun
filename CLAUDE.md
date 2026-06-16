@@ -47,38 +47,21 @@ The goal is not to deliver 100% of the plan; it's to deliver 120% at better qual
 - **Review Mode**: for non-trivial changes, propose in text, wait for approval.
 - **No silent descoping**: never silently drop, deprioritize, or exclude work. Report findings at equal weight — user prioritizes.
 
+## Docs
+
+`docs/` captures **why and invariants, never what the code is**. No identifiers, signatures, constants, env-var names, or code snippets — those live in the code and rot when duplicated. If a doc edit restates code, it's wrong; write the rationale instead. (A fenced block only for an actual illustrative example.) This is *why* conceptual docs survive refactors: the code shape can change without invalidating them.
+
 ## Project Structure
 
+Module (not file) overviews, ≤60 chars each; a single-file module gets none.
+Per-module detail lives in `docs/ARCHITECTURE.md` — read it before the code.
+
 ```
-crates/       Rust workspace crates
-  atop/src/
-    main.rs     terminal setup, thread spawn, UI event loop (drives etch::Display)
-    app.rs      UI-thread state: selection, collapse, cached display rows
-    ui.rs       rendering via etch: column Schema + per-frame value binding; sys-stat
-                header, htop-style tree, Pct/Mem value-formatters (Display+Hash gates)
-    snapshot.rs Snapshot / ProcessEntry / SystemStats (index-based, POD; is_kthread, pool_overflow)
-    arena.rs    HugePageBuf + StringRef (mmap/THP arena)
-    tree.rs     index-based intrusive tree build + subtree aggregation
-    sys.rs      sysconf, getrlimit(NOFILE), getdents64 enumeration, uid map, /proc/stat|meminfo|loadavg readers
-    gather/     gatherer thread
-      mod.rs    Gatherer, CpuTracker, ProcCache (uid+cmdline cache), Backend dispatch,
-                pool capacity + env knobs (ATOP_POOL_CAP/FORCE_SYSCALL/CMDLINE_REFRESH_N), recycling
-      parse.rs  zero-copy /proc/<pid>/stat parse (+ non_ascii, PF_KTHREAD), cmdline cleanup
-      syscall.rs  persistent stat-fd pool (lseek+read), transient/reopen helpers, test oracle
-      uring.rs    io_uring persistent fixed-fd pool: cached=1 ReadFixed, new=open+read (no close)
-  etch/src/     retained-mode, value-gated terminal renderer (no atop types)
-    lib.rs      public API: Display/Frame/Table/Row, Schema/ColSpec, Cell, Line, Style/Color
-    display.rs  Display + Frame/Table/Row builders + paint routines (the gate lives here)
-    schema.rs   ColSpec/Schema/Align — column geometry, precomputed x-offsets
-    cell.rs     Cell — width-tracked fill-column writer (ascii/glyph/unicode)
-    line.rs     Line — free-form styled spans, content-hash gated
-    hash.rs     GateHasher (FxHash) + gate()
-    style.rs    Style/Color (crossterm wrapper)
-    tests/integration.rs  vt100 render + gate tests (identical frame ⇒ 0 bytes)
-docs/
-  ARCHITECTURE.md  how it's built — read before touching code
-  GOALS.md         goals/constraints
-  plans/           active work-in-progress plans
+crates/
+  atop/     process-manager TUI: 2 threads, ArcSwap snapshot exchange
+    gather/ gatherer thread: read /proc, parse, CPU%, tree, publish
+  etch/     retained-mode, value-gated terminal renderer
+docs/       ARCHITECTURE.md (design — read first), GOALS.md, plans/
 ```
 
 ## Project Goals
@@ -86,4 +69,4 @@ docs/
 **atop** — a Rust CLI/TUI process manager. See `docs/GOALS.md` for full goals and
 `docs/ARCHITECTURE.md` for the implemented design.
 Linux (io_uring + syscall fallback) and macOS (`sysctl`/`libproc`). Windows is not a goal.
-Core invariants: near-zero idle CPU, sub-ms input response, O(n) on process/core count, safe sudo escalation.
+Core invariants: near-zero idle CPU, sub-ms input response, sub O(n) on process/core count when possible, safe sudo escalation.

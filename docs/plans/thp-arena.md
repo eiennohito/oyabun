@@ -97,6 +97,15 @@ formalize the split). cmdline stays per-snapshot and self-contained (the per-cyc
 retained here — eliminating it requires stable cross-snapshot string storage, which is
 deferred to the scale-observation plan where carry-forward actually needs it).
 
+**Also a prerequisite for the deferred gather-coordination §4 A/B (measured 2026-06).**
+Because both arenas are pinned for io_uring, locked memory grows with PID count and hits the
+per-process lock limit a few thousand PIDs in, silently downgrading io_uring to syscall. So
+the backends can't be compared at scale until this bounds the pinned region — and the same
+ceiling blocks profiling the io_uring path under `perf` (perf's locked ring + the buffers
+exceed the limit together). At ~700 PIDs the two tie within noise. Once this lands, re-run
+the A/B (wall + CPU cycles, several PID counts, not under strace): it decides whether
+io_uring stays default (GOALS prefers it) or syscall wins net of coordination.
+
 ## Validation checkpoints (do these first)
 
 1. **THP actually backs the mappings.** `madvise(MADV_HUGEPAGE)` is best-effort; confirm the

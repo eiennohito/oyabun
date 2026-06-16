@@ -180,6 +180,20 @@ impl Snapshot {
         idx
     }
 
+    /// Re-tombstone a slot whose backend read failed (`ESRCH`, parse failure, open
+    /// failure, speculative-probe miss): zero its `pid` so [`is_tombstone`] holds again
+    /// and [`compact`] drops it. Without this a failed read leaves a phantom row — a
+    /// real pid with `state '?'` and empty everything. **Load-bearing for the birth
+    /// probe**, which makes failed speculative reads the common path; also fixes the
+    /// pre-existing die-mid-scan phantom row. Backends own the failure paths, so they
+    /// call this; `compact` stays the single tombstone gate.
+    ///
+    /// [`is_tombstone`]: ProcessEntry::is_tombstone
+    /// [`compact`]: Self::compact
+    pub fn tombstone(&mut self, idx: usize) {
+        self.procs[idx].pid = 0;
+    }
+
     /// Drop vanished PIDs, preserving order (PIDs were enumerated sorted).
     pub fn compact(&mut self) {
         self.procs.retain(|p| !p.is_tombstone());

@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -104,6 +104,43 @@ fn cmdline_refresh_n() -> u32 {
     env_u32("ATOP_CMDLINE_REFRESH_N")
         .unwrap_or(CMDLINE_REFRESH_N)
         .max(1)
+}
+
+/// Wall-clock target for a full `/proc` re-enumeration (§3): the periodic full `getdents`
+/// scan catches a birth at most this late, so K = `ENUM_WALL_MS / REFRESH_MS` cycles.
+const ENUM_WALL_MS: u64 = 1000;
+/// Birth-probe window width W: candidate PIDs probed just above the live max per skip cycle.
+const PROBE_WIDTH: u32 = 8;
+
+/// Gatherer tuning knobs, read once from the environment. Grouped so the knob set is one
+/// named thing rather than scattered single-use readers.
+struct Config {
+    /// Full-scan cadence K — cycles between full `getdents` re-enumerations; skip cycles
+    /// reuse the maintained live set + birth probe. Derived from a wall-clock target so
+    /// birth latency is `≤ K × interval`. `ATOP_ENUM_EVERY` (1 = full scan every cycle).
+    enum_every: u64,
+    /// Birth-probe window width — candidates probed just above the live max per skip cycle.
+    /// `ATOP_PROBE_WIDTH`.
+    probe_width: u32,
+    /// Per-round CQE wait target for the `io_uring` backend (the I/O↔parse overlap dial):
+    /// default a full ring ⇒ submit the batch and wait once for all of it (no overlap, since
+    /// parse is now cheap). `ATOP_URING_BATCH_CAP` lowers it to re-enable overlap.
+    batch_cap: usize,
+}
+
+impl Config {
+    fn from_env() -> Self {
+        Self {
+            enum_every: std::env::var("ATOP_ENUM_EVERY")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or((ENUM_WALL_MS / REFRESH_MS).max(1))
+                .max(1),
+            probe_width: env_u32("ATOP_PROBE_WIDTH").unwrap_or(PROBE_WIDTH).max(1),
+            batch_cap: env_u32("ATOP_URING_BATCH_CAP")
+                .map_or(RING_ENTRIES as usize, |n| n.max(1) as usize),
+        }
+    }
 }
 
 fn env_u32(key: &str) -> Option<u32> {
@@ -590,7 +627,6 @@ impl Backend {
 pub struct Gatherer {
     arc_swap: Arc<ArcSwap<Snapshot>>,
     recycled: Option<Arc<Snapshot>>,
-    backend: Backend,
     proc_dir: ProcDir,
     pids: Vec<u32>,
     dent_buf: Vec<u8>,
@@ -604,32 +640,28 @@ pub struct Gatherer {
     long_stat_pids: HashSet<u32>,
     /// Persistent-fd pool capacity, retained for the mid-run `io_uring`→syscall downgrade.
     pool_cap: u32,
+    config: Config,
+    /// `pid_max` (the PID-counter wrap point), read once at startup — bounds the probe
+    /// window so it never generates an impossible PID.
+    pid_max: u32,
     page_size: u64,
     generation: u64,
 }
 
 impl Gatherer {
-    /// Build the gatherer and the shared snapshot cell. Returns the `ArcSwap` for
-    /// the UI to load from. Probes `io_uring`; falls back to the syscall backend.
+    /// Build the gatherer and the shared snapshot cell. Returns the `ArcSwap` for the UI to
+    /// load from. The I/O backend is **not** built here — [`run`](Self::run) builds it on the
+    /// gatherer thread, so the `io_uring` ring is owned by its sole submitter. Runs on the
+    /// main thread; does no `/proc` I/O.
     pub fn new(page_size: u64) -> std::io::Result<(Self, Arc<ArcSwap<Snapshot>>)> {
         let front = Arc::new(Snapshot::new(INIT_BUF, 0));
         let back = Arc::new(Snapshot::new(INIT_BUF, 1));
 
         let pool_cap = pool_capacity();
-        let backend = if force_syscall() {
-            Backend::Syscall(SyscallBackend::new(pool_cap))
-        } else {
-            match UringBackend::probe(pool_cap, RING_ENTRIES, &front, &back) {
-                Some(u) => Backend::Uring(Box::new(u)),
-                None => Backend::Syscall(SyscallBackend::new(pool_cap)),
-            }
-        };
-
         let arc_swap = Arc::new(ArcSwap::from(front));
         let gatherer = Self {
             arc_swap: arc_swap.clone(),
             recycled: Some(back),
-            backend,
             proc_dir: ProcDir::open()?,
             pids: Vec::new(),
             dent_buf: vec![0u8; 64 * 1024],
@@ -640,31 +672,101 @@ impl Gatherer {
             tree_order: Vec::new(),
             long_stat_pids: HashSet::new(),
             pool_cap,
+            config: Config::from_env(),
+            pid_max: sys::read_pid_max(),
             page_size,
             generation: 0,
         };
         Ok((gatherer, arc_swap))
     }
 
-    /// Produce the first snapshot synchronously. Call before spawning the gatherer
-    /// thread so the opening frame is populated (no startup poll on the UI side).
-    pub fn prime(&mut self) {
-        self.gather();
-    }
-
-    /// Gatherer thread entry point. Sleeps on the control channel between refreshes
-    /// (zero idle CPU); gathers on timeout or `Refresh`; exits on `Quit`/hangup.
-    /// The caller is expected to have `prime()`d the first snapshot.
-    pub fn run(mut self, ctrl: &Receiver<Ctrl>, interval: Duration) {
+    /// Gatherer thread entry point and **sole ring submitter**. Builds the I/O backend on
+    /// this thread (binding the ring's single-issuer submitter task here), produces the
+    /// priming snapshot, signals `ready`, then sleeps on the control channel (zero idle CPU),
+    /// gathering on timeout or `Refresh` and exiting on `Quit`/hangup. The backend lives in
+    /// this frame and is passed to each `gather` — so it is non-optional and never escapes
+    /// the submitter thread. `ready` lets the main thread rendezvous on the first snapshot
+    /// (or observe this thread's early exit, when the sender drops).
+    pub fn run(mut self, ctrl: &Receiver<Ctrl>, interval: Duration, ready: &Sender<()>) {
+        let mut backend = self.build_backend();
+        self.gather(&mut backend); // prime
+        let _ = ready.send(()); // first snapshot published — release the main thread
         // Exits on Quit or a hung-up channel; gathers on Refresh or interval timeout.
         while let Ok(Ctrl::Refresh) | Err(RecvTimeoutError::Timeout) = ctrl.recv_timeout(interval) {
-            self.gather();
+            self.gather(&mut backend);
         }
     }
 
-    fn gather(&mut self) {
-        self.proc_dir.read_pids(&mut self.dent_buf, &mut self.pids);
+    /// Build the I/O backend on the **calling thread** — which must be the gatherer thread,
+    /// because the `io_uring` backend's single-issuer flags bind the ring's submitter task to
+    /// its creator. Probes `io_uring` (`ATOP_FORCE_SYSCALL` or any probe failure falls back to
+    /// the syscall backend).
+    fn build_backend(&self) -> Backend {
+        if force_syscall() {
+            return Backend::Syscall(SyscallBackend::new(self.pool_cap));
+        }
+        let front = self.arc_swap.load_full();
+        let back = self
+            .recycled
+            .as_ref()
+            .expect("recycled buffer present before first gather");
+        match UringBackend::probe(
+            self.pool_cap,
+            RING_ENTRIES,
+            self.config.batch_cap,
+            &front,
+            back,
+        ) {
+            Some(u) => Backend::Uring(Box::new(u)),
+            None => Backend::Syscall(SyscallBackend::new(self.pool_cap)),
+        }
+    }
+
+    /// Skip-cycle birth probe (§3a): append up to `probe_width` candidate PIDs just above
+    /// the highest live PID, bounded by the kernel's allocation frontier (`ns_last_pid`).
+    /// PIDs are allocated near-monotonically, so a freshly-forked process almost always
+    /// takes a number above the current max; `collect` opens these speculatively — survivors
+    /// join the maintained set, misses fail their open and are re-tombstoned (§3b, the
+    /// hygiene that makes speculative opens safe). In steady state `ns_last_pid` equals our
+    /// max, so the window is empty and the probe costs **zero** opens. A burst > W, a
+    /// non-sequential birth, or a post-wrap low PID (the live max cannot follow the counter
+    /// below itself) waits for the next full scan — a probe hit-rate, never a correctness,
+    /// concern, because the full scan is the backstop.
+    ///
+    /// **Precondition**: `self.pids` is sorted ascending and holds the current live set —
+    /// the probe reads the max (`last`) as its anchor and appends strictly-larger candidates
+    /// to stay sorted. The survivor rebuild after `compact` upholds this. `ns_last_pid` is
+    /// read from the gatherer's own PID namespace (the only one whose numbering it tracks).
+    fn probe_births(&mut self) {
+        debug_assert!(
+            self.pids.windows(2).all(|w| w[0] <= w[1]),
+            "probe_births requires a sorted live set"
+        );
+        let w = self.config.probe_width;
+        let Some(&anchor) = self.pids.last() else {
+            return; // no live set yet — the next full scan seeds it
+        };
+        let frontier = sys::read_ns_last_pid().unwrap_or(anchor.saturating_add(w));
+        let hi = anchor.saturating_add(w).min(frontier).min(self.pid_max);
+        for cand in anchor.saturating_add(1)..=hi {
+            self.pids.push(cand); // > current max ⇒ appends keep `pids` sorted
+        }
+    }
+
+    fn gather(&mut self, backend: &mut Backend) {
+        // Enumeration cadence (§3): a full `getdents` re-scan every K cycles is the resync
+        // that catches any birth the probe missed (non-sequential, burst > W, post-wrap);
+        // skip cycles reuse the maintained live set plus a cheap sequential-birth probe.
+        // `self.pids` is rebuilt from survivors after `compact` (below), so deaths drop the
+        // same cycle (held read → `ESRCH` → re-tombstone → compact) — the full scan is only
+        // for births, never for pruning.
+        if self.generation.is_multiple_of(self.config.enum_every) {
+            self.proc_dir.read_pids(&mut self.dent_buf, &mut self.pids);
+        } else {
+            self.probe_births();
+        }
         self.pids.sort_unstable();
+        self.pids.dedup();
         let now = Instant::now();
 
         // Reclaim the recycled buffer; skip this cycle if the UI still holds it
@@ -686,24 +788,30 @@ impl Gatherer {
                 .count()
         };
         let needed = self.pids.len() * BYTES_PER_PID + n_long * (STAT_SLOT_LONG - STAT_SLOT);
-        Self::prepare(snap, &self.pids, needed, &mut self.backend);
+        Self::prepare(snap, &self.pids, needed, backend);
 
         let overflow = if let Ok(overflow) =
-            self.backend
-                .collect(&self.pids, snap, self.page_size, &mut self.long_stat_pids)
+            backend.collect(&self.pids, snap, self.page_size, &mut self.long_stat_pids)
         {
             overflow
         } else {
             // io_uring failed mid-cycle: drop to syscall permanently and redo.
-            self.backend = Backend::Syscall(SyscallBackend::new(self.pool_cap));
-            Self::prepare(snap, &self.pids, needed, &mut self.backend);
-            self.backend
+            *backend = Backend::Syscall(SyscallBackend::new(self.pool_cap));
+            Self::prepare(snap, &self.pids, needed, backend);
+            backend
                 .collect(&self.pids, snap, self.page_size, &mut self.long_stat_pids)
                 .unwrap_or(0)
         };
         snap.pool_overflow = overflow;
 
         snap.compact();
+
+        // Rebuild the maintained live set from survivors (PID-sorted, since `compact`
+        // preserves order): deaths and probe misses fall out now, confirmed births stay.
+        // The next skip cycle reuses this set; the next full scan replaces it wholesale.
+        self.pids.clear();
+        self.pids.extend(snap.procs.iter().map(|p| p.pid));
+
         // Fill uid + cmdline (slow fields) on the surviving entries, then CPU%.
         self.cache.update(&mut snap.procs, &mut snap.strings);
         self.cpu.update(&mut snap.procs, now);
@@ -846,7 +954,9 @@ mod tests {
         let mut a = Snapshot::new(INIT_BUF, 0);
         let mut b = Snapshot::new(INIT_BUF, 1);
 
-        let Some(mut uring) = UringBackend::probe(pool_cap, RING_ENTRIES, &a, &b) else {
+        let Some(mut uring) =
+            UringBackend::probe(pool_cap, RING_ENTRIES, RING_ENTRIES as usize, &a, &b)
+        else {
             eprintln!("io_uring unavailable — skipping oracle comparison");
             return;
         };
@@ -929,10 +1039,11 @@ mod tests {
         });
 
         let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let mut backend = g.build_backend();
         let me = std::process::id();
         let (mut max_cpu, mut max_peak) = (0, 0);
         for _ in 0..4 {
-            g.gather();
+            g.gather(&mut backend);
             let snap = cell.load_full();
             if let Some(p) = snap.procs.iter().find(|p| p.pid == me) {
                 max_cpu = max_cpu.max(p.cpu_pct);
@@ -959,7 +1070,8 @@ mod tests {
     #[test]
     fn gatherer_publishes_valid_snapshot() {
         let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
-        g.gather();
+        let mut backend = g.build_backend();
+        g.gather(&mut backend);
         let snap = cell.load_full();
 
         assert!(snap.generation >= 1);
@@ -1014,12 +1126,13 @@ mod tests {
     fn gather_steady_state_is_cheap() {
         const ITERS: u32 = 400;
         let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
-        g.gather();
-        g.gather(); // warm up the persistent-fd pool
+        let mut backend = g.build_backend();
+        g.gather(&mut backend);
+        g.gather(&mut backend); // warm up the persistent-fd pool
 
         let start = Instant::now();
         for _ in 0..ITERS {
-            g.gather();
+            g.gather(&mut backend);
         }
         let elapsed = start.elapsed();
         let snap = cell.load_full();
@@ -1038,8 +1151,9 @@ mod tests {
     #[test]
     fn cmdline_persists_across_coarse_cycles() {
         let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let mut backend = g.build_backend();
         let me = std::process::id();
-        g.gather();
+        g.gather(&mut backend);
         let snap1 = cell.load_full();
         let cmd1 = {
             let p = snap1.procs.iter().find(|p| p.pid == me).expect("self c1");
@@ -1049,12 +1163,76 @@ mod tests {
 
         // A second cycle (no time for argv to change) must still show the cmdline,
         // re-materialized from the cache into the new arena.
-        g.gather();
+        g.gather(&mut backend);
         let snap2 = cell.load_full();
         let cmd2 = {
             let p = snap2.procs.iter().find(|p| p.pid == me).expect("self c2");
             String::from_utf8_lossy(snap2.strings.get(p.cmdline)).into_owned()
         };
         assert_eq!(cmd1, cmd2, "cmdline must persist across cycles");
+    }
+
+    /// §3a: a sequentially-allocated new process is caught by the skip-cycle birth probe
+    /// within **1** cycle — not only at the next full `getdents` scan. Full scans are
+    /// disabled (`enum_every` huge) so the birth can *only* be found by the probe.
+    #[test]
+    fn birth_probe_catches_sequential_birth_within_one_cycle() {
+        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        g.config.enum_every = 1_000_000; // effectively no full re-scan → births only via probe
+        g.config.probe_width = 1_000_000; // window spans (max_live, ns_last_pid] regardless of W
+        let mut backend = g.build_backend();
+        g.gather(&mut backend); // generation 0 → full scan seeds the maintained live set
+        assert!(cell.load().procs.iter().any(|p| p.pid == 1), "set seeded");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id();
+
+        g.gather(&mut backend); // generation 1 → SKIP cycle: probe must discover the new child
+        let caught = cell.load().procs.iter().any(|p| p.pid == child_pid);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            caught,
+            "sequential birth (pid {child_pid}) must be caught by the probe within 1 cycle"
+        );
+    }
+
+    /// §3b + cadence: a process that dies vanishes the **same** (skip) cycle via the pool
+    /// `ESRCH` → re-tombstone → compact → survivor-rebuild path — it never lingers until
+    /// the next full scan, and no phantom row is left behind.
+    #[test]
+    fn death_caught_same_cycle_on_skip() {
+        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        g.config.enum_every = 1_000_000; // force skip cycles after the first
+        let mut backend = g.build_backend();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id();
+
+        g.gather(&mut backend); // generation 0 → full scan sees the (still-live) child
+        assert!(
+            cell.load().procs.iter().any(|p| p.pid == child_pid),
+            "child must be observed while alive"
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        g.gather(&mut backend); // generation 1 → SKIP cycle: held read ESRCH ⇒ death caught now
+        let snap = cell.load();
+        assert!(
+            !snap.procs.iter().any(|p| p.pid == child_pid),
+            "death must be caught the same skip cycle, not deferred to the next full scan"
+        );
+        assert!(
+            snap.procs.iter().all(|p| p.state != b'?'),
+            "no phantom row may survive the death"
+        );
     }
 }

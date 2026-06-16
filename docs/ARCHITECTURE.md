@@ -9,9 +9,13 @@ This describes how atop is actually built. For *why* (goals/constraints) see `GO
 Two OS threads, no async runtime:
 
 - **UI thread** (main): `etch` (retained renderer) + crossterm event loop. Loads the
-  current snapshot, flattens the tree to display rows, renders, handles input.
+  current snapshot, flattens the tree to display rows, renders, handles input. Does no
+  `/proc` I/O; at startup it waits for the gatherer's first snapshot.
 - **Gatherer thread**: enumerates `/proc`, reads stat files, parses, computes CPU%,
-  builds the tree, publishes the snapshot.
+  builds the tree, publishes the snapshot. Owns the ring and is its sole submitter, so
+  the ring is built on this thread, not at construction on main — io_uring's modern
+  single-submitter optimizations bind a ring to its creating thread. Its first gather
+  also primes the opening snapshot.
 
 Exchange is via `arc_swap::ArcSwap<Snapshot>` — lock-free; the UI never blocks the
 gatherer.
@@ -85,6 +89,11 @@ as tombstones (`pid == 0`) and `compact()`ed out before publish; because PIDs ar
 enumerated sorted and filled by index, `procs` stays sorted by PID (the tree build's
 binary-search precondition).
 
+**Tombstone hygiene**: a slot is born a tombstone and only goes live when a read parses.
+Every failure path (open, read, reopen, parse) must re-mark the slot dead, or it survives
+compaction as a *phantom row* — a real PID with empty fields. This is load-bearing for the
+birth probe (below), where most speculative reads are meant to fail.
+
 ## Arena (`HugePageBuf`)
 
 `mmap(MAP_ANONYMOUS|MAP_PRIVATE)` rounded to 2 MiB, `madvise(MADV_HUGEPAGE)` to cut
@@ -104,11 +113,28 @@ relocate the mapping and invalidate in-flight `ReadFixed` destinations *and* lea
 registered buffer stale for the next cycle. All transient reads (overflow, reopen) reuse
 or fit within that budget — reopen reads into the failed read's already-claimed slot.
 
-## `/proc` enumeration
+## `/proc` enumeration — maintained live set + cadence + birth probe
 
 `getdents64` directly into a reused buffer, parsing dirent records by hand — no
 per-entry `String`/`PathBuf` (unlike `fs::read_dir`). The `/proc` dir fd is opened
 once and `lseek(0)`'d per scan.
+
+The live PID set is **maintained across cycles**, not re-derived every scan. A full scan's
+cost is kernel-side dirent materialization, so the only unprivileged lever is frequency:
+
+- Deaths are free — a held read fails when its task dies, dropping the PID the same cycle —
+  so enumeration exists only to find *births*.
+- Full re-scan only every ~1 s (a wall-clock target, not a cycle count); it resyncs anything
+  the probe missed.
+- Between scans, a cheap **birth probe**: since the kernel allocates PIDs near-monotonically,
+  speculatively read a few numbers just above the highest live PID, bounded by the kernel's
+  allocation frontier. New arrivals are caught within one cycle; in steady state the window
+  is empty (zero cost). Bursts and the post-wrap low range wait for the full re-scan — a
+  hit-rate, not a correctness, concern (the failed speculative reads rely on the hygiene
+  rule above).
+
+This enumeration cadence is the shared component the scale-observation plan's per-PID
+*sampling* cadence builds on — the two are independent knobs.
 
 ## Zero-copy stat parse
 
@@ -143,6 +169,11 @@ Containers with a 256/512 fd limit get a proportionally smaller pool.
 
 ### io_uring backend
 
+Built on the gatherer thread (sole submitter — see Threading) with io_uring's modern
+single-submitter flags, probed richest-first with fallback to a plain ring on older
+kernels. They defer completion bookkeeping to the wait call and drop cross-CPU wakeups —
+safe because every cycle reaches a wait.
+
 Direct (fixed) descriptors, registered sparse (`register_files_sparse(pool_cap)`),
 one slot per held PID. `user_data = (fixed_idx << 1) | op`:
 
@@ -162,11 +193,23 @@ dead PID:    register_files_update(idx, -1)                    (eviction, low vo
 - **Reopen / overflow** are deferred until the ring fully drains, then read transiently
   (a non-fixed close hits `files->file_lock` briefly, never `uring_lock`). Reopen reuses
   the failed read's slot; overflow allocates within the up-front reserve.
+- **Wait-batching (one wakeup/cycle)**: submit the whole batch, then wait for all its
+  completions at once instead of draining one at a time. This collapsed ~51 blocking waits
+  per cycle — each a scheduler context switch — to ~1, the largest remaining slice of pure
+  coordination overhead. Overlapping parse with later reads stays available as a tuning
+  dial, but is off by default now that parse is cheap.
 - **Bounded in-flight + free-list**: keep filling the SQ while fixed slots and SQ space
-  remain, then reap and parse — continuous I/O↔parse overlap.
+  remain, then reap and parse.
 
 `RING_ENTRIES=4096` bounds in-flight concurrency (multiple fill/reap rounds per cycle
 when `pool_cap` is large). `submit_and_wait` retries on `EINTR`.
+
+**Known limitation — pinned memory scales with PID count.** Both arenas are registered as
+fixed io_uring buffers, so locked memory grows with the process count and counts against
+the per-process lock limit. Under a low limit (8 MiB is common) it is exceeded a few
+thousand PIDs in; registration then fails on growth and the backend silently downgrades to
+syscall. The fix — register only a small fixed read region sized to in-flight depth — is
+the THP-arena plan's, and also unblocks a fair backend A/B at scale (deferred until then).
 
 ### syscall backend
 

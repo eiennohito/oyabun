@@ -59,6 +59,38 @@ impl SystemStats {
     }
 }
 
+/// `comm` (process name) stored inline: up to [`COMM_CAP`] bytes plus the valid length, as one
+/// value. Bundling the pair makes an out-of-range length **non-representable** — the only way
+/// to write it is [`set`](Self::set), which truncates to capacity, so [`as_bytes`](Self::as_bytes)
+/// can never slice past the buffer. `Flat` (`Copy`), so it embeds in the POD row.
+#[derive(Clone, Copy)]
+pub struct InlineComm {
+    bytes: [u8; COMM_CAP],
+    len: u8,
+}
+
+impl InlineComm {
+    /// The empty name.
+    pub const EMPTY: InlineComm = InlineComm {
+        bytes: [0; COMM_CAP],
+        len: 0,
+    };
+
+    /// The name bytes (always in bounds by construction).
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
+    /// Copy a name in, truncating to [`COMM_CAP`].
+    #[allow(clippy::cast_possible_truncation)] // n ≤ COMM_CAP (15), fits u8
+    pub fn set(&mut self, comm: &[u8]) {
+        let n = comm.len().min(COMM_CAP);
+        self.bytes[..n].copy_from_slice(&comm[..n]);
+        self.len = n as u8;
+    }
+}
+
 /// Per-process record. POD (`Flat`) — lives in a [`TypedBuf`] on huge pages; `clear` drops
 /// nothing, enabling zero-alloc reuse each cycle.
 #[derive(Clone, Copy)]
@@ -72,8 +104,6 @@ pub struct ProcessEntry {
     pub priority: i8,
     /// Nice value (−20 … 19). User-controllable scheduling hint.
     pub nice: i8,
-    /// Number of valid bytes in [`comm`](Self::comm_bytes).
-    pub comm_len: u8,
     /// Thread count (`num_threads` from `/proc/<pid>/stat`).
     pub num_threads: u32,
     /// Moving-average CPU% in basis points (hundredths of a percent); 10000 = one
@@ -89,10 +119,10 @@ pub struct ProcessEntry {
     /// Process start time (jiffies since boot). With `pid`, identifies a unique
     /// process incarnation — used to make `kill` safe against PID reuse.
     pub start_time: u64,
-    /// `comm` (process name) inline. Re-parsed from `stat` every cycle (a store would be
-    /// pure overhead), so the first [`comm_len`](Self::comm_len) bytes hold the name; read
-    /// via [`comm`](Self::comm).
-    pub comm_bytes: [u8; COMM_CAP],
+    /// `comm` (process name) inline. Re-parsed from `stat` every cycle (a store would be pure
+    /// overhead). Private so the bytes/length invariant holds: read via [`comm`](Self::comm),
+    /// write via [`set_comm`](Self::set_comm).
+    comm: InlineComm,
     /// Full `/proc/<pid>/cmdline` (NUL→space) as a handle into the generational `Cmd` store.
     /// Empty for kernel threads and inaccessible processes. The handle is stable across
     /// cycles while the cmdline is unchanged (no per-cycle re-copy).
@@ -130,14 +160,13 @@ impl ProcessEntry {
         state: b'?',
         priority: 0,
         nice: 0,
-        comm_len: 0,
         num_threads: 0,
         cpu_pct: 0,
         cpu_peak: 0,
         mem_bytes: 0,
         ticks: 0,
         start_time: 0,
-        comm_bytes: [0; COMM_CAP],
+        comm: InlineComm::EMPTY,
         cmdline: StringRef::EMPTY,
         non_ascii: false,
         is_kthread: false,
@@ -153,15 +182,12 @@ impl ProcessEntry {
     /// The `comm` (process name) bytes.
     #[must_use]
     pub fn comm(&self) -> &[u8] {
-        &self.comm_bytes[..self.comm_len as usize]
+        self.comm.as_bytes()
     }
 
     /// Copy `comm` in from a parsed `stat` slice, truncating to [`COMM_CAP`].
-    #[allow(clippy::cast_possible_truncation)] // n ≤ COMM_CAP (15), fits u8
     pub fn set_comm(&mut self, comm: &[u8]) {
-        let n = comm.len().min(COMM_CAP);
-        self.comm_bytes[..n].copy_from_slice(&comm[..n]);
-        self.comm_len = n as u8;
+        self.comm.set(comm);
     }
 
     /// A slot is a tombstone (read failed / PID vanished) iff `pid == 0`. Linux never

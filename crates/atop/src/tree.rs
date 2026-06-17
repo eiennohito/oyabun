@@ -112,32 +112,15 @@ mod tests {
     use super::*;
 
     fn proc(pid: u32, parent: u32) -> ProcessEntry {
-        ProcessEntry {
-            pid,
-            ppid: parent,
-            uid: 0,
-            state: b'S',
-            priority: 20,
-            nice: 0,
-            comm_len: 0,
-            num_threads: 1,
-            cpu_pct: 0,
-            cpu_peak: 0,
-            mem_bytes: 0,
-            ticks: 0,
-            start_time: 0,
-            comm_bytes: [0; crate::procs::COMM_CAP],
-            cmdline: thoop::StringRef::EMPTY,
-            non_ascii: false,
-            is_kthread: false,
-            parent_idx: NONE,
-            first_child: NONE,
-            next_sibling: NONE,
-            subtree_size: 0,
-            depth: 0,
-            subtree_cpu: 0,
-            subtree_mem: 0,
-        }
+        // Build on the POD tombstone (its private `comm` field is not nameable here) and set
+        // only what the tree build reads plus a couple of plausible stat fields.
+        let mut e = ProcessEntry::TOMBSTONE;
+        e.pid = pid;
+        e.ppid = parent;
+        e.state = b'S';
+        e.priority = 20;
+        e.num_threads = 1;
+        e
     }
 
     fn build_v(mut procs: Vec<ProcessEntry>) -> (Vec<ProcessEntry>, u32) {

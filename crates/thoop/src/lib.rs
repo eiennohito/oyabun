@@ -11,8 +11,8 @@
 //! - [`Arena`] — huge-page sub-allocator: many structures share a few regions (one
 //!   `mmap`-per-structure would commit a full huge page each). Hands out [`ChunkId`]s;
 //!   growth relocates chunks (transparently — holders keep their `ChunkId`).
-//! - [`GenStore`] / [`StrStore`] / [`TypedBuf`] — live in arena chunks; their growing
-//!   methods take `&mut Arena`, hot reads take `&Arena`.
+//! - [`GenStore`] / [`StrStore`] / [`TypedBuf`] / [`ThpMap`] — live in arena chunks; their
+//!   growing methods take `&mut Arena`, hot reads take `&Arena`.
 //!
 //! Inter-region references are typed [`Ref`] handles (slot indices, stable across
 //! relocation), never raw pointers — a handle resolves only against the store that issued
@@ -24,12 +24,14 @@ mod arena;
 mod genstore;
 mod region;
 mod strstore;
+mod thpmap;
 mod typedbuf;
 
 pub use arena::{Arena, ChunkId};
 pub use genstore::GenStore;
 pub use region::{HUGE_PAGE, MmapRegion};
 pub use strstore::{ByteResolver, StrStore, StringRef};
+pub use thpmap::{MapKey, ThpMap};
 pub use typedbuf::TypedBuf;
 
 use std::marker::PhantomData;

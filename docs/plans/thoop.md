@@ -3,9 +3,9 @@
 > **Scope.** A policy-free substrate for storing flat records on transparent-huge-page memory
 > with a generational lifecycle. It is built for atop but holds **zero atop concepts** — no PID,
 > snapshot, gather, and crucially no "single thread" written into a *contract* as a law — and is
-> meant to be extractable as a standalone library. atop layers its own policy on top; see
-> `thp-arena.md`. The current instantiation is single-threaded, but the multithread path is an
-> additive **concurrency seam** (below), never a rewrite.
+> meant to be extractable as a standalone library. atop layers its own policy on top; see the
+> storage section of `../ARCHITECTURE.md`. The current instantiation is single-threaded, but the
+> multithread path is an additive **concurrency seam** (below), never a rewrite.
 
 ## Why huge pages
 
@@ -31,8 +31,9 @@ chunks from **one** shared region.
 
 ## Writers — the arena is the factory
 
-Containers (a generational slab, a string slab, a typed buffer) are **writers** over arena
-chunks. A writer exists only as a `Pin<Box<Writer>>` returned by an `arena.new_*` constructor
+Containers (a generational slab, a string slab, a typed buffer, an open-addressing map keyed by
+a flat sentinel-reserving key) are **writers** over arena chunks. A writer exists only as a
+`Pin<Box<Writer>>` returned by an `arena.new_*` constructor
 that, in one step, allocates the chunk, builds the writer at its final address, and registers
 its base-cell location. The consequences are enforced by the type system, not convention:
 
@@ -97,5 +98,7 @@ honest — a future extraction neither over-anchors on "single-thread" nor redis
 - **Allocator oracle:** alloc/free/reuse/compaction matches a reference model over a churny
   workload; fragmentation returns to zero after a compaction.
 - **Lifecycle oracle:** alloc/demote/free/gc matches a reference model over churn.
+- **Map oracle:** random insert/update/remove and bulk `retain` churn matches a `HashMap`
+  reference, across the rehash relocations a tiny initial capacity forces.
 - **THP backing confirmed:** non-zero `AnonHugePages` for regions where host policy permits;
   graceful fallback where it is `never`.

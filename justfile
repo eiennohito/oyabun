@@ -39,6 +39,10 @@ check: _require-cargo
 test: _require-cargo
     @{{ _run }} test-rust cargo test --workspace
 
+# Run a filtered subset (e.g. `just testf thpmap -p thoop`); FILTER matches test names
+testf FILTER *ARGS: _require-cargo
+    @{{ _run }} test-filtered cargo test {{ ARGS }} -- {{ FILTER }}
+
 # --- Build ---
 
 # Build workspace in debug mode

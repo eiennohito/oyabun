@@ -151,8 +151,9 @@ Consequences:
   on reparent — caught within N cycles, or promptly if we re-read a dead parent's former
   children).
 
-This is the riskiest part of the plan and the reason THP-arena (which introduces the arena
-partitioning and can introduce stable string storage) comes first.
+This is the riskiest part of the plan and the reason the THP storage work (now landed — the
+arena, the per-PID stores, the stable `Cmd` string store, and the THP-resident PID index; see
+`../ARCHITECTURE.md`) came first.
 
 ### 4. Enumeration cadence decoupled from sampling
 
@@ -208,7 +209,7 @@ only addition here:
   tier logic / debugging); carried-forward string validity.
 - `app.rs` / `main.rs`: send viewport + collapse set on scroll/collapse/navigation; request the
   navigation fast-path refresh.
-- Depends on the THP-arena plan's stable string storage for carry-forward.
+- Depends on the now-landed stable `Cmd` string store for carry-forward (see `../ARCHITECTURE.md`).
 
 ## Risks / open questions
 
@@ -248,6 +249,6 @@ only addition here:
 
 ## Sequencing
 
-**After the THP-arena plan.** That plan makes the all-PID path miss-free (so rotation is
-unneeded below extreme scale) and introduces the arena partitioning + stable-string storage
-this plan's incremental snapshot depends on. Build this only when targeting extreme hardware.
+**After the THP storage work (now landed).** It makes the all-PID path miss-free (so rotation
+is unneeded below extreme scale) and provides the arena + stable `Cmd` string store this plan's
+incremental snapshot depends on. Build this only when targeting extreme hardware.

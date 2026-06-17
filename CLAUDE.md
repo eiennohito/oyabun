@@ -62,7 +62,7 @@ crates/
   atop/     process-manager TUI: one thread, serialized gather→render loop
     gather/ read /proc, parse, CPU%, tree; fill the arena row buffer in place
   etch/     retained-mode, value-gated terminal renderer
-  thoop/    THP storage primitives (MmapRegion, Arena, GenStore, TypedBuf, …)
+  thoop/    THP storage primitives (MmapRegion, Arena, GenStore, TypedBuf, ThpMap, …)
 docs/       ARCHITECTURE.md (design — read first), GOALS.md, plans/
 ```
 

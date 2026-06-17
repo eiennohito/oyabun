@@ -4,8 +4,8 @@ Status: **implemented** (Linux). macOS and several features below are still futu
 
 This describes how atop is actually built. For *why* (goals/constraints) see `GOALS.md`.
 The single-thread storage *policy* on top of the `thoop` substrate (mechanism) is
-`docs/plans/thoop.md`; the remaining storage work (a THP-resident PID index) is
-`docs/plans/thp-arena.md`.
+`docs/plans/thoop.md`. With the PID index now on huge pages too, every hot, randomly-probed
+per-PID structure is THP-resident.
 
 ## Threading model
 
@@ -87,7 +87,8 @@ from the outside, so a `Ref` is a stable slot index and no reference into arena 
 an allocation.
 
 atop holds three per-PID stores (a hot CPU-history ring, cold uid/cmdline metadata, and the
-`Cmd` string store) **and** the process row buffer in one shared arena. Because gather and
+`Cmd` string store), the **PID index** (an open-addressing map), **and** the process row buffer
+in one shared arena. Because gather and
 render never overlap, atop picks the cheapest sound instantiation of the substrate — each
 choice is exactly a cross-thread-safety piece *removed*:
 
@@ -359,8 +360,9 @@ after a kill) carry the windowed values forward instead of dividing by a near-ze
 window; a PID whose tick counter goes backwards (reuse/wrap) resets its history;
 PIDs absent from a cycle are evicted via a generation tag. The rings live on huge pages in
 a generational store (the **hot** half of `ProcTable`, kept apart from cold metadata) and
-are keyed through the shared PID index — a small hand-rolled `FxHash`-style hasher, since the
-default `SipHash` is hash-flood-resistant but slow and PID keys aren't attacker-controlled.
+are keyed through the shared PID index (a THP-resident open-addressing map). Its multiplicative
+integer hash is fast and *not* hash-flood-resistant — which PID keys do not need, and the
+default `SipHash` would be slow for.
 The ring is updated through a copy-free in-place borrow that never spans another store's
 allocation (which could relocate it).
 
@@ -390,9 +392,13 @@ allocation (which could relocate it).
   the two-tier long-stat slot mechanism go away (one fixed slot size with ample margin).
 - **Reopen / overflow** read transiently into a free landing slot after the ring drains.
 - **Bounded in-flight** (not fixed "waves") — more overlap, self-balancing.
-- **The `ProcTable` PID index** and the fd pools are persistent `HashMap`s, not flat
-  PID-indexed arrays (which would be ~32 MB). (A THP-resident open-addressing index is the
-  remaining storage work — `docs/plans/thp-arena.md`.)
+- **The `ProcTable` PID index** is a THP-resident open-addressing map (`thoop::ThpMap` —
+  Robin Hood, backward-shift deletion so per-cycle bulk eviction never accrues tombstones),
+  sharing the arena and its TLB win rather than living on the heap (and not a flat
+  PID-indexed array, which would be ~32 MB). The **fd pools** inside each backend are still
+  heap `HashMap`s with the same per-PID-per-cycle probe pattern; moving them onto the arena is
+  a natural follow-up, blocked only on the backends being able to reach the arena (they are
+  built without it today). `ThpMap` is the reusable primitive for that step.
 - **Selection-follows-PID** across refreshes is implemented; full follow-mode
   auto-scroll is not.
 - **Kill is race-safe**: `sys::kill_verified` pins the target with a `pidfd`, re-checks

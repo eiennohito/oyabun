@@ -19,7 +19,7 @@ When goals conflict, higher wins:
 This order is *why* the app serializes to one thread: the latency budget is loose enough that
 losing gather/render parallelism costs nothing measurable, while the serial model deletes
 whole classes of CPU/RAM overhead (copies, double-buffering, the cross-thread lease,
-generational GC) and makes data races non-representable. See `docs/plans/thp-arena.md`.
+generational GC) and makes data races non-representable. See `docs/ARCHITECTURE.md`.
 
 ## Core constraints
 

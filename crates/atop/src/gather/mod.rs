@@ -9,11 +9,10 @@ mod syscall;
 mod uring;
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, Instant};
 
-use thoop::{Arena, Gen, GenStore, Ref, StrStore, StringRef};
+use thoop::{Arena, Gen, GenStore, Ref, StrStore, StringRef, ThpMap};
 
 use crate::procs::{Cmd, NONE, ProcessEntry, Procs, SystemStats};
 use crate::sys::{self, ProcDir, ProcPath, RawCpuCounters, clk_tck, nofile_soft_limit};
@@ -84,6 +83,10 @@ const PIDMETA_MIN_SLOTS: usize = 2048;
 /// Initial slot count for the per-PID CPU-history store — same population as metadata (every
 /// PID, kthreads included, gets CPU tracked). Grows via the arena.
 const CPURING_MIN_SLOTS: usize = 2048;
+/// Initial capacity of the PID→`PidSlot` index (rounded to a power of two by the map). Sized
+/// to hold a typical box's full PID set (kthreads included) below the grow threshold; a busier
+/// host rehashes into a bigger arena chunk automatically.
+const PIDINDEX_MIN_CAP: usize = 4096;
 
 /// Persistent-fd pool capacity: `min(RLIMIT_NOFILE.soft − RESERVED, MAX_POOL)`, or the
 /// `ATOP_POOL_CAP` override (exercise the overflow path without touching `ulimit`).
@@ -369,7 +372,7 @@ impl PidMeta {
 /// holds the store handles plus the cross-store bookkeeping the fill (and a future
 /// update-prioritization scan) reads on every PID *without* chasing into a store. This is the
 /// intended **extension point**: process-volatility signals for adaptive sampling land here.
-/// `Copy`; lives in the [`PidIndex`] map (heap now; phase 6 → THP `ThpMap`).
+/// `Flat` (`Copy`); lives in the THP-resident [`PidIndex`].
 #[derive(Clone, Copy)]
 struct PidSlot {
     /// Hot CPU-history slot.
@@ -384,9 +387,11 @@ struct PidSlot {
     seen_gen: u64,
 }
 
-/// PID → [`PidSlot`]. A plain `FxHashMap` for now; phase 6 replaces it with a THP-resident
-/// open-addressing `ThpMap` so even this lookup table is on huge pages.
-type PidIndex = PidMap<PidSlot>;
+/// PID → [`PidSlot`], the per-cycle randomly-probed lookup that coordinates every per-PID
+/// store. Resident in the shared arena (a `thoop::ThpMap`) so even this table is on huge pages
+/// — the same TLB win as the stores it indexes. The map's fixed `u32` key is the PID; PID 0 is
+/// the map's empty sentinel and never a real process (the scheduler is not a `/proc` entry).
+type PidIndex = ThpMap<u32, PidSlot>;
 
 /// The unified per-PID table: one PID lookup serves every store. Owns the shared [`PidIndex`]
 /// plus the per-PID stores — the **hot** [`CpuRing`] (touched every sample), the **cold**
@@ -407,7 +412,7 @@ type PidIndex = PidMap<PidSlot>;
 /// reads a slot across the boundary). `CpuRing`/`PidMeta` stay *separate* stores so a CPU
 /// update loads only the hot ring, never the cold metadata.
 struct ProcTable {
-    /// PID → [`PidSlot`] (phase 6 → THP `ThpMap`).
+    /// PID → [`PidSlot`], THP-resident (`thoop::ThpMap`) — on the arena like the stores.
     index: PidIndex,
     /// Hot per-PID CPU history on huge pages. Freed immediately on death.
     cpu: GenStore<CpuRing>,
@@ -428,7 +433,7 @@ struct ProcTable {
 impl ProcTable {
     fn new(arena: &Arena, clk_tck: u64, refresh_n: u32) -> Self {
         Self {
-            index: PidIndex::default(),
+            index: PidIndex::new(arena, PIDINDEX_MIN_CAP),
             cpu: GenStore::new(arena, CPURING_MIN_SLOTS),
             meta: GenStore::new(arena, PIDMETA_MIN_SLOTS),
             cmd_store: CmdStore::new(arena, CMD_STORE_MIN_SLOTS),
@@ -443,6 +448,7 @@ impl ProcTable {
     /// Bind the stores to the (now pinned, boxed) arena. Call once after construction, before
     /// any update — each store caches a `*const Arena` and its current base.
     fn wire(&mut self, arena: &Arena) {
+        self.index.wire(arena);
         self.cpu.wire(arena);
         self.meta.wire(arena);
         self.cmd_store.wire(arena);
@@ -453,18 +459,25 @@ impl ProcTable {
         self.cmd_store.get(e.cmdline)
     }
 
-    /// One per-PID pass filling CPU% + uid + cmdline, then evicting vanished PIDs — a single
-    /// [`PidIndex`] lookup per PID. `now` drives the CPU window; `cur_gen` keys the cmdline
-    /// cadence. CPU% reads fresh every cycle; uid/cmdline read fresh on first sighting, while
-    /// settling, or on the staggered coarse tick, else reuse the cached handle (no I/O, no
-    /// copy) — an unchanged cmdline keeps its slot, a changed one frees the old at once.
+    /// One per-PID pass filling CPU% + uid + cmdline, then evicting vanished PIDs. `now` drives
+    /// the CPU window; `cur_gen` keys the cmdline cadence. CPU% reads fresh every cycle;
+    /// uid/cmdline read fresh on first sighting, while settling, or on the staggered coarse
+    /// tick, else reuse the cached handle (no I/O, no copy) — an unchanged cmdline keeps its
+    /// slot, a changed one frees the old at once.
     ///
-    /// Each row is **copied out by value, mutated locally, and written back** — never held as a
-    /// `&row` across a store op, because an `intern`/`insert` may grow a store and trigger an
-    /// arena repack (regime B) that relocates the row buffer's chunk. The store ops self-heal
-    /// their own bases; the only rule the caller must keep is not to span one with a live row
-    /// reference.
-    #[allow(clippy::cast_possible_truncation)] // tick delta / cmdline len are bounded
+    /// The PID's index slot is **read out by value** ([`PidIndex::get_entry`]) at the top and
+    /// **written back** at the bottom — a known PID through [`PidIndex::update_at`] using the
+    /// slot index from that same probe (no second probe), a birth through [`PidIndex::insert`].
+    /// A borrow into the index may not be held across the middle: a store `insert`/`intern`
+    /// there can grow and trigger a regime-B repack that relocates the index's own chunk. The
+    /// **slot index** survives that — it is a logical position, re-homed only by a map
+    /// insert/remove, neither of which runs mid-PID — which is why caching it is sound where
+    /// caching a pointer would not be.
+    ///
+    /// For the same reason each row is **copied out, mutated locally, and written back** —
+    /// never held as a `&row` across a store op. The arena-resident stores (and now the index)
+    /// self-heal their own bases on the next access; the only rule the caller keeps is not to
+    /// span an allocation with a live reference into any arena chunk.
     fn update(&mut self, procs: &mut Procs, now: Instant, cur_gen: u64) {
         // CPU window: real elapsed since the last sample, or `None` if too soon / first call.
         let window = self
@@ -475,29 +488,16 @@ impl ProcTable {
         let jiff =
             window.map(|e| u32::try_from(elapsed_jiffies(e, self.clk_tck)).unwrap_or(u32::MAX));
 
-        let Self {
-            index,
-            cpu,
-            meta,
-            cmd_store,
-            refresh_n,
-            cmd_path,
-            scratch,
-            ..
-        } = self;
-        let refresh_n = *refresh_n;
+        let refresh_n = self.refresh_n;
 
         for i in 0..procs.as_slice().len() {
             let mut e = procs.row(i); // copy out — no live row ref spans a store op below
             let pid = e.pid;
-            // One index probe per PID: hold the `entry` across the per-PID store work below
-            // (which borrows the sibling stores, never `index`), then write the slot back
-            // through the same entry — no second hash lookup on the common known-PID path.
-            let entry = index.entry(pid);
-            let prior: Option<PidSlot> = match &entry {
-                Entry::Occupied(o) => Some(*o.get()),
-                Entry::Vacant(_) => None,
-            };
+            // One probe: read the prior slot *and* its slot index. The value is copied out; the
+            // index is kept (not a pointer) to write back after the per-PID store work, which
+            // can relocate the index's chunk but never re-homes the slot (see the method doc).
+            let prior_entry: Option<(usize, PidSlot)> = self.index.get_entry(pid);
+            let prior: Option<PidSlot> = prior_entry.map(|(_, s)| s);
             let reused = prior.is_some_and(|s| s.start_time != e.start_time);
             let settling = prior.is_some_and(|s| {
                 !reused && cur_gen.wrapping_sub(s.first_seen_gen) < u64::from(CMDLINE_SETTLE_GENS)
@@ -506,12 +506,14 @@ impl ProcTable {
             // CPU ring (hot): mutated in place; its &mut never spans the cmd/meta ops below.
             let cpu_ref = match prior {
                 Some(s) => s.cpu,
-                None => cpu.insert(Gen::ALIVE, CpuRing::new(e.ticks)),
+                None => self.cpu.insert(Gen::ALIVE, CpuRing::new(e.ticks)),
             };
-            let ring = cpu.get_mut(cpu_ref);
-            ring.sample(e.ticks, jiff, reused, prior.is_some());
-            e.cpu_pct = ring.avg();
-            e.cpu_peak = ring.peak();
+            {
+                let ring = self.cpu.get_mut(cpu_ref);
+                ring.sample(e.ticks, jiff, reused, prior.is_some());
+                e.cpu_pct = ring.avg();
+                e.cpu_peak = ring.peak();
+            }
 
             // Metadata (cold): uid + cmdline on the cadence.
             let stagger =
@@ -519,9 +521,14 @@ impl ProcTable {
             let refresh = prior.is_none() || reused || settling || stagger;
             let fresh = if refresh {
                 if e.is_kthread {
-                    Some((0u32, 0usize, false)) // kthreads: uid 0, empty cmdline, no syscall
+                    // kthreads: uid 0, empty cmdline, no syscall.
+                    Some(CmdlineRead {
+                        uid: 0,
+                        len: 0,
+                        non_ascii: false,
+                    })
                 } else {
-                    Some(read_cmdline_uid(pid, cmd_path, scratch))
+                    Some(read_cmdline_uid(pid, &mut self.cmd_path, &mut self.scratch))
                 }
             } else {
                 None
@@ -529,9 +536,9 @@ impl ProcTable {
 
             let meta_ref = match prior {
                 Some(s) => s.meta,
-                None => meta.insert(Gen::ALIVE, PidMeta::EMPTY),
+                None => self.meta.insert(Gen::ALIVE, PidMeta::EMPTY),
             };
-            let pm = refresh_meta(meta, cmd_store, meta_ref, reused, fresh, &scratch[..]);
+            let pm = self.refresh_meta(meta_ref, reused, fresh);
 
             e.uid = pm.uid;
             e.cmdline = pm.cmd;
@@ -549,11 +556,11 @@ impl ProcTable {
                 },
                 seen_gen: cur_gen,
             };
-            match entry {
-                Entry::Occupied(mut o) => *o.get_mut() = slot,
-                Entry::Vacant(v) => {
-                    v.insert(slot);
-                }
+            // Write the slot back: a known PID overwrites at its already-probed slot (no second
+            // probe); a birth inserts (may rehash → relocate sibling chunks, all self-healed).
+            match prior_entry {
+                Some((slot_idx, _)) => self.index.update_at(slot_idx, slot),
+                None => self.index.insert(pid, slot),
             }
 
             procs.set(i, e); // write back
@@ -591,55 +598,73 @@ impl ProcTable {
             }
         });
     }
-}
 
-/// Update a PID's cold metadata slot and return the new record (also written back). Carries
-/// the cached record forward, or resets on reuse (freeing the dead incarnation's cmd slot —
-/// immediate, no lease). A `fresh` uid/cmdline read replaces the cmd slot **only when the bytes
-/// changed** (free old, intern new); an unchanged or not-refreshed cmdline keeps its slot. The
-/// cleaned cmdline bytes are in `scratch[..len]` from a prior [`read_cmdline_uid`].
-fn refresh_meta(
-    meta: &mut GenStore<PidMeta>,
-    cmd_store: &mut CmdStore,
-    meta_ref: Ref<PidMeta>,
-    reused: bool,
-    fresh: Option<(u32, usize, bool)>,
-    scratch: &[u8],
-) -> PidMeta {
-    let mut pm = if reused {
-        cmd_store.free(meta.get(meta_ref).cmd);
-        PidMeta::EMPTY
-    } else {
-        *meta.get(meta_ref)
-    };
-    if let Some((uid, len, non_ascii)) = fresh {
-        pm.uid = uid;
-        let new_bytes = &scratch[..len];
-        if new_bytes.is_empty() {
-            cmd_store.free(pm.cmd); // no-op if already empty
-            pm.cmd = StringRef::EMPTY;
-            pm.cmd_non_ascii = false;
-        } else if pm.cmd.is_empty() || cmd_store.get(pm.cmd) != new_bytes {
-            // Changed (or first non-empty argv): free the old slot, intern the new.
-            cmd_store.free(pm.cmd);
-            pm.cmd = cmd_store.intern(Gen::ALIVE, new_bytes);
-            pm.cmd_non_ascii = non_ascii;
+    /// Update this PID's cold metadata slot and return the new record (also written back).
+    /// Carries the cached record forward, or resets on reuse (freeing the dead incarnation's cmd
+    /// slot — immediate, no lease). A `fresh` uid/cmdline read replaces the cmd slot **only when
+    /// the bytes changed** (free old, intern new); an unchanged or not-refreshed cmdline keeps
+    /// its slot. The cleaned cmdline bytes are in `self.scratch[..len]` from a prior
+    /// [`read_cmdline_uid`].
+    fn refresh_meta(
+        &mut self,
+        meta_ref: Ref<PidMeta>,
+        reused: bool,
+        fresh: Option<CmdlineRead>,
+    ) -> PidMeta {
+        let mut pm = if reused {
+            self.cmd_store.free(self.meta.get(meta_ref).cmd);
+            PidMeta::EMPTY
+        } else {
+            *self.meta.get(meta_ref)
+        };
+        if let Some(CmdlineRead {
+            uid,
+            len,
+            non_ascii,
+        }) = fresh
+        {
+            pm.uid = uid;
+            let new_bytes = &self.scratch[..len];
+            if new_bytes.is_empty() {
+                self.cmd_store.free(pm.cmd); // no-op if already empty
+                pm.cmd = StringRef::EMPTY;
+                pm.cmd_non_ascii = false;
+            } else if pm.cmd.is_empty() || self.cmd_store.get(pm.cmd) != new_bytes {
+                // Changed (or first non-empty argv): free the old slot, intern the new.
+                self.cmd_store.free(pm.cmd);
+                pm.cmd = self.cmd_store.intern(Gen::ALIVE, new_bytes);
+                pm.cmd_non_ascii = non_ascii;
+            }
+            // else: unchanged — keep the existing slot (the whole point of the store).
         }
-        // else: unchanged — keep the existing slot (the whole point of the store).
+        self.meta.assign(meta_ref, pm);
+        pm
     }
-    meta.assign(meta_ref, pm);
-    pm
 }
 
-/// Read `/proc/<pid>/cmdline` into `scratch` and the owner `uid` from the same fd's
-/// `fstat`. Returns `(uid, cleaned_len, non_ascii)`; `uid` is still valid when the
-/// cmdline is empty. The cleaned bytes live in `scratch[..len]`.
-fn read_cmdline_uid(pid: u32, path: &mut ProcPath, scratch: &mut [u8]) -> (u32, usize, bool) {
+/// One `/proc/<pid>/cmdline` read: owner `uid` (from the same fd's `fstat`), the cleaned byte
+/// length in the caller's scratch, and whether any byte is ≥ 0x80. A named record so the three
+/// are not a bare positional tuple at the call site.
+#[derive(Clone, Copy)]
+struct CmdlineRead {
+    uid: u32,
+    len: usize,
+    non_ascii: bool,
+}
+
+/// Read `/proc/<pid>/cmdline` into `scratch` and the owner `uid` from the same fd's `fstat`
+/// ([`CmdlineRead`]); `uid` is still valid when the cmdline is empty. The cleaned bytes live in
+/// `scratch[..len]`.
+fn read_cmdline_uid(pid: u32, path: &mut ProcPath, scratch: &mut [u8]) -> CmdlineRead {
     let ptr = path.write(pid, b"cmdline");
     // SAFETY: valid C path, read-only.
     let fd = unsafe { libc::open(ptr, libc::O_RDONLY | libc::O_CLOEXEC) };
     if fd < 0 {
-        return (u32::MAX, 0, false);
+        return CmdlineRead {
+            uid: u32::MAX,
+            len: 0,
+            non_ascii: false,
+        };
     }
     // SAFETY: scratch is a valid writable region; fd is open.
     let (n, uid) = unsafe {
@@ -654,11 +679,19 @@ fn read_cmdline_uid(pid: u32, path: &mut ProcPath, scratch: &mut [u8]) -> (u32, 
         (n, uid)
     };
     if n <= 0 {
-        return (uid, 0, false);
+        return CmdlineRead {
+            uid,
+            len: 0,
+            non_ascii: false,
+        };
     }
     let raw = usize::try_from(n).unwrap_or(0).min(scratch.len());
     let (clean_len, non_ascii) = parse::clean_cmdline(&mut scratch[..raw]);
-    (uid, clean_len as usize, non_ascii)
+    CmdlineRead {
+        uid,
+        len: clean_len as usize,
+        non_ascii,
+    }
 }
 
 /// Tracks cumulative `/proc/stat` CPU counters to compute deltas.

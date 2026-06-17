@@ -69,5 +69,3 @@ Or per-service: `LimitMEMLOCK=128M` in a systemd unit.
   and the `perf_is_paranoid()` gate on `RLIMIT_MEMLOCK` enforcement.
 - `include/linux/perf_event.h` `perf_is_paranoid`: returns false when `paranoid = -1`,
   disabling the limit check for perf while leaving the charge on the shared counter.
-
-Investigation details and measurements: `docs/plans/iouring-perf-fallback.md`.

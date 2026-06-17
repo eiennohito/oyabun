@@ -135,7 +135,8 @@ impl<S> ByteResolver<S> {
 /// A generational store of fixed-`N`-byte string slots, tagged `S`, over a
 /// [`GenStore<[u8; N]>`]. [`intern`](Self::intern) copies bytes straight into a slot (no
 /// stack temporary); an unchanged string keeps its slot across cycles (no per-cycle
-/// re-copy). Methods thread the owning `&Arena`/`&mut Arena` like `GenStore`.
+/// re-copy). Like `GenStore` it caches its base and phones the arena to grow, so it must be
+/// [`wire`](Self::wire)d after reaching its final address. Neither `Send` nor `Sync`.
 pub struct StrStore<const N: usize, S> {
     inner: GenStore<[u8; N]>,
     _marker: PhantomData<fn() -> S>,
@@ -143,11 +144,17 @@ pub struct StrStore<const N: usize, S> {
 
 impl<const N: usize, S> StrStore<N, S> {
     #[must_use]
-    pub fn new(arena: &mut Arena, min_slots: usize) -> Self {
+    pub fn new(arena: &Arena, min_slots: usize) -> Self {
         Self {
             inner: GenStore::new(arena, min_slots),
             _marker: PhantomData,
         }
+    }
+
+    /// Wire to the arena after final placement (see [`GenStore::wire`]). Call once, before
+    /// any string is interned or read.
+    pub fn wire(&mut self, arena: &Arena) {
+        self.inner.wire(arena);
     }
 
     /// Store `bytes` in a fresh slot tagged `tag`. Empty input gets no slot
@@ -155,12 +162,12 @@ impl<const N: usize, S> StrStore<N, S> {
     ///
     /// # Panics
     /// If `bytes` is longer than the slot size `N`.
-    pub fn intern(&mut self, arena: &mut Arena, tag: Gen, bytes: &[u8]) -> StringRef<S> {
+    pub fn intern(&mut self, tag: Gen, bytes: &[u8]) -> StringRef<S> {
         if bytes.is_empty() {
             return StringRef::EMPTY;
         }
         assert!(bytes.len() <= N, "string exceeds {N}-byte slot");
-        let r = self.inner.construct(arena, tag, |slot| {
+        let r = self.inner.construct(tag, |slot| {
             // SAFETY: slot holds N bytes, `bytes.len() ≤ N`.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -175,29 +182,29 @@ impl<const N: usize, S> StrStore<N, S> {
 
     /// The bytes a reference points to (an empty ref → `&[]`).
     #[must_use]
-    pub fn get(&self, arena: &Arena, sr: StringRef<S>) -> &[u8] {
+    pub fn get(&self, sr: StringRef<S>) -> &[u8] {
         if sr.is_empty() {
             return &[];
         }
-        &self.inner.get(arena, Ref::new(sr.idx))[..sr.len()]
+        &self.inner.get(Ref::new(sr.idx))[..sr.len()]
     }
 
     /// Demote a reference's slot to generation `now`. No-op for the empty ref.
-    pub fn demote(&mut self, arena: &Arena, sr: StringRef<S>, now: u64) {
+    pub fn demote(&mut self, sr: StringRef<S>, now: u64) {
         if !sr.is_empty() {
-            self.inner.demote(arena, Ref::new(sr.idx), now);
+            self.inner.demote(Ref::new(sr.idx), now);
         }
     }
 
     /// Reclaim demoted slots whose generation `min_live` has passed.
-    pub fn gc(&mut self, arena: &Arena, min_live: u64) {
-        self.inner.gc(arena, min_live);
+    pub fn gc(&mut self, min_live: u64) {
+        self.inner.gc(min_live);
     }
 
     /// A base capture for store-free, cross-thread resolution.
     #[must_use]
-    pub fn resolver(&self, arena: &Arena) -> ByteResolver<S> {
-        self.inner.byte_resolver(arena)
+    pub fn resolver(&self) -> ByteResolver<S> {
+        self.inner.byte_resolver()
     }
 
     /// Slots ever handed out (high-water) — grows with distinct live strings, not cycles.
@@ -225,52 +232,54 @@ mod tests {
 
     struct Tag;
 
+    /// Wire a store to `arena`. The store points at `arena` (which must stay put); the store
+    /// itself may move.
+    fn wired<const N: usize, S>(arena: &Arena, min_slots: usize) -> StrStore<N, S> {
+        let mut s = StrStore::new(arena, min_slots);
+        s.wire(arena);
+        s
+    }
+
     #[test]
     fn intern_get_roundtrip_and_empty() {
-        let mut arena = Arena::new(0);
-        let mut s: StrStore<16, Tag> = StrStore::new(&mut arena, 0);
-        let a = s.intern(&mut arena, Gen::ALIVE, b"bash");
-        let b = s.intern(&mut arena, Gen::ALIVE, b"");
-        assert_eq!(s.get(&arena, a), b"bash");
+        let arena = Arena::new(0);
+        let mut s: StrStore<16, Tag> = wired(&arena, 0);
+        let a = s.intern(Gen::ALIVE, b"bash");
+        let b = s.intern(Gen::ALIVE, b"");
+        assert_eq!(s.get(a), b"bash");
         assert!(b.is_empty());
-        assert_eq!(s.get(&arena, b), b"");
+        assert_eq!(s.get(b), b"");
     }
 
     #[test]
     fn resolver_reads_same_bytes_across_growth() {
         // Tiny min forces growth/relocation; the resolver captured *after* must still read
         // every ref correctly.
-        let mut arena = Arena::new(0);
-        let mut s: StrStore<256, Tag> = StrStore::new(&mut arena, 1);
+        let arena = Arena::new(0);
+        let mut s: StrStore<256, Tag> = wired(&arena, 1);
         let refs: Vec<_> = (0..2000u32)
-            .map(|i| {
-                s.intern(
-                    &mut arena,
-                    Gen::ALIVE,
-                    format!("/usr/bin/proc-{i}").as_bytes(),
-                )
-            })
+            .map(|i| s.intern(Gen::ALIVE, format!("/usr/bin/proc-{i}").as_bytes()))
             .collect();
-        let resolver = s.resolver(&arena);
+        let resolver = s.resolver();
         for (i, r) in refs.iter().enumerate() {
             let expect = format!("/usr/bin/proc-{i}");
             assert_eq!(resolver.resolve(*r), expect.as_bytes());
-            assert_eq!(s.get(&arena, *r), expect.as_bytes());
+            assert_eq!(s.get(*r), expect.as_bytes());
         }
         assert_eq!(resolver.resolve(StringRef::EMPTY), b"");
     }
 
     #[test]
     fn lease_old_resolver_survives_until_gc() {
-        let mut arena = Arena::new(0);
-        let mut s: StrStore<32, Tag> = StrStore::new(&mut arena, 8);
-        let old = s.intern(&mut arena, Gen::ALIVE, b"old-cmdline");
-        let _new = s.intern(&mut arena, Gen::ALIVE, b"new-cmdline");
-        s.demote(&arena, old, 5);
-        assert_eq!(s.get(&arena, old), b"old-cmdline");
-        s.gc(&arena, 4); // below 5 → kept
-        assert_eq!(s.get(&arena, old), b"old-cmdline");
-        s.gc(&arena, 5); // reached → reclaimable
+        let arena = Arena::new(0);
+        let mut s: StrStore<32, Tag> = wired(&arena, 8);
+        let old = s.intern(Gen::ALIVE, b"old-cmdline");
+        let _new = s.intern(Gen::ALIVE, b"new-cmdline");
+        s.demote(old, 5);
+        assert_eq!(s.get(old), b"old-cmdline");
+        s.gc(4); // below 5 → kept
+        assert_eq!(s.get(old), b"old-cmdline");
+        s.gc(5); // reached → reclaimable
         assert!(s.free_count() >= 1);
     }
 }

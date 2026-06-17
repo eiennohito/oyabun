@@ -2,6 +2,14 @@
 
 Status: **implemented** (Linux). macOS and several features below are still future work.
 
+> **Pivot in progress (2026-06).** The two-thread / `ArcSwap` / cross-thread-lease design
+> described below is being collapsed to a **single thread** running one serialized
+> `gather → render` loop — which retires the double buffer, the cross-thread string lease, and
+> the generational reclaim lag (`GOALS.md` priority order: the latency budget makes serializing
+> free, and it buys away whole classes of CPU/RAM overhead). The threading, snapshot-lease, and
+> generational-storage sections here still describe the *current built code*; they are rewritten
+> as the collapse lands. Target model + rationale: `docs/plans/thp-arena.md`.
+
 This describes how atop is actually built. For *why* (goals/constraints) see `GOALS.md`.
 
 ## Threading model
@@ -14,8 +22,11 @@ Two OS threads, no async runtime:
 - **Gatherer thread**: enumerates `/proc`, reads stat files, parses, computes CPU%,
   builds the tree, publishes the snapshot. Owns the ring and is its sole submitter, so
   the ring is built on this thread, not at construction on main — io_uring's modern
-  single-submitter optimizations bind a ring to its creating thread. Its first gather
-  also primes the opening snapshot.
+  single-submitter optimizations bind a ring to its creating thread. Its huge-page arena
+  and generational stores are built here too: they hold self-referential raw pointers (a
+  store caches a `*const Arena`), so they are `!Send` and must be constructed in place on
+  the thread that uses them — main creates only the shared snapshot cell and the (`Send`)
+  `/proc` dir fd, then hands them over. Its first gather also primes the opening snapshot.
 
 Exchange is via `arc_swap::ArcSwap<Snapshot>` — lock-free; the UI never blocks the
 gatherer.
@@ -138,12 +149,27 @@ and demotes the old.
 **The arena.** Stores do not each `mmap` a huge page — with THP, a touched 2 MiB mapping
 commits a full huge page, so a mapping per structure is ~5× waste at a dozen structures.
 Instead they share a few regions via an `Arena` suballocator that hands out `ChunkId`s. The
-arena's chunk table is the source of truth for where a chunk lives, so growth (which
-relocates) is transparent: a store keeps its `ChunkId`, a `Ref` is a slot *index* (stable
-across relocation), and the gatherer re-fetches the base each access. Growth is two-regime:
-**A** (common) bumps a larger copy from the region's tail, leaving the old bytes as a frozen
-hole; **B** (rare, tail exhausted) repacks all chunks into a fresh region — compacting
-holes, sized to live + headroom rather than a blind 2× — and retires the old region.
+arena is **interior-mutable** — accessed by `&self`, never `&mut` — because it owns no slot
+data, only the regions and the chunk table; so allocation and relocation go through a shared
+reference and many stores grow through one arena without the self-referential-borrow problem
+that threading `&mut Arena` everywhere would create. A store caches its chunk's base pointer
+(hot access is `base + idx·stride`, no chunk-table chase) plus a `*const Arena` to grow
+through; a `Ref` is a slot *index*, stable across relocation. Growth is two-regime: **A**
+(common) bumps a larger copy from the region's tail, leaving the old bytes as a frozen hole;
+**B** (rare, tail exhausted) repacks all chunks into a fresh region — compacting holes, sized
+to live + headroom rather than a blind 2× — and retires the old region.
+
+**Cooperative self-heal (the relocation protocol).** A B repack moves *every* store's chunk,
+so a store's cached base can be invalidated by a *sibling's* growth, not just its own. The
+arena carries an epoch counter, bumped on each repack; a store compares it on access and
+re-reads its own base when it advanced. The store heals *itself* — nothing reaches in to fix
+it — which is the load-bearing soundness choice: an arena that wrote a sibling's base through
+a back-pointer would alias the `&mut` the gatherer holds while filling that store (UB under
+Rust's aliasing model). The same reason makes the per-PID fill copy a `Flat` record out,
+mutate locally, and write back rather than hold a `&` into a slot across a store op: any op
+may grow a store and relocate the arena, dangling an outstanding slot reference. Because the
+cached base + `*const Arena` are self-referential, the arena is **pinned** (boxed) and the
+write stores are `!Send`/`!Sync`; cross-thread reads use the lease view below.
 
 **The lease.** A published snapshot carries a `ByteResolver<Cmd>` — a read-only capture of
 the `Cmd` chunk's base *at publish* — so the UI thread resolves `cmdline` handles without
@@ -268,7 +294,7 @@ per-process lock limit (8 MiB is common) no longer downgrades io_uring as the pr
 count grows. (A separate, **root-caused** symptom — `io_uring_setup` returning `ENOMEM` under a
 non-root `perf record` — is caused by perf's per-CPU ring buffers exhausting the
 per-user `user->locked_vm` counter that io_uring also checks against `RLIMIT_MEMLOCK`;
-the fix is raising `RLIMIT_MEMLOCK`. See `docs/plans/iouring-perf-fallback.md`.)
+the fix is raising `RLIMIT_MEMLOCK`.)
 
 ### syscall backend
 
@@ -277,15 +303,26 @@ Held fds re-read with `lseek(0)+read`; new PIDs `open`ed and installed; dead PID
 floor — persistent fds eliminate the open/close churn even without io_uring (there is no
 storm here regardless: plain closes hit `files->file_lock`, not `uring_lock`).
 
-### ProcCache — slow fields (uid + cmdline)
+### ProcTable — per-PID state (CPU history + uid/cmdline)
 
-comm rides inside stat (re-read every cycle, free). `uid` and `cmdline` do not, and
-change slowly, so a gatherer-owned `ProcCache` (beside `CpuTracker`) owns them via plain
-syscalls — backend-agnostic (the **hybrid rule**: low-volume ops stay synchronous). The
-per-PID metadata (`PidMeta`: uid, cmdline handle, cadence bookkeeping) lives in a
-`GenStore<PidMeta>` on huge pages, keyed by a `PidIndex` (PID → slot). `PidMeta` is
-gatherer-internal — no snapshot references it — so a dead PID's slot is freed immediately
-(`GenStore::free`, no lease); only the cmdline *string* it points at is snapshot-leased.
+All per-PID state the gatherer maintains across cycles lives in one **`ProcTable`**, keyed by
+a single PID index so one lookup serves every store (and gives future
+volatility-based update prioritization a single place to read per-PID signals — the index
+value, `PidSlot`, is the deliberate extension point). It replaced the former separate
+`CpuTracker` + `ProcCache`, collapsing two per-cycle hashmap lookups into one.
+
+Two per-PID records sit in *separate* huge-page generational stores, split by access
+temperature: the **hot** CPU-history ring (touched every sample) and the **cold** metadata
+(uid + cmdline handle, touched on the refresh cadence). Co-locating them would pull cold
+cache lines into every CPU update. Both are gatherer-internal — no snapshot references them —
+so a dead PID's slots are freed immediately (no lease); only the cmdline *string* is
+snapshot-leased. Incarnation/cadence bookkeeping (`start_time`, first/last-seen generation)
+lives in the index value, not the records, so the reuse/settling/eviction decisions never
+chase into a store.
+
+comm rides inside stat (re-read every cycle, free). `uid` and `cmdline` do not, and change
+slowly, so the table reads them via plain syscalls — backend-agnostic (the **hybrid rule**:
+low-volume ops stay synchronous):
 
 - **Kernel threads** (`is_kthread`) cost **zero** syscalls — uid is root (0), cmdline is
   permanently empty. On a typical box kthreads are the majority of PIDs.
@@ -378,7 +415,7 @@ truth — a 32× undercount on a 32-core box.
 
 Because correct per-core values magnify the inherent ±1-jiffy quantization (±2% over
 a 500 ms window at 100 Hz), each PID keeps a **bounded ring of the recent sample
-window** (`CpuHistory`) with exact `u64` running sums. The window is a wall-clock
+window** (`CpuRing`) with exact `u64` running sums. The window is a wall-clock
 duration — `CPU_WINDOW_MS` (default 10 s, the controllable knob) — and the per-PID
 ring depth is derived as `CPU_WINDOW_MS ÷ REFRESH_MS`:
 - **`cpu_pct`** = the sum-weighted moving **average** (`Σticks / Σjiffies`) — the
@@ -392,10 +429,12 @@ All arithmetic is exact integer math (no float, no EWMA accumulation error).
 Robustness: refreshes closer than `MIN_SAMPLE` (100 ms — e.g. the forced refresh
 after a kill) carry the windowed values forward instead of dividing by a near-zero
 window; a PID whose tick counter goes backwards (reuse/wrap) resets its history;
-PIDs absent from a cycle are evicted via a generation tag. State is a persistent
-`HashMap<pid, CpuHistory>` updated in place — zero allocation after warmup — keyed
-with a small hand-rolled `FxHash`-style hasher (`FxBuildHasher`), since the default
-`SipHash` is hash-flood-resistant but slow and PID keys aren't attacker-controlled.
+PIDs absent from a cycle are evicted via a generation tag. The rings live on huge pages in
+a generational store (the **hot** half of `ProcTable`, kept apart from cold metadata) and
+are keyed through the shared PID index — a small hand-rolled `FxHash`-style hasher, since the
+default `SipHash` is hash-flood-resistant but slow and PID keys aren't attacker-controlled.
+The ring is updated through a copy-free in-place borrow that never spans another store's
+allocation (which could relocate it).
 
 ## Dependencies
 

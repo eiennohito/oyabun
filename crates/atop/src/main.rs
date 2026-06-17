@@ -31,18 +31,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     let page_size = sys::page_size();
-    let (gatherer, cell) = Gatherer::new(page_size)?;
+    // `/proc` open is the one fallible bit of gatherer setup; do it here so it propagates with
+    // `?`. The rest (arena + `!Send` stores) is built on the gatherer thread by `Gatherer::new`.
+    let proc_dir = sys::ProcDir::open()?;
+    let cell = Gatherer::make_cell();
     let uid_names = sys::read_uid_names();
 
     let (tx, rx) = mpsc::channel::<Ctrl>();
-    // The gatherer owns the io_uring ring and is its sole submitter, so it builds the
-    // backend and produces the first snapshot itself. `ready` is the rendezvous: main blocks
-    // until the gatherer signals its first publish (or until it exits early, dropping the
-    // sender → `recv` returns `Err`). main never gathers.
+    // The gatherer owns the io_uring ring and is its sole submitter, and its arena + stores
+    // are `!Send`, so it both builds itself and produces the first snapshot on its own thread.
+    // `ready` is the rendezvous: main blocks until the gatherer signals its first publish (or
+    // until it exits early, dropping the sender → `recv` returns `Err`). main never gathers.
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let cell_for_gatherer = cell.clone();
     let gather_handle = std::thread::Builder::new()
         .name("gatherer".into())
-        .spawn(move || gatherer.run(&rx, REFRESH_INTERVAL, &ready_tx))?;
+        .spawn(move || {
+            Gatherer::new(page_size, cell_for_gatherer, proc_dir).run(
+                &rx,
+                REFRESH_INTERVAL,
+                &ready_tx,
+            );
+        })?;
     let _ = ready_rx.recv();
 
     let app = App::new(cell, tx.clone(), uid_names);

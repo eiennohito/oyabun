@@ -8,7 +8,6 @@ mod syscall;
 mod uring;
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -99,6 +98,9 @@ const CMD_STORE_MIN_SLOTS: usize = 512;
 /// Largish initial slot count for the per-PID metadata store (covers all live PIDs,
 /// kthreads included). Grows via the arena if a box runs hotter.
 const PIDMETA_MIN_SLOTS: usize = 2048;
+/// Initial slot count for the per-PID CPU-history store — same population as metadata (every
+/// PID, kthreads included, gets CPU tracked). Grows via the arena.
+const CPURING_MIN_SLOTS: usize = 2048;
 
 /// How many generations a demoted `Cmd` slot is held before GC may reclaim it. The live
 /// window is two snapshots (double buffer), so a lag of 2 is the minimum safe value; the
@@ -185,11 +187,17 @@ struct Sample {
     jiff: u32,
 }
 
-/// Bounded per-PID history: a ring of the last [`CPU_WINDOW`] intervals plus exact
-/// `u64` running sums. The displayed CPU% is the sum-weighted moving **average**
-/// (stable); [`peak`](Self::peak) is the max single-interval rate still in the
-/// window (captures a spike for up to [`CPU_WINDOW`] intervals after it happens).
-struct CpuHistory {
+/// Bounded per-PID CPU history: a ring of the last [`CPU_WINDOW`] intervals plus exact `u64`
+/// running sums. The displayed CPU% is the sum-weighted moving **average** (stable);
+/// [`peak`](Self::peak) is the max single-interval rate still in the window (captures a spike
+/// for up to [`CPU_WINDOW`] intervals after it happens).
+///
+/// `Flat` (`Copy`, no heap) so it lives on huge pages in a `GenStore<CpuRing>`. It is the
+/// **hot** per-PID record — touched on every sample — and is deliberately a *separate* store
+/// from the cold [`PidMeta`] so a CPU update loads only this, not metadata cache lines.
+/// Liveness/incarnation bookkeeping (`seen_gen`, `start_time`) lives in [`PidSlot`], not here.
+#[derive(Clone, Copy)]
+struct CpuRing {
     /// `utime + stime` at the last sample.
     prev_ticks: u64,
     samples: [Sample; CPU_WINDOW],
@@ -201,12 +209,10 @@ struct CpuHistory {
     peak_bp: u32,
     /// Ring index of the sample that produced `peak_bp` (or `usize::MAX` = dirty).
     peak_at: usize,
-    /// Tracker generation when last seen, for evicting vanished PIDs.
-    seen_gen: u32,
 }
 
-impl CpuHistory {
-    fn new(prev_ticks: u64, seen_gen: u32) -> Self {
+impl CpuRing {
+    fn new(prev_ticks: u64) -> Self {
         Self {
             prev_ticks,
             samples: [Sample::default(); CPU_WINDOW],
@@ -216,13 +222,35 @@ impl CpuHistory {
             sum_jiff: 0,
             peak_bp: 0,
             peak_at: usize::MAX,
-            seen_gen,
         }
     }
 
     /// Discard history (PID reuse / counter reset), re-baselining at `ticks`.
     fn reset(&mut self, ticks: u64) {
-        *self = Self::new(ticks, self.seen_gen);
+        *self = Self::new(ticks);
+    }
+
+    /// Fold one cycle's observation into the ring. `reused` ⇒ a new incarnation took this PID,
+    /// so discard the dead one's history. Otherwise, given a real measurement window (`jiff`)
+    /// for an already-`known` PID, push the tick delta — or reset if the counter went
+    /// backwards (wrap). A brand-new PID just keeps its baseline (first real rate lands next
+    /// interval); a too-soon/first cycle (no window) carries the windowed values forward.
+    fn sample(&mut self, ticks: u64, jiff: Option<u32>, reused: bool, known: bool) {
+        if reused {
+            self.reset(ticks);
+            return;
+        }
+        let Some(j) = jiff else { return };
+        if !known {
+            return;
+        }
+        if ticks < self.prev_ticks {
+            self.reset(ticks);
+        } else {
+            let delta = u32::try_from(ticks - self.prev_ticks).unwrap_or(u32::MAX);
+            self.push(delta, j);
+            self.prev_ticks = ticks;
+        }
     }
 
     fn push(&mut self, ticks: u32, jiff: u32) {
@@ -320,92 +348,6 @@ impl BuildHasher for FxBuildHasher {
 /// PID-keyed map using the fast hasher above.
 type PidMap<V> = HashMap<u32, V, FxBuildHasher>;
 
-/// Derives per-process CPU% as a **per-core rate over real elapsed time** —
-/// `Δticks / (Δwall · CLK_TCK)`, so one fully-used core reads 100% and a
-/// multi-threaded process can exceed 100% (matching `top`/`htop` "Irix mode").
-/// Dividing instead by the `/proc/stat` machine-wide tick sum (an earlier approach)
-/// yielded `1/num_cpus` of the truth — a 32× undercount on a 32-core box.
-///
-/// Each PID keeps a [`CpuHistory`]: the moving average is the stable reading, the
-/// peak captures spikes. The window is a monotonic clock (a jittering gather
-/// interval self-corrects), and refreshes closer than [`MIN_SAMPLE`] (e.g. the
-/// forced refresh after a kill) carry forward rather than dividing by a near-zero
-/// window. PIDs absent from a cycle are evicted via the generation tag.
-struct CpuTracker {
-    hist: PidMap<CpuHistory>,
-    last: Option<Instant>,
-    clk_tck: u64,
-    gen_counter: u32,
-}
-
-impl CpuTracker {
-    fn new(clk_tck: u64) -> Self {
-        Self {
-            hist: PidMap::default(),
-            last: None,
-            clk_tck,
-            gen_counter: 0,
-        }
-    }
-
-    fn update(&mut self, procs: &mut [ProcessEntry], now: Instant) {
-        let window = self
-            .last
-            .map(|t| now.saturating_duration_since(t))
-            .filter(|e| *e >= MIN_SAMPLE);
-
-        let Some(elapsed) = window else {
-            // First sample, or a refresh too soon to measure: carry the windowed
-            // values forward; seed baselines only on the very first call.
-            let first = self.last.is_none();
-            if first {
-                self.gen_counter = self.gen_counter.wrapping_add(1);
-                self.last = Some(now);
-            }
-            for p in procs.iter_mut() {
-                match self.hist.get_mut(&p.pid) {
-                    Some(h) => {
-                        p.cpu_pct = h.avg();
-                        p.cpu_peak = h.peak();
-                    }
-                    None if first => {
-                        self.hist
-                            .insert(p.pid, CpuHistory::new(p.ticks, self.gen_counter));
-                    }
-                    None => {}
-                }
-            }
-            return;
-        };
-
-        let jiff = u32::try_from(elapsed_jiffies(elapsed, self.clk_tck)).unwrap_or(u32::MAX);
-        self.gen_counter = self.gen_counter.wrapping_add(1);
-        let cur_gen = self.gen_counter;
-        for p in procs.iter_mut() {
-            let h = match self.hist.entry(p.pid) {
-                Entry::Occupied(e) => {
-                    let h = e.into_mut();
-                    if p.ticks < h.prev_ticks {
-                        h.reset(p.ticks); // PID reuse / counter wrap
-                    } else {
-                        let delta = u32::try_from(p.ticks - h.prev_ticks).unwrap_or(u32::MAX);
-                        h.push(delta, jiff);
-                        h.prev_ticks = p.ticks;
-                    }
-                    h
-                }
-                // New PID: baseline now; first real rate lands next interval.
-                Entry::Vacant(e) => e.insert(CpuHistory::new(p.ticks, cur_gen)),
-            };
-            h.seen_gen = cur_gen;
-            p.cpu_pct = h.avg();
-            p.cpu_peak = h.peak();
-        }
-        self.hist.retain(|_, h| h.seen_gen == cur_gen); // drop vanished PIDs
-        self.last = Some(now);
-    }
-}
-
 /// Per-core elapsed time in jiffies, floored at 1 to keep [`rate`] division safe.
 fn elapsed_jiffies(elapsed: Duration, clk_tck: u64) -> u64 {
     (u64::try_from(elapsed.as_micros())
@@ -423,15 +365,14 @@ fn rate(ticks: u64, jiff: u64) -> u32 {
     u32::try_from(ticks.saturating_mul(10000) / jiff).unwrap_or(u32::MAX)
 }
 
-/// Slow-changing per-PID metadata, stored on huge pages in a [`GenStore`] keyed by
-/// [`PidIndex`]. `Flat` (`Copy`) — no heap fields — so it lives in a THP arena chunk. It is
-/// **gatherer-internal**: no published snapshot references a `PidMeta` slot (the snapshot
-/// carries the resolved `uid`/`cmdline` handle), so slots are freed immediately on death
-/// (no lease). Only the cmdline *string* it points at is leased.
+/// Slow-changing per-PID metadata (uid + cmdline handle) on huge pages in a
+/// `GenStore<PidMeta>`. `Flat` (`Copy`) — no heap. **Gatherer-internal**: no published
+/// snapshot references a `PidMeta` slot (the snapshot carries the resolved `uid`/`cmdline`),
+/// so slots are freed immediately on death; only the cmdline *string* it points at is leased.
+/// The **cold** counterpart to [`CpuRing`] — a separate store so a CPU sample never loads it.
+/// Incarnation/cadence bookkeeping lives in [`PidSlot`], not here.
 #[derive(Clone, Copy)]
 struct PidMeta {
-    /// Start time of the incarnation this metadata belongs to (PID-reuse discriminator).
-    start_time: u64,
     uid: u32,
     /// Handle to this PID's cmdline in the `Cmd` store (empty for kthreads / no argv). The
     /// slot persists across cycles; replaced (old demoted, new alive) only when the cmdline
@@ -439,119 +380,170 @@ struct PidMeta {
     cmd: StringRef<Cmd>,
     /// The cmdline contains a byte ≥ 0x80 (renderer unicode path).
     cmd_non_ascii: bool,
-    /// Generation when first seen — drives the age-adaptive cmdline cadence.
-    first_seen_gen: u64,
-    /// Generation when last seen, for evicting vanished PIDs.
-    seen_gen: u64,
 }
 
 impl PidMeta {
-    fn new(start_time: u64, cur_gen: u64) -> Self {
-        Self {
-            start_time,
-            uid: u32::MAX,
-            cmd: StringRef::EMPTY,
-            cmd_non_ascii: false,
-            first_seen_gen: cur_gen,
-            seen_gen: cur_gen,
-        }
-    }
+    const EMPTY: PidMeta = PidMeta {
+        uid: u32::MAX,
+        cmd: StringRef::EMPTY,
+        cmd_non_ascii: false,
+    };
 }
 
-/// PID → its [`PidMeta`] slot. A plain `FxHashMap` for now; phase 6 replaces it with a
-/// THP-resident open-addressing `ThpMap` so even this lookup table is on huge pages.
-type PidIndex = PidMap<Ref<PidMeta>>;
+/// The per-PID index value — what one PID lookup yields, coordinating every per-PID store. It
+/// holds the store handles plus the cross-store bookkeeping the fill (and a future
+/// update-prioritization scan) reads on every PID *without* chasing into a store. This is the
+/// intended **extension point**: process-volatility signals for adaptive sampling land here.
+/// `Copy`; lives in the [`PidIndex`] map (heap now; phase 6 → THP `ThpMap`).
+#[derive(Clone, Copy)]
+struct PidSlot {
+    /// Hot CPU-history slot.
+    cpu: Ref<CpuRing>,
+    /// Cold metadata slot (uid + cmdline handle).
+    meta: Ref<PidMeta>,
+    /// Incarnation discriminator: `start_time` from stat. A change ⇒ PID reuse.
+    start_time: u64,
+    /// Generation first seen — drives the age-adaptive cmdline cadence (settling window).
+    first_seen_gen: u64,
+    /// Generation last seen — evicts vanished PIDs.
+    seen_gen: u64,
+}
 
-/// Owns the slow per-PID metadata (`uid`, `cmdline`) backend-agnostically. comm rides
-/// inside stat (re-read every cycle, free); this layer covers what does not. Each cycle
-/// it materializes the cmdline — fresh-read or cached — into the *current* arena so the
-/// `StringRef` stays valid across the double-buffer reset.
-struct ProcCache {
-    /// PID → its [`PidMeta`] slot (gatherer-internal; phase 6 → THP `ThpMap`).
-    pid_index: PidIndex,
-    /// Per-PID metadata on huge pages (uid, cmdline handle, cadence bookkeeping). Freed
-    /// immediately on death — no snapshot leases it.
+/// PID → [`PidSlot`]. A plain `FxHashMap` for now; phase 6 replaces it with a THP-resident
+/// open-addressing `ThpMap` so even this lookup table is on huge pages.
+type PidIndex = PidMap<PidSlot>;
+
+/// The unified per-PID table: one PID lookup serves every store. Owns the shared [`PidIndex`]
+/// plus the per-PID stores — the **hot** [`CpuRing`] (touched every sample), the **cold**
+/// [`PidMeta`] (uid/cmdline), and the snapshot-leased `Cmd` string store — and the CPU
+/// sampling clock. Replacing the former separate `CpuTracker` + `ProcCache`, it collapses the
+/// two per-PID hashmap lookups per cycle into one, and gives volatility-based update
+/// prioritization a single place to read per-PID state ([`PidSlot`]).
+///
+/// **CPU%** is a per-core rate over real elapsed time (`Δticks / (Δwall · CLK_TCK)`), so one
+/// full core reads 100% and a multithreaded process exceeds it (`top`/`htop` "Irix mode";
+/// dividing by the machine-wide `/proc/stat` tick sum undercounts by `1/num_cpus`). The window
+/// is a monotonic clock (a jittering interval self-corrects); a refresh closer than
+/// [`MIN_SAMPLE`] (e.g. the forced one after a kill) carries the windowed values forward
+/// rather than dividing by a near-zero window.
+///
+/// `CpuRing`/`PidMeta` are gatherer-internal → freed eagerly on death (no lease); only the
+/// cmdline string is leased. The two are *separate* stores so a CPU update loads only the hot
+/// ring, never the cold metadata.
+struct ProcTable {
+    /// PID → [`PidSlot`] (gatherer-internal; phase 6 → THP `ThpMap`).
+    index: PidIndex,
+    /// Hot per-PID CPU history on huge pages. Freed immediately on death.
+    cpu: GenStore<CpuRing>,
+    /// Cold per-PID metadata on huge pages. Freed immediately on death.
     meta: GenStore<PidMeta>,
     /// Generational cmdline storage, shared across snapshots (persistent). A `StringRef<Cmd>`
     /// in a published snapshot stays valid until GC, which lags by [`GC_LAG`] generations.
     cmd_store: CmdStore,
+    /// Last real CPU-sample instant (the window origin); `None` until the first sample.
+    last: Option<Instant>,
+    clk_tck: u64,
     refresh_n: u32,
     cmd_path: ProcPath,
     /// Reused read buffer for `/proc/<pid>/cmdline` (no per-cycle allocation).
     scratch: Vec<u8>,
 }
 
-impl ProcCache {
-    fn new(arena: &mut Arena, refresh_n: u32) -> Self {
+impl ProcTable {
+    fn new(arena: &Arena, clk_tck: u64, refresh_n: u32) -> Self {
         Self {
-            pid_index: PidIndex::default(),
+            index: PidIndex::default(),
+            cpu: GenStore::new(arena, CPURING_MIN_SLOTS),
             meta: GenStore::new(arena, PIDMETA_MIN_SLOTS),
             cmd_store: CmdStore::new(arena, CMD_STORE_MIN_SLOTS),
+            last: None,
+            clk_tck,
             refresh_n,
             cmd_path: ProcPath::new(),
             scratch: vec![0u8; CMD_SLOT],
         }
     }
 
+    /// Bind the stores to the (now pinned, boxed) arena. Call once after construction, before
+    /// any update — each store caches a `*const Arena` and its current base.
+    fn wire(&mut self, arena: &Arena) {
+        self.cpu.wire(arena);
+        self.meta.wire(arena);
+        self.cmd_store.wire(arena);
+    }
+
     /// Read-only `Cmd`-store view to publish in the snapshot for UI-side resolution.
-    fn resolver(&self, arena: &Arena) -> ByteResolver<Cmd> {
-        self.cmd_store.resolver(arena)
+    fn resolver(&self) -> ByteResolver<Cmd> {
+        self.cmd_store.resolver()
     }
 
-    /// Reclaim cmdline slots whose generation the live snapshot window has passed.
-    /// Cross-thread soundness: a published snapshot only references `ALIVE` or
-    /// recently-demoted slots; `min_live` (= current gen − [`GC_LAG`]) never reaches those,
-    /// so the UI thread's `resolve` reads of leased slots never race a reclaim. Demotion
-    /// flips only a slot's 1-byte tag (a distinct memory location from its data bytes), and
-    /// new interns target free/new slots no live snapshot references. (Arena region
-    /// retirement from a store relocate is reclaimed on the same lease — see
-    /// [`Gatherer::gather`].)
-    fn gc(&mut self, arena: &Arena, min_live: u64) {
-        self.cmd_store.gc(arena, min_live);
+    /// Reclaim cmdline slots whose generation the live snapshot window has passed — the only
+    /// leased store (`CpuRing`/`PidMeta` are freed eagerly on death). Cross-thread soundness:
+    /// a published snapshot only references `ALIVE` or recently-demoted slots; `min_live`
+    /// (= current gen − [`GC_LAG`]) never reaches those, so the UI thread's `resolve` reads of
+    /// leased slots never race a reclaim. Demotion flips only a slot's 1-byte tag (a distinct
+    /// memory location from its data bytes), and new interns target free/new slots no live
+    /// snapshot references. (Arena region retirement from a store relocate is reclaimed on the
+    /// same lease — see [`Gatherer::gather`].)
+    fn gc(&mut self, min_live: u64) {
+        self.cmd_store.gc(min_live);
     }
 
-    /// Fill `uid` + `cmdline` on every live entry (stat fields are already set). Reads
-    /// fresh on first sighting, while settling, or on the staggered coarse tick; otherwise
-    /// reuses the cached handle (no I/O, no copy). A fresh read replaces the `Cmd` slot
-    /// **only when the bytes changed** — an unchanged cmdline keeps its slot, so the
-    /// per-cycle re-materialization of every PID's cmdline is gone. `gen` is the generation
-    /// of the snapshot being built; demotions/allocations key the generational lease to it.
-    #[allow(clippy::cast_possible_truncation)] // cmdline len bounded by CMD_SLOT
-    fn update(&mut self, arena: &mut Arena, procs: &mut [ProcessEntry], cur_gen: u64) {
+    /// One per-PID pass filling CPU% + uid + cmdline, then evicting vanished PIDs — a single
+    /// [`PidIndex`] lookup per PID. `now` drives the CPU window; `cur_gen` keys the cmdline
+    /// cadence and the generational lease. CPU% reads fresh every cycle; uid/cmdline read
+    /// fresh on first sighting, while settling, or on the staggered coarse tick, else reuse
+    /// the cached handle (no I/O, no copy) — an unchanged cmdline keeps its slot. Per-PID
+    /// records are copied out / written back (never held as a live `&slot` across a store op),
+    /// because any allocation may grow a store and relocate the arena.
+    #[allow(clippy::cast_possible_truncation)] // tick delta / cmdline len are bounded
+    fn update(&mut self, procs: &mut [ProcessEntry], now: Instant, cur_gen: u64) {
+        // CPU window: real elapsed since the last sample, or `None` if too soon / first call.
+        let window = self
+            .last
+            .map(|t| now.saturating_duration_since(t))
+            .filter(|e| *e >= MIN_SAMPLE);
+        let first = self.last.is_none();
+        let jiff =
+            window.map(|e| u32::try_from(elapsed_jiffies(e, self.clk_tck)).unwrap_or(u32::MAX));
+
         let Self {
-            pid_index,
+            index,
+            cpu,
             meta,
             cmd_store,
             refresh_n,
             cmd_path,
             scratch,
+            ..
         } = self;
         let refresh_n = *refresh_n;
 
         for e in procs.iter_mut() {
             let pid = e.pid;
-            // Copy the prior record out (`PidMeta` is `Copy`) so no `meta`/`arena` borrow is
-            // held across the `cmd_store` ops below, which also need the arena.
-            let prior = pid_index
-                .get(&pid)
-                .map(|&mref| (mref, *meta.get(arena, mref)));
-            let (present, reused, settling) = match prior {
-                Some((_, pm)) => {
-                    let reused = pm.start_time != e.start_time;
-                    let settling = !reused
-                        && cur_gen.wrapping_sub(pm.first_seen_gen) < u64::from(CMDLINE_SETTLE_GENS);
-                    (true, reused, settling)
-                }
-                None => (false, false, true), // new → treat as settling
+            let prior = index.get(&pid).copied();
+            let reused = prior.is_some_and(|s| s.start_time != e.start_time);
+            let settling = prior.is_some_and(|s| {
+                !reused && cur_gen.wrapping_sub(s.first_seen_gen) < u64::from(CMDLINE_SETTLE_GENS)
+            });
+
+            // CPU ring (hot): mutated in place; its &mut never spans the cmd/meta ops below.
+            let cpu_ref = match prior {
+                Some(s) => s.cpu,
+                None => cpu.insert(Gen::ALIVE, CpuRing::new(e.ticks)),
             };
+            let ring = cpu.get_mut(cpu_ref);
+            ring.sample(e.ticks, jiff, reused, prior.is_some());
+            e.cpu_pct = ring.avg();
+            e.cpu_peak = ring.peak();
+
+            // Metadata (cold): uid + cmdline on the cadence. Copy-out / write-back.
             let stagger =
                 refresh_n <= 1 || cur_gen.wrapping_add(u64::from(pid)) % u64::from(refresh_n) == 0;
-            let refresh = !present || reused || settling || stagger;
-
-            // Read fresh into scratch (kthreads cost zero syscalls: uid 0, cmdline empty).
+            let refresh = prior.is_none() || reused || settling || stagger;
             let fresh = if refresh {
                 if e.is_kthread {
-                    Some((0u32, 0usize, false))
+                    Some((0u32, 0usize, false)) // kthreads: uid 0, empty cmdline, no syscall
                 } else {
                     Some(read_cmdline_uid(pid, cmd_path, scratch))
                 }
@@ -559,57 +551,84 @@ impl ProcCache {
                 None
             };
 
-            // Build the record locally. On reuse, demote the prior incarnation's cmd slot and
-            // re-baseline; on a kept PID, carry its record forward.
-            let mut pm = match prior {
-                Some((_, pm)) if !reused => pm,
-                _ => PidMeta::new(e.start_time, cur_gen),
+            let meta_ref = match prior {
+                Some(s) => s.meta,
+                None => meta.insert(Gen::ALIVE, PidMeta::EMPTY),
             };
-            if reused && let Some((_, old)) = prior {
-                cmd_store.demote(arena, old.cmd, cur_gen);
-            }
-            pm.seen_gen = cur_gen;
-
+            // Carry the cached record forward, or start fresh on reuse (demoting the dead
+            // incarnation's cmd slot first).
+            let mut pm = if reused {
+                let old_cmd = meta.get(meta_ref).cmd;
+                cmd_store.demote(old_cmd, cur_gen);
+                PidMeta::EMPTY
+            } else {
+                *meta.get(meta_ref)
+            };
             if let Some((uid, len, non_ascii)) = fresh {
                 pm.uid = uid;
                 let new_bytes = &scratch[..len];
                 if new_bytes.is_empty() {
-                    cmd_store.demote(arena, pm.cmd, cur_gen); // no-op if already empty
+                    cmd_store.demote(pm.cmd, cur_gen); // no-op if already empty
                     pm.cmd = StringRef::EMPTY;
                     pm.cmd_non_ascii = false;
-                } else if pm.cmd.is_empty() || cmd_store.get(arena, pm.cmd) != new_bytes {
+                } else if pm.cmd.is_empty() || cmd_store.get(pm.cmd) != new_bytes {
                     // Changed (or first non-empty argv): new slot alive, old slot demoted.
-                    cmd_store.demote(arena, pm.cmd, cur_gen);
-                    pm.cmd = cmd_store.intern(arena, Gen::ALIVE, new_bytes);
+                    cmd_store.demote(pm.cmd, cur_gen);
+                    pm.cmd = cmd_store.intern(Gen::ALIVE, new_bytes);
                     pm.cmd_non_ascii = non_ascii;
                 }
                 // else: unchanged — keep the existing slot (the whole point of the store).
             }
-
-            // Write back: overwrite the existing slot, or allocate one for a new PID + index.
-            if let Some((mref, _)) = prior {
-                meta.assign(arena, mref, pm);
-            } else {
-                let mref = meta.insert(arena, Gen::ALIVE, pm);
-                pid_index.insert(pid, mref);
-            }
+            meta.assign(meta_ref, pm);
 
             e.uid = pm.uid;
             e.cmdline = pm.cmd;
             if !pm.cmd.is_empty() {
                 e.non_ascii |= pm.cmd_non_ascii;
             }
+
+            index.insert(
+                pid,
+                PidSlot {
+                    cpu: cpu_ref,
+                    meta: meta_ref,
+                    start_time: e.start_time,
+                    first_seen_gen: match prior {
+                        Some(s) if !reused => s.first_seen_gen,
+                        _ => cur_gen,
+                    },
+                    seen_gen: cur_gen,
+                },
+            );
         }
 
-        // Evict vanished PIDs: demote their cmd slot (leased) + free their PidMeta slot
-        // (gatherer-internal, immediate).
-        pid_index.retain(|_, &mut mref| {
-            let pm = *meta.get(arena, mref);
-            if pm.seen_gen == cur_gen {
+        self.evict(cur_gen);
+
+        // The window origin advances only on a real sample (or the first call); a too-soon
+        // cycle leaves it so elapsed keeps accumulating until it exceeds `MIN_SAMPLE`.
+        if first || window.is_some() {
+            self.last = Some(now);
+        }
+    }
+
+    /// Drop PIDs not seen this cycle: free their hot + cold slots (gatherer-internal,
+    /// immediate) and demote their leased cmd slot so GC reclaims it once the lease expires.
+    fn evict(&mut self, cur_gen: u64) {
+        let Self {
+            index,
+            cpu,
+            meta,
+            cmd_store,
+            ..
+        } = self;
+        index.retain(|_, slot| {
+            if slot.seen_gen == cur_gen {
                 true
             } else {
-                cmd_store.demote(arena, pm.cmd, cur_gen);
-                meta.free(arena, mref);
+                let cmd = meta.get(slot.meta).cmd;
+                cmd_store.demote(cmd, cur_gen);
+                meta.free(slot.meta);
+                cpu.free(slot.cpu);
                 false
             }
         });
@@ -718,15 +737,17 @@ pub struct Gatherer {
     proc_dir: ProcDir,
     pids: Vec<u32>,
     dent_buf: Vec<u8>,
-    cpu: CpuTracker,
-    cache: ProcCache,
+    /// Unified per-PID table (CPU history + uid/cmdline + the shared PID index).
+    table: ProcTable,
     sys_cpu: SysCpuAccum,
     tree_stack: Vec<u32>,
     tree_order: Vec<u32>,
     /// Shared THP sub-allocator backing the gatherer's generational stores (currently the
-    /// `Cmd` store; phases 3–6 add per-PID/CPU/index stores). One per gatherer; growth is
+    /// `Cmd` store; phases 3–6 add per-PID/CPU/index stores). **Boxed so it is pinned in
+    /// memory**: the stores cache a `*const Arena` to it (set at `wire`), so the gatherer may
+    /// move freely while the arena's address stays fixed. One per gatherer; growth is
     /// lease-deferred so cross-thread readers stay valid.
-    arena: Arena,
+    arena: Box<Arena>,
     /// Persistent-fd pool capacity, retained for the mid-run `io_uring`→syscall downgrade.
     pool_cap: u32,
     config: Config,
@@ -738,26 +759,34 @@ pub struct Gatherer {
 }
 
 impl Gatherer {
-    /// Build the gatherer and the shared snapshot cell. Returns the `ArcSwap` for the UI to
-    /// load from. The I/O backend is **not** built here — [`run`](Self::run) builds it on the
-    /// gatherer thread, so the `io_uring` ring is owned by its sole submitter. Runs on the
-    /// main thread; does no `/proc` I/O.
-    pub fn new(page_size: u64) -> std::io::Result<(Self, Arc<ArcSwap<Snapshot>>)> {
-        let front = Arc::new(Snapshot::new(INIT_BUF));
-        let back = Arc::new(Snapshot::new(INIT_BUF));
+    /// Create the shared snapshot cell (the front buffer). Called on the **main** thread; the
+    /// gatherer thread then builds the rest via [`new`](Self::new). Split out because the
+    /// arena + generational stores are `!Send` — they cannot be built on one thread and moved
+    /// to another — but the UI needs the cell before the gatherer thread starts.
+    #[must_use]
+    pub fn make_cell() -> Arc<ArcSwap<Snapshot>> {
+        Arc::new(ArcSwap::from(Arc::new(Snapshot::new(INIT_BUF))))
+    }
 
+    /// Build the gatherer on the **calling thread**, which must be the gatherer thread: its
+    /// arena + stores are `!Send`. The arena is boxed (pinned) so the stores can cache a
+    /// `*const Arena` during `wire` and the gatherer may then move freely. The I/O backend is
+    /// **not** built here — [`run`](Self::run) builds it, so the `io_uring` ring is owned by
+    /// its sole submitter. `proc_dir` is opened by the caller (a fallible op kept on main).
+    #[must_use]
+    pub fn new(page_size: u64, cell: Arc<ArcSwap<Snapshot>>, proc_dir: ProcDir) -> Self {
+        let back = Arc::new(Snapshot::new(INIT_BUF));
         let pool_cap = pool_capacity();
-        let arc_swap = Arc::new(ArcSwap::from(front));
-        let mut arena = Arena::new(0);
-        let cache = ProcCache::new(&mut arena, cmdline_refresh_n());
-        let gatherer = Self {
-            arc_swap: arc_swap.clone(),
+        let arena = Box::new(Arena::new(0));
+        let mut table = ProcTable::new(&arena, clk_tck(), cmdline_refresh_n());
+        table.wire(&arena); // arena is pinned (boxed) → stores may cache its address
+        Self {
+            arc_swap: cell,
             recycled: Some(back),
-            proc_dir: ProcDir::open()?,
+            proc_dir,
             pids: Vec::new(),
             dent_buf: vec![0u8; 64 * 1024],
-            cpu: CpuTracker::new(clk_tck()),
-            cache,
+            table,
             sys_cpu: SysCpuAccum::new(),
             tree_stack: Vec::new(),
             tree_order: Vec::new(),
@@ -767,8 +796,7 @@ impl Gatherer {
             pid_max: sys::read_pid_max(),
             page_size,
             generation: 0,
-        };
-        Ok((gatherer, arc_swap))
+        }
     }
 
     /// Gatherer thread entry point and **sole ring submitter**. Builds the I/O backend on
@@ -896,12 +924,10 @@ impl Gatherer {
         let building_gen = self.generation + 1;
         self.arena.set_gen(building_gen);
 
-        // Fill uid + cmdline handle (slow fields) on the surviving entries, then publish
-        // the Cmd-store view for UI resolution, then CPU%.
-        self.cache
-            .update(&mut self.arena, &mut snap.procs, building_gen);
-        snap.cmd = self.cache.resolver(&self.arena);
-        self.cpu.update(&mut snap.procs, now);
+        // One unified per-PID pass: CPU% + uid + cmdline handle on the surviving entries (a
+        // single index lookup each), then publish the Cmd-store view for UI resolution.
+        self.table.update(&mut snap.procs, now, building_gen);
+        snap.cmd = self.table.resolver();
         snap.first_root = tree::build(&mut snap.procs, &mut self.tree_stack, &mut self.tree_order);
         tree::aggregate(&mut snap.procs, &self.tree_order);
 
@@ -922,7 +948,7 @@ impl Gatherer {
         // one generation more conservative than strictly required. The arena GC frees any
         // region a store relocate retired, on the same lease.
         let min_live = self.generation.saturating_sub(GC_LAG);
-        self.cache.gc(&self.arena, min_live);
+        self.table.gc(min_live);
         self.arena.gc(min_live);
     }
 
@@ -958,6 +984,15 @@ impl Gatherer {
 mod tests {
     use super::*;
 
+    /// Build a gatherer on the current (test) thread. The arena + stores are `!Send`, so they
+    /// are constructed where they are used; the boxed arena lets the returned gatherer move.
+    fn new_test() -> (Gatherer, Arc<ArcSwap<Snapshot>>) {
+        let cell = Gatherer::make_cell();
+        let proc_dir = ProcDir::open().expect("open /proc");
+        let g = Gatherer::new(crate::sys::page_size(), cell.clone(), proc_dir);
+        (g, cell)
+    }
+
     #[test]
     fn elapsed_jiffies_is_per_core() {
         // 500 ms at 100 Hz = 50 jiffies on one core, regardless of core count.
@@ -985,7 +1020,7 @@ mod tests {
 
     #[test]
     fn moving_average_is_exact() {
-        let mut h = CpuHistory::new(0, 1);
+        let mut h = CpuRing::new(0);
         h.push(25, 50); // 50%
         h.push(50, 50); // 100% → (25+50)/(100) = 75%
         assert_eq!(h.avg(), 7500);
@@ -993,7 +1028,7 @@ mod tests {
 
     #[test]
     fn moving_average_evicts_old_samples() {
-        let mut h = CpuHistory::new(0, 1);
+        let mut h = CpuRing::new(0);
         for _ in 0..CPU_WINDOW {
             h.push(10, 50); // fill window with 20%
         }
@@ -1006,7 +1041,7 @@ mod tests {
 
     #[test]
     fn peak_captures_spike_the_average_damps() {
-        let mut h = CpuHistory::new(0, 1);
+        let mut h = CpuRing::new(0);
         h.push(5, 50); // 10%
         h.push(50, 50); // 100% spike
         h.push(5, 50); // 10%
@@ -1117,7 +1152,7 @@ mod tests {
             }
         });
 
-        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let (mut g, cell) = new_test();
         let mut backend = g.build_backend();
         let me = std::process::id();
         let (mut max_cpu, mut max_peak) = (0, 0);
@@ -1148,7 +1183,7 @@ mod tests {
     /// Full gatherer pipeline (enumerate → backend → cpu → tree → publish).
     #[test]
     fn gatherer_publishes_valid_snapshot() {
-        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let (mut g, cell) = new_test();
         let mut backend = g.build_backend();
         g.gather(&mut backend);
         let snap = cell.load_full();
@@ -1204,7 +1239,7 @@ mod tests {
     #[allow(clippy::cast_precision_loss)] // a print, not a measurement
     fn gather_steady_state_is_cheap() {
         const ITERS: u32 = 400;
-        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let (mut g, cell) = new_test();
         let mut backend = g.build_backend();
         g.gather(&mut backend);
         g.gather(&mut backend); // warm up the persistent-fd pool
@@ -1229,7 +1264,7 @@ mod tests {
     /// persistent `Cmd`-store slot, still resolvable through the new snapshot's view.
     #[test]
     fn cmdline_persists_across_coarse_cycles() {
-        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let (mut g, cell) = new_test();
         let mut backend = g.build_backend();
         let me = std::process::id();
         g.gather(&mut backend);
@@ -1259,7 +1294,7 @@ mod tests {
     /// but a shared store can if the lease is wrong).
     #[test]
     fn held_snapshot_resolves_dead_pid_cmdline() {
-        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let (mut g, cell) = new_test();
         let mut backend = g.build_backend();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -1307,7 +1342,7 @@ mod tests {
     /// re-interned), the store would grow by ~one slot per userspace PID per cycle.
     #[test]
     fn cmd_store_does_not_grow_per_cycle() {
-        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let (mut g, cell) = new_test();
         let mut backend = g.build_backend();
         let me = std::process::id();
 
@@ -1317,7 +1352,7 @@ mod tests {
             g.gather(&mut backend);
             drop(cell.load_full());
         }
-        let slots_warm = g.cache.cmd_store.slot_count();
+        let slots_warm = g.table.cmd_store.slot_count();
         let userspace = {
             let s = cell.load_full();
             s.procs.iter().filter(|p| !p.is_kthread).count()
@@ -1327,7 +1362,7 @@ mod tests {
             g.gather(&mut backend);
             drop(cell.load_full());
         }
-        let slots_after = g.cache.cmd_store.slot_count();
+        let slots_after = g.table.cmd_store.slot_count();
 
         // Slack covers genuine churn (new userspace PIDs over ~18 s); the disaster mode
         // would be `userspace × 30` extra slots.
@@ -1349,7 +1384,7 @@ mod tests {
     /// disabled (`enum_every` huge) so the birth can *only* be found by the probe.
     #[test]
     fn birth_probe_catches_sequential_birth_within_one_cycle() {
-        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let (mut g, cell) = new_test();
         g.config.enum_every = 1_000_000; // effectively no full re-scan → births only via probe
         g.config.probe_width = 1_000_000; // window spans (max_live, ns_last_pid] regardless of W
         let mut backend = g.build_backend();
@@ -1378,7 +1413,7 @@ mod tests {
     /// the next full scan, and no phantom row is left behind.
     #[test]
     fn death_caught_same_cycle_on_skip() {
-        let (mut g, cell) = Gatherer::new(crate::sys::page_size()).expect("gatherer");
+        let (mut g, cell) = new_test();
         g.config.enum_every = 1_000_000; // force skip cycles after the first
         let mut backend = g.build_backend();
         let mut child = std::process::Command::new("sleep")

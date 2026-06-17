@@ -1,5 +1,26 @@
 # Goals
 
+## Priority order (the tie-breaker)
+
+When goals conflict, higher wins:
+
+1. **Minimal CPU** — the theoretical floor, not "good enough." Idle is near-zero (blocked,
+   not polling); active work tracks change, not population, wherever avoidable. Every removed
+   copy / scan / syscall / atomic counts.
+2. **Minimal RAM**, scaled to load. A largish *floor* is accepted: THP commits whole 2 MiB
+   pages, so we will not go below ~6–8 MiB regardless. Growth above the floor must track real
+   load, not waste.
+3. **UI responsiveness** — redraw/input latency **< 10 ms at p90, < 100 ms at p99.99**.
+   Generous on purpose: loose enough to *serialize* gather and render (drop all concurrency)
+   and spend that simplicity on goals 1–2. We currently run well inside it.
+4. **Monitoring richness, not fanciness** — invest in *what* is observed (more signals,
+   deeper tree/cgroup/thread awareness) over UI flourish.
+
+This order is *why* the app serializes to one thread: the latency budget is loose enough that
+losing gather/render parallelism costs nothing measurable, while the serial model deletes
+whole classes of CPU/RAM overhead (copies, double-buffering, the cross-thread lease,
+generational GC) and makes data races non-representable. See `docs/plans/thp-arena.md`.
+
 ## Core constraints
 
 - **Lowest possible footprint, on purpose**: a *full-featured* process manager **and** the

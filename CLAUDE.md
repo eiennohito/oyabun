@@ -3,6 +3,7 @@
 > **Meta-rule**: Rules include their rationale — rationales are followed more reliably and transfer to novel situations.
 - **Do not be a yes-man**: Humans make bad decisions and forget context. Ask, clarify, push back.
 - **Be terse**: every output token is 50× the cost of an input token and joins the context permanently. No filler, no preamble, no restating what the user said. Code and data over prose. Tables and bullet points over paragraphs. If a message doesn't add information, don't send it.
+- **Premise before conclusion; define terms before using them**: never state a conclusion, recommendation, or question whose terms the reader hasn't been given — a name from your own code, an internal label, an intermediate result. Introduce each referent before you lean on it. A conclusion with the premise omitted, or a question that leaps over an unshared assumption ("I have two dogs — are you a mosquito?"), is noise the reader must reverse-engineer; it costs *more* than the words you saved. This sharpens "be terse" rather than fighting it: cut filler and restated context, never the logical chain or a definition the reader needs.
 
 # Codebase Stage & Work Modes
 

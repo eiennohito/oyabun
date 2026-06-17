@@ -5,14 +5,14 @@
 //! lists are prepend-linked, and depth/subtree sizes come from one pre-order pass
 //! plus its reverse. Scratch buffers are caller-owned and reused.
 
-use crate::snapshot::{NONE, ProcessEntry};
+use crate::procs::{NONE, ProcessEntry};
 
 /// Build the structural tree. `procs` MUST be sorted ascending by `pid`.
 ///
 /// Sets `parent_idx`, `first_child`, `next_sibling`, `subtree_size`, and `depth` on
 /// every entry; returns the head index of the root sibling chain (or [`NONE`]).
 /// `stack` and `order` are reused scratch (cleared on entry).
-// Indices are `< procs.len()`, which fits `u32` by the snapshot design.
+// Indices are `< procs.len()`, which fits `u32` by the row-buffer design.
 #[allow(clippy::cast_possible_truncation)]
 pub fn build(procs: &mut [ProcessEntry], stack: &mut Vec<u32>, order: &mut Vec<u32>) -> u32 {
     let n = procs.len();
@@ -110,7 +110,6 @@ fn push_chain(procs: &[ProcessEntry], head: u32, stack: &mut Vec<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::StringRef;
 
     fn proc(pid: u32, parent: u32) -> ProcessEntry {
         ProcessEntry {
@@ -120,13 +119,14 @@ mod tests {
             state: b'S',
             priority: 20,
             nice: 0,
+            comm_len: 0,
             num_threads: 1,
             cpu_pct: 0,
             cpu_peak: 0,
             mem_bytes: 0,
             ticks: 0,
             start_time: 0,
-            name: StringRef::EMPTY,
+            comm_bytes: [0; crate::procs::COMM_CAP],
             cmdline: thoop::StringRef::EMPTY,
             non_ascii: false,
             is_kthread: false,

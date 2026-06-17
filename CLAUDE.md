@@ -59,10 +59,10 @@ Per-module detail lives in `docs/ARCHITECTURE.md` — read it before the code.
 
 ```
 crates/
-  atop/     process-manager TUI: 2 threads, ArcSwap snapshot exchange
-    gather/ gatherer thread: read /proc, parse, CPU%, tree, publish
+  atop/     process-manager TUI: one thread, serialized gather→render loop
+    gather/ read /proc, parse, CPU%, tree; fill the arena row buffer in place
   etch/     retained-mode, value-gated terminal renderer
-  thoop/    THP-backed generational storage primitives (MmapRegion, GenStore, …)
+  thoop/    THP storage primitives (MmapRegion, Arena, GenStore, TypedBuf, …)
 docs/       ARCHITECTURE.md (design — read first), GOALS.md, plans/
 ```
 

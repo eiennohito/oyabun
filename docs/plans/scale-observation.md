@@ -1,5 +1,14 @@
 # Scale Observation — Two-Tier Sampling for Extreme Hardware
 
+> **Threading note (2026-06).** This plan was written against the old two-thread design. atop
+> has since collapsed to a **single thread** (`docs/ARCHITECTURE.md`), which moots the
+> cross-thread parts below: the "incremental carry-forward vs double-buffer recycling" hazard,
+> the `Arc<Snapshot>`/`ArcSwap`-release ordering, and the lease-lifetime reasoning are all gone
+> — incremental carry-forward is now just in-place store updates between cycles, with no lease
+> and no buffer to seed (the row buffer persists and is mutated in place). The **sampling
+> cadence** core of this plan (amortizing O(n) observation across cycles, the two-tier
+> display-relevant-vs-background split) is unchanged and independent of threading.
+
 ## Problem
 
 The gatherer observes **every** PID every cycle: read stat, parse, feed the CPU window,

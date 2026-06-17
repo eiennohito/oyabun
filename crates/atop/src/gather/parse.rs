@@ -1,13 +1,12 @@
 //! `/proc/<pid>/stat` parsing.
 //!
 //! Operates directly on the raw bytes read into the `io_uring` landing pad (or the
-//! syscall backend's scratch). `comm` is located as a relative [`StringRef`] into that
-//! read slot; [`StatFields::write_into`] copies just those ~15 bytes into the snapshot's
-//! string arena (the slot is reused by the next read). Numeric fields are parsed
-//! byte-wise without UTF-8 validation.
+//! syscall backend's scratch). `comm` is located as a relative byte range into that read
+//! slot; [`StatFields::write_into`] copies those ≤ 15 bytes **inline** into the process row
+//! (the slot is reused by the next read). Numeric fields are parsed byte-wise without UTF-8
+//! validation.
 
-use crate::arena::{HugePageBuf, StringRef};
-use crate::snapshot::ProcessEntry;
+use crate::procs::ProcessEntry;
 
 /// `PF_KTHREAD` in the stat `flags` field — set for kernel threads, which have a
 /// permanently empty `/proc/<pid>/cmdline` (so we skip reading it for them).
@@ -24,9 +23,11 @@ pub struct StatFields {
     /// Start time (jiffies since boot) — stat field 22.
     pub start_time: u64,
     pub rss_pages: u64,
-    /// `comm` location **relative to the start of the parsed read slot** — copied into
-    /// the string arena by [`write_into`](Self::write_into), since the slot is reused.
-    pub comm: StringRef,
+    /// `comm` byte offset **relative to the start of the parsed read slot** — copied inline
+    /// into the row by [`write_into`](Self::write_into), since the slot is reused.
+    pub comm_off: u32,
+    /// `comm` byte length within the slot.
+    pub comm_len: u32,
     /// `comm` has a byte ≥ 0x80 (a process can set a non-ASCII name via `prctl`).
     pub comm_non_ascii: bool,
     /// `PF_KTHREAD` is set — a kernel thread with permanently empty cmdline.
@@ -34,19 +35,12 @@ pub struct StatFields {
 }
 
 impl StatFields {
-    /// Populate a process entry from these parsed stat fields, copying `comm` out of
-    /// the transient read `slot` into the snapshot's string arena (the slot is reused
-    /// by the next read, so `comm` cannot stay borrowed from it). `uid` and `cmdline`
-    /// are filled afterward by [`ProcCache`](crate::gather); `cpu_pct`/`cpu_peak` and
-    /// the tree links by later stages; `pid` was set when the tombstone was pushed.
-    #[allow(clippy::cast_possible_truncation)] // comm len ≤ TASK_COMM_LEN (16)
-    pub fn write_into(
-        &self,
-        e: &mut ProcessEntry,
-        page_size: u64,
-        slot: &[u8],
-        arena: &mut HugePageBuf,
-    ) {
+    /// Populate a process row from these parsed stat fields, copying `comm` out of the
+    /// transient read `slot` **inline** into the row (the slot is reused by the next read,
+    /// so `comm` cannot stay borrowed from it). `uid`/`cmdline` are filled afterward by the
+    /// `ProcTable`; `cpu_pct`/`cpu_peak` and the tree links by later stages; `pid` was set
+    /// when the tombstone was pushed.
+    pub fn write_into(&self, e: &mut ProcessEntry, page_size: u64, slot: &[u8]) {
         e.ppid = self.ppid;
         e.state = self.state;
         e.priority = self.priority;
@@ -58,33 +52,21 @@ impl StatFields {
         e.non_ascii = self.comm_non_ascii;
         e.is_kthread = self.is_kthread;
 
-        // `comm.offset`/`len` come from `parse_stat` positions within `slot`, so they are
+        // `comm_off`/`comm_len` come from `parse_stat` positions within `slot`, so they are
         // in range — but resolve defensively (checked add + `get`) so a malformed field can
-        // never index out of bounds, and key the stored `StringRef` to the bytes actually
-        // copied (never the parsed `len`), so a fallback to empty can't leave a dangling ref.
-        let start = self.comm.offset as usize;
+        // never index out of bounds. `set_comm` truncates to the inline capacity.
+        let start = self.comm_off as usize;
         let comm = self
-            .comm
-            .offset
-            .checked_add(self.comm.len)
+            .comm_off
+            .checked_add(self.comm_len)
             .and_then(|end| slot.get(start..end as usize))
             .unwrap_or(&[]);
-        let off = arena.alloc(comm.len());
-        let ptr = arena.write_ptr(off);
-        // SAFETY: `off` was just allocated for exactly `comm.len()` bytes; `comm`
-        // borrows the read slot, which is disjoint from `arena`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(comm.as_ptr(), ptr, comm.len());
-        }
-        e.name = StringRef {
-            offset: off as u32,
-            len: comm.len() as u32,
-        };
+        e.set_comm(comm);
     }
 }
 
-/// Parse one stat record from a read `slot`. The returned `comm` `StringRef` is
-/// **relative to `slot[0]`** (the caller relocates it into the arena).
+/// Parse one stat record from a read `slot`. The returned `comm_off` is **relative to
+/// `slot[0]`** (the caller copies that range inline into the row).
 ///
 /// `comm` is wrapped in parens and may contain spaces/parens; we take everything
 /// between the first `(` and last `)`. Numeric field indices (0-based, after `) `):
@@ -99,10 +81,8 @@ pub fn parse_stat(slot: &[u8]) -> Option<StatFields> {
     if close <= open + 1 {
         return None;
     }
-    let comm = StringRef {
-        offset: (open + 1) as u32,
-        len: (close - open - 1) as u32,
-    };
+    let comm_off = (open + 1) as u32;
+    let comm_len = (close - open - 1) as u32;
     let comm_non_ascii = slot[open + 1..close].iter().any(|&b| b >= 0x80);
 
     // Fields are single-space separated; ") " precedes the state char.
@@ -134,7 +114,8 @@ pub fn parse_stat(slot: &[u8]) -> Option<StatFields> {
         ticks: utime.saturating_add(stime),
         start_time,
         rss_pages,
-        comm,
+        comm_off,
+        comm_len,
         comm_non_ascii,
         is_kthread: flags & PF_KTHREAD != 0,
     })
@@ -221,7 +202,7 @@ mod tests {
         assert!(!f.is_kthread, "flags 4194560 lacks PF_KTHREAD");
         // comm offset is relative to slot[0]; points at 'b' in "(bash)" → index 6.
         assert_eq!(
-            &raw[f.comm.offset as usize..(f.comm.offset + f.comm.len) as usize],
+            &raw[f.comm_off as usize..(f.comm_off + f.comm_len) as usize],
             b"bash"
         );
     }
@@ -246,7 +227,7 @@ mod tests {
         assert_eq!(f.ppid, 7);
         assert_eq!(f.state, b'R');
         assert_eq!(f.ticks, 33);
-        let name = &raw[f.comm.offset as usize..(f.comm.offset + f.comm.len) as usize];
+        let name = &raw[f.comm_off as usize..(f.comm_off + f.comm_len) as usize];
         assert_eq!(name, b"Web Content (tab)");
     }
 
@@ -254,19 +235,28 @@ mod tests {
     fn comm_offset_is_slot_relative() {
         let raw = b"5 (x) S 1 5 5 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 4096 0 0\n";
         let f = parse_stat(raw).expect("parse");
-        assert_eq!(f.comm.offset, 3); // '(' at index 2, comm 'x' at 3
-        assert_eq!(f.comm.len, 1);
+        assert_eq!(f.comm_off, 3); // '(' at index 2, comm 'x' at 3
+        assert_eq!(f.comm_len, 1);
     }
 
     #[test]
-    fn write_into_copies_comm_into_arena() {
+    fn write_into_copies_comm_inline() {
         let raw = b"5 (x) S 1 5 5 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 4096 0 0\n";
         let f = parse_stat(raw).expect("parse");
-        let mut arena = HugePageBuf::new(0);
         let mut e = ProcessEntry::TOMBSTONE;
-        f.write_into(&mut e, 4096, raw, &mut arena);
-        assert_eq!(arena.get(e.name), b"x", "comm copied into the arena");
+        f.write_into(&mut e, 4096, raw);
+        assert_eq!(e.comm(), b"x", "comm copied inline into the row");
         assert_eq!(e.ppid, 1);
+    }
+
+    /// A pathologically long comm is truncated to the inline capacity, never overflowing.
+    #[test]
+    fn write_into_truncates_long_comm() {
+        let raw = b"7 (abcdefghijklmnopqrstuvwxyz) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 4096 0 0\n";
+        let f = parse_stat(raw).expect("parse");
+        let mut e = ProcessEntry::TOMBSTONE;
+        f.write_into(&mut e, 4096, raw);
+        assert_eq!(e.comm(), b"abcdefghijklmno", "comm truncated to 15 bytes");
     }
 
     #[test]

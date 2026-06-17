@@ -1,22 +1,21 @@
-//! The gatherer thread: enumerate `/proc`, read stat files (`io_uring` or syscall)
-//! into a fixed landing pad, parse into the back snapshot (copying `comm` into its
-//! string arena), compute CPU%, build the tree, and publish via `ArcSwap` using a
-//! two-buffer recycling protocol.
+//! The gatherer: enumerate `/proc`, read stat files (`io_uring` or syscall) into a fixed
+//! landing pad, parse into the live process buffer (`comm` inline), compute CPU%, build the
+//! tree. Single-threaded — the owner calls [`Gatherer::cycle`] then renders the same buffer;
+//! the borrow checker proves the two never overlap, so there is no publish, no double buffer,
+//! and no cross-thread lease.
 
 mod parse;
 mod syscall;
 mod uring;
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
-use thoop::{Arena, ByteResolver, Gen, GenStore, Ref, StrStore, StringRef};
+use thoop::{Arena, Gen, GenStore, Ref, StrStore, StringRef};
 
-use crate::snapshot::{Cmd, ProcessEntry, Snapshot, SystemStats};
+use crate::procs::{Cmd, NONE, ProcessEntry, Procs, SystemStats};
 use crate::sys::{self, ProcDir, ProcPath, RawCpuCounters, clk_tck, nofile_soft_limit};
 use crate::tree;
 use syscall::SyscallBackend;
@@ -33,14 +32,6 @@ pub const STAT_SLOT: usize = 1024;
 /// `/proc/<pid>/cmdline` slot. We never display >200 chars; if full detail is needed
 /// later, re-read via a non-batched API.
 pub const CMD_SLOT: usize = 256;
-/// Typical `comm` size for the arena reserve hint (`TASK_COMM_LEN` = 16, name ≤ 15 chars).
-/// Unlike [`STAT_SLOT`] this is **not** a hard bound: the actual copy uses `comm.len()` and
-/// the arena grows freely — see [`ARENA_BYTES_PER_PID`].
-const COMM_SLOT: usize = 16;
-/// Comm-arena bytes reserved per PID. Only `comm` lives in the per-cycle arena now —
-/// cmdline moved to the generational `Cmd` store (no per-cycle re-copy). A **reserve sizing
-/// hint only**; the arena grows freely if exceeded.
-const ARENA_BYTES_PER_PID: usize = COMM_SLOT;
 /// `io_uring` SQ depth. A new PID costs 2 SQEs (open+read), a cached PID 1; the bounded
 /// fill/reap loop submits in rounds, so this only bounds in-flight concurrency.
 const RING_ENTRIES: u32 = 4096;
@@ -50,21 +41,13 @@ const RESERVED_FDS: u64 = 64;
 /// Upper bound on the persistent-fd pool — caps held kernel `struct file`s (and the
 /// fixed-file table) even when `RLIMIT_NOFILE` is enormous.
 pub(crate) const MAX_POOL: u32 = 4096;
-/// Initial arena size per snapshot buffer (grows by doubling if exceeded).
-/// 2 MiB ≈ 2700 PIDs at default slot sizes; grows automatically.
-const INIT_BUF: usize = 2 * 1024 * 1024;
+/// Initial process-row buffer capacity (rows; grows via the arena). Sized to cover a typical
+/// box without a regrow; a busier host grows automatically.
+const INITIAL_ROWS: usize = 4096;
 
-/// Display refresh / gather cadence — the gatherer produces a snapshot this often.
+/// Display refresh / gather cadence — the loop gathers this often.
 const REFRESH_MS: u64 = 500;
 pub const REFRESH_INTERVAL: Duration = Duration::from_millis(REFRESH_MS);
-
-/// Control messages from the UI thread to the gatherer.
-pub enum Ctrl {
-    /// Gather immediately (e.g. right after a kill, so the change shows fast).
-    Refresh,
-    /// Stop the gatherer loop and exit the thread.
-    Quit,
-}
 
 /// CPU averaging / peak window as wall-clock time — the controllable knob (start:
 /// 10 s). Longer = a calmer moving average and a longer spike memory.
@@ -93,7 +76,7 @@ const CMDLINE_REFRESH_N: u32 = 16;
 type CmdStore = StrStore<CMD_SLOT, Cmd>;
 
 /// Largish initial slot count for the `Cmd` store, so it rarely grows after warmup
-/// (growth relocates + retires the old chunk via the lease — fine, but a cold path).
+/// (growth relocates the chunk and retires the old region — fine, but a cold path).
 const CMD_STORE_MIN_SLOTS: usize = 512;
 /// Largish initial slot count for the per-PID metadata store (covers all live PIDs,
 /// kthreads included). Grows via the arena if a box runs hotter.
@@ -101,13 +84,6 @@ const PIDMETA_MIN_SLOTS: usize = 2048;
 /// Initial slot count for the per-PID CPU-history store — same population as metadata (every
 /// PID, kthreads included, gets CPU tracked). Grows via the arena.
 const CPURING_MIN_SLOTS: usize = 2048;
-
-/// How many generations a demoted `Cmd` slot is held before GC may reclaim it. The live
-/// window is two snapshots (double buffer), so a lag of 2 is the minimum safe value; the
-/// `u8` generation tag has ~127 generations of headroom, so this is purely conservative
-/// margin (reclaim one generation later than strictly required, never sooner). See the GC
-/// derivation in [`Gatherer::gather`].
-const GC_LAG: u64 = 2;
 
 /// Persistent-fd pool capacity: `min(RLIMIT_NOFILE.soft − RESERVED, MAX_POOL)`, or the
 /// `ATOP_POOL_CAP` override (exercise the overflow path without touching `ulimit`).
@@ -366,16 +342,15 @@ fn rate(ticks: u64, jiff: u64) -> u32 {
 }
 
 /// Slow-changing per-PID metadata (uid + cmdline handle) on huge pages in a
-/// `GenStore<PidMeta>`. `Flat` (`Copy`) — no heap. **Gatherer-internal**: no published
-/// snapshot references a `PidMeta` slot (the snapshot carries the resolved `uid`/`cmdline`),
-/// so slots are freed immediately on death; only the cmdline *string* it points at is leased.
+/// `GenStore<PidMeta>`. `Flat` (`Copy`) — no heap. The row carries the resolved `uid` and a
+/// cmdline handle, so a dead PID's `PidMeta` slot is freed immediately (no reader leases it).
 /// The **cold** counterpart to [`CpuRing`] — a separate store so a CPU sample never loads it.
 /// Incarnation/cadence bookkeeping lives in [`PidSlot`], not here.
 #[derive(Clone, Copy)]
 struct PidMeta {
     uid: u32,
     /// Handle to this PID's cmdline in the `Cmd` store (empty for kthreads / no argv). The
-    /// slot persists across cycles; replaced (old demoted, new alive) only when the cmdline
+    /// slot persists across cycles; replaced (old freed, new alive) only when the cmdline
     /// bytes actually change — no per-cycle re-copy.
     cmd: StringRef<Cmd>,
     /// The cmdline contains a byte ≥ 0x80 (renderer unicode path).
@@ -415,7 +390,7 @@ type PidIndex = PidMap<PidSlot>;
 
 /// The unified per-PID table: one PID lookup serves every store. Owns the shared [`PidIndex`]
 /// plus the per-PID stores — the **hot** [`CpuRing`] (touched every sample), the **cold**
-/// [`PidMeta`] (uid/cmdline), and the snapshot-leased `Cmd` string store — and the CPU
+/// [`PidMeta`] (uid/cmdline), and the `Cmd` string store — and the CPU
 /// sampling clock. Replacing the former separate `CpuTracker` + `ProcCache`, it collapses the
 /// two per-PID hashmap lookups per cycle into one, and gives volatility-based update
 /// prioritization a single place to read per-PID state ([`PidSlot`]).
@@ -427,18 +402,19 @@ type PidIndex = PidMap<PidSlot>;
 /// [`MIN_SAMPLE`] (e.g. the forced one after a kill) carries the windowed values forward
 /// rather than dividing by a near-zero window.
 ///
-/// `CpuRing`/`PidMeta` are gatherer-internal → freed eagerly on death (no lease); only the
-/// cmdline string is leased. The two are *separate* stores so a CPU update loads only the hot
-/// ring, never the cold metadata.
+/// Single thread means **no lease**: a CPU/meta slot *and* a changed/dead cmdline slot are all
+/// freed immediately (render of the prior cycle finished before this gather began, so nothing
+/// reads a slot across the boundary). `CpuRing`/`PidMeta` stay *separate* stores so a CPU
+/// update loads only the hot ring, never the cold metadata.
 struct ProcTable {
-    /// PID → [`PidSlot`] (gatherer-internal; phase 6 → THP `ThpMap`).
+    /// PID → [`PidSlot`] (phase 6 → THP `ThpMap`).
     index: PidIndex,
     /// Hot per-PID CPU history on huge pages. Freed immediately on death.
     cpu: GenStore<CpuRing>,
     /// Cold per-PID metadata on huge pages. Freed immediately on death.
     meta: GenStore<PidMeta>,
-    /// Generational cmdline storage, shared across snapshots (persistent). A `StringRef<Cmd>`
-    /// in a published snapshot stays valid until GC, which lags by [`GC_LAG`] generations.
+    /// Generational cmdline storage, persistent across cycles: an unchanged cmdline keeps its
+    /// slot (no per-cycle re-copy); a changed/dead one is freed at once (no reader lease).
     cmd_store: CmdStore,
     /// Last real CPU-sample instant (the window origin); `None` until the first sample.
     last: Option<Instant>,
@@ -472,32 +448,24 @@ impl ProcTable {
         self.cmd_store.wire(arena);
     }
 
-    /// Read-only `Cmd`-store view to publish in the snapshot for UI-side resolution.
-    fn resolver(&self) -> ByteResolver<Cmd> {
-        self.cmd_store.resolver()
-    }
-
-    /// Reclaim cmdline slots whose generation the live snapshot window has passed — the only
-    /// leased store (`CpuRing`/`PidMeta` are freed eagerly on death). Cross-thread soundness:
-    /// a published snapshot only references `ALIVE` or recently-demoted slots; `min_live`
-    /// (= current gen − [`GC_LAG`]) never reaches those, so the UI thread's `resolve` reads of
-    /// leased slots never race a reclaim. Demotion flips only a slot's 1-byte tag (a distinct
-    /// memory location from its data bytes), and new interns target free/new slots no live
-    /// snapshot references. (Arena region retirement from a store relocate is reclaimed on the
-    /// same lease — see [`Gatherer::gather`].)
-    fn gc(&mut self, min_live: u64) {
-        self.cmd_store.gc(min_live);
+    /// Resolve a row's cmdline bytes directly from the `Cmd` store (`&self` read; no lease).
+    fn cmdline(&self, e: &ProcessEntry) -> &[u8] {
+        self.cmd_store.get(e.cmdline)
     }
 
     /// One per-PID pass filling CPU% + uid + cmdline, then evicting vanished PIDs — a single
     /// [`PidIndex`] lookup per PID. `now` drives the CPU window; `cur_gen` keys the cmdline
-    /// cadence and the generational lease. CPU% reads fresh every cycle; uid/cmdline read
-    /// fresh on first sighting, while settling, or on the staggered coarse tick, else reuse
-    /// the cached handle (no I/O, no copy) — an unchanged cmdline keeps its slot. Per-PID
-    /// records are copied out / written back (never held as a live `&slot` across a store op),
-    /// because any allocation may grow a store and relocate the arena.
+    /// cadence. CPU% reads fresh every cycle; uid/cmdline read fresh on first sighting, while
+    /// settling, or on the staggered coarse tick, else reuse the cached handle (no I/O, no
+    /// copy) — an unchanged cmdline keeps its slot, a changed one frees the old at once.
+    ///
+    /// Each row is **copied out by value, mutated locally, and written back** — never held as a
+    /// `&row` across a store op, because an `intern`/`insert` may grow a store and trigger an
+    /// arena repack (regime B) that relocates the row buffer's chunk. The store ops self-heal
+    /// their own bases; the only rule the caller must keep is not to span one with a live row
+    /// reference.
     #[allow(clippy::cast_possible_truncation)] // tick delta / cmdline len are bounded
-    fn update(&mut self, procs: &mut [ProcessEntry], now: Instant, cur_gen: u64) {
+    fn update(&mut self, procs: &mut Procs, now: Instant, cur_gen: u64) {
         // CPU window: real elapsed since the last sample, or `None` if too soon / first call.
         let window = self
             .last
@@ -519,9 +487,17 @@ impl ProcTable {
         } = self;
         let refresh_n = *refresh_n;
 
-        for e in procs.iter_mut() {
+        for i in 0..procs.as_slice().len() {
+            let mut e = procs.row(i); // copy out — no live row ref spans a store op below
             let pid = e.pid;
-            let prior = index.get(&pid).copied();
+            // One index probe per PID: hold the `entry` across the per-PID store work below
+            // (which borrows the sibling stores, never `index`), then write the slot back
+            // through the same entry — no second hash lookup on the common known-PID path.
+            let entry = index.entry(pid);
+            let prior: Option<PidSlot> = match &entry {
+                Entry::Occupied(o) => Some(*o.get()),
+                Entry::Vacant(_) => None,
+            };
             let reused = prior.is_some_and(|s| s.start_time != e.start_time);
             let settling = prior.is_some_and(|s| {
                 !reused && cur_gen.wrapping_sub(s.first_seen_gen) < u64::from(CMDLINE_SETTLE_GENS)
@@ -537,7 +513,7 @@ impl ProcTable {
             e.cpu_pct = ring.avg();
             e.cpu_peak = ring.peak();
 
-            // Metadata (cold): uid + cmdline on the cadence. Copy-out / write-back.
+            // Metadata (cold): uid + cmdline on the cadence.
             let stagger =
                 refresh_n <= 1 || cur_gen.wrapping_add(u64::from(pid)) % u64::from(refresh_n) == 0;
             let refresh = prior.is_none() || reused || settling || stagger;
@@ -555,31 +531,7 @@ impl ProcTable {
                 Some(s) => s.meta,
                 None => meta.insert(Gen::ALIVE, PidMeta::EMPTY),
             };
-            // Carry the cached record forward, or start fresh on reuse (demoting the dead
-            // incarnation's cmd slot first).
-            let mut pm = if reused {
-                let old_cmd = meta.get(meta_ref).cmd;
-                cmd_store.demote(old_cmd, cur_gen);
-                PidMeta::EMPTY
-            } else {
-                *meta.get(meta_ref)
-            };
-            if let Some((uid, len, non_ascii)) = fresh {
-                pm.uid = uid;
-                let new_bytes = &scratch[..len];
-                if new_bytes.is_empty() {
-                    cmd_store.demote(pm.cmd, cur_gen); // no-op if already empty
-                    pm.cmd = StringRef::EMPTY;
-                    pm.cmd_non_ascii = false;
-                } else if pm.cmd.is_empty() || cmd_store.get(pm.cmd) != new_bytes {
-                    // Changed (or first non-empty argv): new slot alive, old slot demoted.
-                    cmd_store.demote(pm.cmd, cur_gen);
-                    pm.cmd = cmd_store.intern(Gen::ALIVE, new_bytes);
-                    pm.cmd_non_ascii = non_ascii;
-                }
-                // else: unchanged — keep the existing slot (the whole point of the store).
-            }
-            meta.assign(meta_ref, pm);
+            let pm = refresh_meta(meta, cmd_store, meta_ref, reused, fresh, &scratch[..]);
 
             e.uid = pm.uid;
             e.cmdline = pm.cmd;
@@ -587,19 +539,24 @@ impl ProcTable {
                 e.non_ascii |= pm.cmd_non_ascii;
             }
 
-            index.insert(
-                pid,
-                PidSlot {
-                    cpu: cpu_ref,
-                    meta: meta_ref,
-                    start_time: e.start_time,
-                    first_seen_gen: match prior {
-                        Some(s) if !reused => s.first_seen_gen,
-                        _ => cur_gen,
-                    },
-                    seen_gen: cur_gen,
+            let slot = PidSlot {
+                cpu: cpu_ref,
+                meta: meta_ref,
+                start_time: e.start_time,
+                first_seen_gen: match prior {
+                    Some(s) if !reused => s.first_seen_gen,
+                    _ => cur_gen,
                 },
-            );
+                seen_gen: cur_gen,
+            };
+            match entry {
+                Entry::Occupied(mut o) => *o.get_mut() = slot,
+                Entry::Vacant(v) => {
+                    v.insert(slot);
+                }
+            }
+
+            procs.set(i, e); // write back
         }
 
         self.evict(cur_gen);
@@ -611,8 +568,9 @@ impl ProcTable {
         }
     }
 
-    /// Drop PIDs not seen this cycle: free their hot + cold slots (gatherer-internal,
-    /// immediate) and demote their leased cmd slot so GC reclaims it once the lease expires.
+    /// Drop PIDs not seen this cycle: free their hot + cold slots and their cmd slot. All
+    /// immediate — the dead PID's row was compacted out before this pass, so nothing references
+    /// any of its slots.
     fn evict(&mut self, cur_gen: u64) {
         let Self {
             index,
@@ -626,13 +584,51 @@ impl ProcTable {
                 true
             } else {
                 let cmd = meta.get(slot.meta).cmd;
-                cmd_store.demote(cmd, cur_gen);
+                cmd_store.free(cmd);
                 meta.free(slot.meta);
                 cpu.free(slot.cpu);
                 false
             }
         });
     }
+}
+
+/// Update a PID's cold metadata slot and return the new record (also written back). Carries
+/// the cached record forward, or resets on reuse (freeing the dead incarnation's cmd slot —
+/// immediate, no lease). A `fresh` uid/cmdline read replaces the cmd slot **only when the bytes
+/// changed** (free old, intern new); an unchanged or not-refreshed cmdline keeps its slot. The
+/// cleaned cmdline bytes are in `scratch[..len]` from a prior [`read_cmdline_uid`].
+fn refresh_meta(
+    meta: &mut GenStore<PidMeta>,
+    cmd_store: &mut CmdStore,
+    meta_ref: Ref<PidMeta>,
+    reused: bool,
+    fresh: Option<(u32, usize, bool)>,
+    scratch: &[u8],
+) -> PidMeta {
+    let mut pm = if reused {
+        cmd_store.free(meta.get(meta_ref).cmd);
+        PidMeta::EMPTY
+    } else {
+        *meta.get(meta_ref)
+    };
+    if let Some((uid, len, non_ascii)) = fresh {
+        pm.uid = uid;
+        let new_bytes = &scratch[..len];
+        if new_bytes.is_empty() {
+            cmd_store.free(pm.cmd); // no-op if already empty
+            pm.cmd = StringRef::EMPTY;
+            pm.cmd_non_ascii = false;
+        } else if pm.cmd.is_empty() || cmd_store.get(pm.cmd) != new_bytes {
+            // Changed (or first non-empty argv): free the old slot, intern the new.
+            cmd_store.free(pm.cmd);
+            pm.cmd = cmd_store.intern(Gen::ALIVE, new_bytes);
+            pm.cmd_non_ascii = non_ascii;
+        }
+        // else: unchanged — keep the existing slot (the whole point of the store).
+    }
+    meta.assign(meta_ref, pm);
+    pm
 }
 
 /// Read `/proc/<pid>/cmdline` into `scratch` and the owner `uid` from the same fd's
@@ -716,38 +712,59 @@ enum Backend {
 }
 
 impl Backend {
-    /// Re-read every live PID's stat into `snap`. Returns the overflow count (PIDs that
+    /// Build the I/O backend on the **calling thread**, which is the single thread that will
+    /// also submit on it — the `io_uring` backend's single-issuer flags bind the ring's
+    /// submitter task to its creator. Probes `io_uring` (`ATOP_FORCE_SYSCALL` or any probe
+    /// failure falls back to the syscall backend). The backend owns its own fixed landing pad,
+    /// so probing needs nothing from the process buffer.
+    fn from_config(pool_cap: u32, config: &Config) -> Backend {
+        if force_syscall() {
+            return Backend::Syscall(SyscallBackend::new(pool_cap));
+        }
+        match UringBackend::probe(pool_cap, RING_ENTRIES, config.batch_cap, config.read_slots) {
+            Some(u) => Backend::Uring(Box::new(u)),
+            None => Backend::Syscall(SyscallBackend::new(pool_cap)),
+        }
+    }
+
+    /// Re-read every live PID's stat into `procs`. Returns the overflow count (PIDs that
     /// exceeded the persistent-fd pool and used the transient fallback).
-    fn collect(
-        &mut self,
-        pids: &[u32],
-        snap: &mut Snapshot,
-        page_size: u64,
-    ) -> std::io::Result<u32> {
+    fn collect(&mut self, pids: &[u32], procs: &mut Procs, page_size: u64) -> std::io::Result<u32> {
         match self {
-            Backend::Uring(u) => u.collect(pids, snap, page_size),
-            Backend::Syscall(s) => Ok(s.collect(pids, snap, page_size)),
+            Backend::Uring(u) => u.collect(pids, procs, page_size),
+            Backend::Syscall(s) => Ok(s.collect(pids, procs, page_size)),
         }
     }
 }
 
+/// The single-threaded data producer: enumerates `/proc`, fills the live [`Procs`] buffer, and
+/// builds the tree + system stats. Owns the THP arena, the per-PID stores, the I/O backend, and
+/// the process buffer the renderer reads directly. No `ArcSwap`, no double buffer, no channel —
+/// [`cycle`](Self::cycle) runs to completion before the caller renders, so the borrow checker
+/// proves gather and render never alias.
 pub struct Gatherer {
-    arc_swap: Arc<ArcSwap<Snapshot>>,
-    recycled: Option<Arc<Snapshot>>,
+    /// Shared THP sub-allocator backing the per-PID stores **and** the process buffer.
+    /// **Boxed so it is pinned**: every store/buffer caches a `*const Arena` (set at `wire`),
+    /// so the gatherer may move freely while the arena's heap address stays fixed.
+    arena: Box<Arena>,
+    /// The live process rows on a huge page — reset and refilled each cycle, read in place.
+    procs: Procs,
+    /// I/O backend, built once on the owning thread (the sole ring submitter).
+    backend: Backend,
     proc_dir: ProcDir,
     pids: Vec<u32>,
     dent_buf: Vec<u8>,
     /// Unified per-PID table (CPU history + uid/cmdline + the shared PID index).
     table: ProcTable,
     sys_cpu: SysCpuAccum,
+    /// System-wide stats for this cycle.
+    sys: SystemStats,
+    /// Head of the root sibling chain (via `next_sibling`), or [`NONE`].
+    first_root: u32,
+    /// Live PIDs this cycle that exceeded the pool and used the transient fallback (0 common).
+    pool_overflow: u32,
     tree_stack: Vec<u32>,
     tree_order: Vec<u32>,
-    /// Shared THP sub-allocator backing the gatherer's generational stores (currently the
-    /// `Cmd` store; phases 3–6 add per-PID/CPU/index stores). **Boxed so it is pinned in
-    /// memory**: the stores cache a `*const Arena` to it (set at `wire`), so the gatherer may
-    /// move freely while the arena's address stays fixed. One per gatherer; growth is
-    /// lease-deferred so cross-thread readers stay valid.
-    arena: Box<Arena>,
     /// Persistent-fd pool capacity, retained for the mid-run `io_uring`→syscall downgrade.
     pool_cap: u32,
     config: Config,
@@ -759,82 +776,70 @@ pub struct Gatherer {
 }
 
 impl Gatherer {
-    /// Create the shared snapshot cell (the front buffer). Called on the **main** thread; the
-    /// gatherer thread then builds the rest via [`new`](Self::new). Split out because the
-    /// arena + generational stores are `!Send` — they cannot be built on one thread and moved
-    /// to another — but the UI needs the cell before the gatherer thread starts.
+    /// Build the gatherer on the **calling thread**, which must stay the only thread that uses
+    /// it: the arena + stores are `!Send`, and the `io_uring` ring binds to its creator. The
+    /// arena is boxed (pinned) so the stores/buffer can cache a `*const Arena` during `wire`.
+    /// `proc_dir` is opened by the caller (a fallible op kept out of here).
     #[must_use]
-    pub fn make_cell() -> Arc<ArcSwap<Snapshot>> {
-        Arc::new(ArcSwap::from(Arc::new(Snapshot::new(INIT_BUF))))
-    }
-
-    /// Build the gatherer on the **calling thread**, which must be the gatherer thread: its
-    /// arena + stores are `!Send`. The arena is boxed (pinned) so the stores can cache a
-    /// `*const Arena` during `wire` and the gatherer may then move freely. The I/O backend is
-    /// **not** built here — [`run`](Self::run) builds it, so the `io_uring` ring is owned by
-    /// its sole submitter. `proc_dir` is opened by the caller (a fallible op kept on main).
-    #[must_use]
-    pub fn new(page_size: u64, cell: Arc<ArcSwap<Snapshot>>, proc_dir: ProcDir) -> Self {
-        let back = Arc::new(Snapshot::new(INIT_BUF));
+    pub fn new(page_size: u64, proc_dir: ProcDir) -> Self {
         let pool_cap = pool_capacity();
+        let config = Config::from_env();
         let arena = Box::new(Arena::new(0));
         let mut table = ProcTable::new(&arena, clk_tck(), cmdline_refresh_n());
         table.wire(&arena); // arena is pinned (boxed) → stores may cache its address
+        let mut procs = Procs::new(&arena, INITIAL_ROWS);
+        procs.wire(&arena);
+        let backend = Backend::from_config(pool_cap, &config);
         Self {
-            arc_swap: cell,
-            recycled: Some(back),
+            arena,
+            procs,
+            backend,
             proc_dir,
             pids: Vec::new(),
             dent_buf: vec![0u8; 64 * 1024],
             table,
             sys_cpu: SysCpuAccum::new(),
+            sys: SystemStats::default(),
+            first_root: NONE,
+            pool_overflow: 0,
             tree_stack: Vec::new(),
             tree_order: Vec::new(),
-            arena,
             pool_cap,
-            config: Config::from_env(),
+            config,
             pid_max: sys::read_pid_max(),
             page_size,
             generation: 0,
         }
     }
 
-    /// Gatherer thread entry point and **sole ring submitter**. Builds the I/O backend on
-    /// this thread (binding the ring's single-issuer submitter task here), produces the
-    /// priming snapshot, signals `ready`, then sleeps on the control channel (zero idle CPU),
-    /// gathering on timeout or `Refresh` and exiting on `Quit`/hangup. The backend lives in
-    /// this frame and is passed to each `gather` — so it is non-optional and never escapes
-    /// the submitter thread. `ready` lets the main thread rendezvous on the first snapshot
-    /// (or observe this thread's early exit, when the sender drops).
-    pub fn run(mut self, ctrl: &Receiver<Ctrl>, interval: Duration, ready: &Sender<()>) {
-        let mut backend = self.build_backend();
-        self.gather(&mut backend); // prime
-        let _ = ready.send(()); // first snapshot published — release the main thread
-        // Exits on Quit or a hung-up channel; gathers on Refresh or interval timeout.
-        while let Ok(Ctrl::Refresh) | Err(RecvTimeoutError::Timeout) = ctrl.recv_timeout(interval) {
-            self.gather(&mut backend);
-        }
+    /// The live process rows (read by render).
+    #[must_use]
+    pub fn procs(&self) -> &Procs {
+        &self.procs
     }
 
-    /// Build the I/O backend on the **calling thread** — which must be the gatherer thread,
-    /// because the `io_uring` backend's single-issuer flags bind the ring's submitter task to
-    /// its creator. Probes `io_uring` (`ATOP_FORCE_SYSCALL` or any probe failure falls back to
-    /// the syscall backend).
-    fn build_backend(&self) -> Backend {
-        if force_syscall() {
-            return Backend::Syscall(SyscallBackend::new(self.pool_cap));
-        }
-        // The backend owns its own fixed landing pad; it no longer registers the
-        // snapshot arenas, so probing needs nothing from the snapshots.
-        match UringBackend::probe(
-            self.pool_cap,
-            RING_ENTRIES,
-            self.config.batch_cap,
-            self.config.read_slots,
-        ) {
-            Some(u) => Backend::Uring(Box::new(u)),
-            None => Backend::Syscall(SyscallBackend::new(self.pool_cap)),
-        }
+    /// System-wide stats for the latest cycle.
+    #[must_use]
+    pub fn sys(&self) -> &SystemStats {
+        &self.sys
+    }
+
+    /// Head of the root sibling chain, or [`NONE`].
+    #[must_use]
+    pub fn first_root(&self) -> u32 {
+        self.first_root
+    }
+
+    /// Live PIDs that overflowed the persistent-fd pool this cycle (0 in the common case).
+    #[must_use]
+    pub fn pool_overflow(&self) -> u32 {
+        self.pool_overflow
+    }
+
+    /// A row's cmdline bytes, resolved directly from the `Cmd` store (no lease).
+    #[must_use]
+    pub fn cmdline(&self, e: &ProcessEntry) -> &[u8] {
+        self.table.cmdline(e)
     }
 
     /// Skip-cycle birth probe (§3a): append up to `probe_width` candidate PIDs just above
@@ -868,7 +873,11 @@ impl Gatherer {
         }
     }
 
-    fn gather(&mut self, backend: &mut Backend) {
+    /// Run one gather cycle, filling [`procs`](Self::procs) + [`sys`](Self::sys) in place. The
+    /// caller renders the same buffer afterward; the two never overlap, so this needs no
+    /// publish, no swap, and no GC lease — slots are freed eagerly and retired arena regions
+    /// reclaimed at once (`min_live` = the just-finished generation).
+    pub fn cycle(&mut self) {
         // Enumeration cadence (§3): a full `getdents` re-scan every K cycles is the resync
         // that catches any birth the probe missed (non-sequential, burst > W, post-wrap);
         // skip cycles reuse the maintained live set plus a cheap sequential-birth probe.
@@ -876,107 +885,80 @@ impl Gatherer {
         // same cycle (held read → `ESRCH` → re-tombstone → compact) — the full scan is only
         // for births, never for pruning.
         if self.generation.is_multiple_of(self.config.enum_every) {
+            // Full scan: `getdents` order is unspecified, so sort (the tree build's
+            // binary-search precondition) and dedup the wholesale-replaced set.
             self.proc_dir.read_pids(&mut self.dent_buf, &mut self.pids);
+            self.pids.sort_unstable();
+            self.pids.dedup();
         } else {
+            // Skip cycle: `self.pids` is already sorted + unique (the survivor rebuild leaves
+            // it so) and the probe only appends strictly-larger candidates, so no re-sort.
             self.probe_births();
         }
-        self.pids.sort_unstable();
-        self.pids.dedup();
         let now = Instant::now();
 
-        // Reclaim the recycled buffer; skip this cycle if the UI still holds it
-        // (vanishingly rare — see take_back).
-        let Some(mut arc) = self.take_back() else {
-            return;
-        };
-        let snap = Arc::get_mut(&mut arc).expect("recycled buffer is unique");
+        // The generation being built. It advances every cycle (no skip path now), so it stays
+        // in lock-step with the per-PID cadence and the arena's region-retirement tagging.
+        let building_gen = self.generation + 1;
+        self.arena.set_gen(building_gen);
 
-        // Arena holds only the copied-out comm + re-materialized cmdline per PID now
-        // (raw stat lands in the backend's fixed read pad). A reserve hint — the arena
-        // grows freely if exceeded, since it is no longer an io_uring target.
-        let needed = self.pids.len() * ARENA_BYTES_PER_PID;
-        Self::prepare(snap, &self.pids, needed);
+        Self::prepare(&mut self.procs, &self.pids);
 
-        let overflow = if let Ok(overflow) = backend.collect(&self.pids, snap, self.page_size) {
+        let overflow = if let Ok(overflow) =
+            self.backend
+                .collect(&self.pids, &mut self.procs, self.page_size)
+        {
             overflow
         } else {
-            // io_uring failed mid-cycle: drop to syscall permanently and redo.
-            *backend = Backend::Syscall(SyscallBackend::new(self.pool_cap));
-            Self::prepare(snap, &self.pids, needed);
-            backend
-                .collect(&self.pids, snap, self.page_size)
+            // io_uring failed mid-cycle: drop to syscall permanently and redo the fill.
+            self.backend = Backend::Syscall(SyscallBackend::new(self.pool_cap));
+            Self::prepare(&mut self.procs, &self.pids);
+            self.backend
+                .collect(&self.pids, &mut self.procs, self.page_size)
                 .unwrap_or(0)
         };
-        snap.pool_overflow = overflow;
+        self.pool_overflow = overflow;
 
-        snap.compact();
+        self.procs.compact();
 
         // Rebuild the maintained live set from survivors (PID-sorted, since `compact`
         // preserves order): deaths and probe misses fall out now, confirmed births stay.
         // The next skip cycle reuses this set; the next full scan replaces it wholesale.
         self.pids.clear();
-        self.pids.extend(snap.procs.iter().map(|p| p.pid));
-
-        // The generation of the snapshot we are building. `self.generation` only advances
-        // on a successful publish, so this is one past the last published generation; a
-        // skipped cycle (take_back failed above) never reaches here, keeping the generation
-        // clock in lock-step with published snapshots — the GC lease math depends on it.
-        let building_gen = self.generation + 1;
-        self.arena.set_gen(building_gen);
+        self.pids
+            .extend(self.procs.as_slice().iter().map(|p| p.pid));
 
         // One unified per-PID pass: CPU% + uid + cmdline handle on the surviving entries (a
-        // single index lookup each), then publish the Cmd-store view for UI resolution.
-        self.table.update(&mut snap.procs, now, building_gen);
-        snap.cmd = self.table.resolver();
-        snap.first_root = tree::build(&mut snap.procs, &mut self.tree_stack, &mut self.tree_order);
-        tree::aggregate(&mut snap.procs, &self.tree_order);
+        // single index lookup each).
+        self.table.update(&mut self.procs, now, building_gen);
+        self.first_root = tree::build(
+            self.procs.as_mut_slice(),
+            &mut self.tree_stack,
+            &mut self.tree_order,
+        );
+        tree::aggregate(self.procs.as_mut_slice(), &self.tree_order);
 
         // System-wide stats (tiny reads, ~3 μs total).
-        self.sys_cpu.update(&mut snap.sys);
-        snap.count_tasks();
+        self.sys_cpu.update(&mut self.sys);
+        self.sys.set_task_counts(self.procs.count_tasks());
 
         self.generation = building_gen;
-        snap.generation = building_gen;
 
-        let prev = self.arc_swap.swap(arc);
-        self.recycled = Some(prev);
-
-        // Reclaim cmdline slots no live snapshot can reference. At end of generation N the
-        // live snapshots are N (just published) and possibly N−1 (UI not yet advanced);
-        // anything demoted at gen ≤ N−1 is referenced only by snapshots ≤ N−2, all dead
-        // (building N required the UI to have dropped N−2). `GC_LAG` (2) reclaims ≤ N−2 —
-        // one generation more conservative than strictly required. The arena GC frees any
-        // region a store relocate retired, on the same lease.
-        let min_live = self.generation.saturating_sub(GC_LAG);
-        self.table.gc(min_live);
-        self.arena.gc(min_live);
+        // Reclaim any arena region a store relocate (regime B) retired this cycle. With no
+        // reader leasing the old bytes (render of the prior cycle is finished, this cycle's
+        // is not started), `min_live` = the current generation reclaims immediately.
+        self.arena.gc(building_gen);
     }
 
-    /// Reset and pre-size the snapshot, seeding tombstones for every PID in sorted
-    /// order. The arena is no longer an `io_uring` target, so `reserve` is a pure
-    /// performance hint (avoid mid-cycle re-mmap+copy) — a grow no longer races
-    /// in-flight reads or staleness any registered buffer.
-    fn prepare(snap: &mut Snapshot, pids: &[u32], needed: usize) {
-        snap.reset();
+    /// Reset and pre-size the process buffer, seeding a tombstone for every PID in sorted
+    /// order. `reserve` keeps the per-cycle tombstone fill from relocating the buffer chunk
+    /// mid-fill — a performance choice, since a grow self-heals harmlessly.
+    fn prepare(procs: &mut Procs, pids: &[u32]) {
+        procs.clear();
+        procs.reserve(pids.len());
         for &pid in pids {
-            snap.push_tombstone(pid);
+            procs.push_tombstone(pid);
         }
-        snap.strings.reserve(needed);
-    }
-
-    /// Reclaim the back buffer with unique access. Spins briefly if the UI still
-    /// references it; gives up (caller skips the cycle) rather than ever allocating
-    /// a third, unregistered buffer.
-    fn take_back(&mut self) -> Option<Arc<Snapshot>> {
-        let mut arc = self.recycled.take()?;
-        for _ in 0..200 {
-            if Arc::get_mut(&mut arc).is_some() {
-                return Some(arc);
-            }
-            std::thread::sleep(Duration::from_micros(50));
-        }
-        self.recycled = Some(arc);
-        None
     }
 }
 
@@ -984,13 +966,11 @@ impl Gatherer {
 mod tests {
     use super::*;
 
-    /// Build a gatherer on the current (test) thread. The arena + stores are `!Send`, so they
-    /// are constructed where they are used; the boxed arena lets the returned gatherer move.
-    fn new_test() -> (Gatherer, Arc<ArcSwap<Snapshot>>) {
-        let cell = Gatherer::make_cell();
+    /// Build a gatherer on the current (test) thread (the single-threaded owner): the arena +
+    /// stores are `!Send`, so they are constructed where they are used.
+    fn new_test() -> Gatherer {
         let proc_dir = ProcDir::open().expect("open /proc");
-        let g = Gatherer::new(crate::sys::page_size(), cell.clone(), proc_dir);
-        (g, cell)
+        Gatherer::new(crate::sys::page_size(), proc_dir)
     }
 
     #[test]
@@ -1058,13 +1038,22 @@ mod tests {
         pids
     }
 
-    fn name_of(snap: &Snapshot, p: &ProcessEntry) -> String {
-        String::from_utf8_lossy(snap.strings.get(p.name)).into_owned()
+    /// A wired, arena-backed `Procs` for direct-backend tests. The returned `Box<Arena>` must
+    /// outlive the `Procs` (the buffer caches its pinned address).
+    fn test_procs() -> (Box<Arena>, Procs) {
+        let arena = Box::new(Arena::new(0));
+        let mut procs = Procs::new(&arena, 256);
+        procs.wire(&arena);
+        (arena, procs)
+    }
+
+    fn name_of(p: &ProcessEntry) -> String {
+        String::from_utf8_lossy(p.comm()).into_owned()
     }
 
     /// The `io_uring` backend must agree with the syscall oracle on stable **stat**
     /// fields for processes both scans observed. (uid/cmdline are no longer backend
-    /// fields — `ProcCache` owns them; CPU/ticks/mem can drift between scans; PID reuse
+    /// fields — the `ProcTable` owns them; CPU/ticks/mem can drift between scans; PID reuse
     /// can churn the set — so we anchor on PID 1 and self, and require broad agreement
     /// on the overlap.)
     #[test]
@@ -1073,8 +1062,8 @@ mod tests {
         let pids = enum_pids();
         let pool_cap = pool_capacity();
 
-        let mut a = Snapshot::new(INIT_BUF);
-        let mut b = Snapshot::new(INIT_BUF);
+        let (_aa, mut a) = test_procs();
+        let (_ab, mut b) = test_procs();
 
         let Some(mut uring) = UringBackend::probe(
             pool_cap,
@@ -1100,16 +1089,20 @@ mod tests {
             .expect("uring collect");
         b.compact();
 
-        assert!(b.procs.len() > 10, "uring found too few: {}", b.procs.len());
+        assert!(
+            b.as_slice().len() > 10,
+            "uring found too few: {}",
+            b.as_slice().len()
+        );
 
-        let by_pid: HashMap<u32, &ProcessEntry> = b.procs.iter().map(|p| (p.pid, p)).collect();
+        let by_pid: HashMap<u32, ProcessEntry> = b.as_slice().iter().map(|p| (p.pid, *p)).collect();
 
         let mut common = 0;
         let mut name_matches = 0;
-        for pa in &a.procs {
+        for pa in a.as_slice() {
             if let Some(pb) = by_pid.get(&pa.pid) {
                 common += 1;
-                if name_of(&a, pa) == name_of(&b, pb) {
+                if name_of(pa) == name_of(pb) {
                     name_matches += 1;
                 }
                 if pa.pid == 1 || pa.pid == std::process::id() {
@@ -1119,12 +1112,7 @@ mod tests {
                         "is_kthread mismatch for pid {}",
                         pa.pid
                     );
-                    assert_eq!(
-                        name_of(&a, pa),
-                        name_of(&b, pb),
-                        "name mismatch pid {}",
-                        pa.pid
-                    );
+                    assert_eq!(name_of(pa), name_of(pb), "name mismatch pid {}", pa.pid);
                 }
             }
         }
@@ -1141,6 +1129,7 @@ mod tests {
     /// PID across a few real sample windows.
     #[test]
     fn busy_process_reads_per_core_cpu() {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1152,14 +1141,12 @@ mod tests {
             }
         });
 
-        let (mut g, cell) = new_test();
-        let mut backend = g.build_backend();
+        let mut g = new_test();
         let me = std::process::id();
         let (mut max_cpu, mut max_peak) = (0, 0);
         for _ in 0..4 {
-            g.gather(&mut backend);
-            let snap = cell.load_full();
-            if let Some(p) = snap.procs.iter().find(|p| p.pid == me) {
+            g.cycle();
+            if let Some(p) = g.procs().as_slice().iter().find(|p| p.pid == me) {
                 max_cpu = max_cpu.max(p.cpu_pct);
                 max_peak = max_peak.max(p.cpu_peak);
             }
@@ -1180,46 +1167,44 @@ mod tests {
         );
     }
 
-    /// Full gatherer pipeline (enumerate → backend → cpu → tree → publish).
+    /// Full gather pipeline (enumerate → backend → cpu → tree).
     #[test]
-    fn gatherer_publishes_valid_snapshot() {
-        let (mut g, cell) = new_test();
-        let mut backend = g.build_backend();
-        g.gather(&mut backend);
-        let snap = cell.load_full();
+    fn gather_fills_valid_buffer() {
+        let mut g = new_test();
+        g.cycle();
+        let procs = g.procs().as_slice();
 
-        assert!(snap.generation >= 1);
-        assert!(snap.procs.len() > 10, "got {}", snap.procs.len());
-        assert!(snap.procs.iter().any(|p| p.pid == 1), "pid 1 missing");
-        assert_ne!(snap.first_root, crate::snapshot::NONE, "no roots");
+        assert!(g.generation >= 1);
+        assert!(procs.len() > 10, "got {}", procs.len());
+        assert!(procs.iter().any(|p| p.pid == 1), "pid 1 missing");
+        assert_ne!(g.first_root(), NONE, "no roots");
 
         // PIDs sorted ascending (tree binary-search precondition).
-        assert!(snap.procs.windows(2).all(|w| w[0].pid < w[1].pid));
+        assert!(procs.windows(2).all(|w| w[0].pid < w[1].pid));
 
         // Every non-root parent index is in range and resolves to the right PID.
-        for p in &snap.procs {
-            if p.parent_idx != crate::snapshot::NONE {
-                let parent = &snap.procs[p.parent_idx as usize];
+        for p in procs {
+            if p.parent_idx != NONE {
+                let parent = &procs[p.parent_idx as usize];
                 assert_eq!(parent.pid, p.ppid, "parent_idx points at wrong pid");
             }
         }
 
-        assert_eq!(snap.pool_overflow, 0, "default pool should not overflow");
+        assert_eq!(g.pool_overflow(), 0, "default pool should not overflow");
 
-        // ProcCache filled the slow fields: pid 1 is root-owned; this test process has
-        // a non-empty cmdline; kernel threads are flagged and have no cmdline.
-        let init = snap.procs.iter().find(|p| p.pid == 1).expect("pid 1");
+        // The table filled the slow fields: pid 1 is root-owned; this test process has a
+        // non-empty cmdline; kernel threads are flagged and have no cmdline.
+        let init = procs.iter().find(|p| p.pid == 1).expect("pid 1");
         assert_eq!(init.uid, 0, "pid 1 is owned by root");
 
-        let me = snap
-            .procs
+        let me = procs
             .iter()
             .find(|p| p.pid == std::process::id())
             .expect("self");
         assert!(!me.is_kthread, "the test process is not a kernel thread");
         assert!(!me.cmdline.is_empty(), "self should have a cmdline");
 
-        for p in &snap.procs {
+        for p in procs {
             if p.is_kthread {
                 assert!(
                     p.cmdline.is_empty(),
@@ -1239,101 +1224,56 @@ mod tests {
     #[allow(clippy::cast_precision_loss)] // a print, not a measurement
     fn gather_steady_state_is_cheap() {
         const ITERS: u32 = 400;
-        let (mut g, cell) = new_test();
-        let mut backend = g.build_backend();
-        g.gather(&mut backend);
-        g.gather(&mut backend); // warm up the persistent-fd pool
+        let mut g = new_test();
+        g.cycle();
+        g.cycle(); // warm up the persistent-fd pool
 
         let start = Instant::now();
         for _ in 0..ITERS {
-            g.gather(&mut backend);
+            g.cycle();
         }
         let elapsed = start.elapsed();
-        let snap = cell.load_full();
         let per_cycle_us = elapsed.as_micros() as f64 / f64::from(ITERS);
         eprintln!(
             "pids={} kthreads={} overflow={} per_cycle={per_cycle_us:.1}µs",
-            snap.procs.len(),
-            snap.procs.iter().filter(|p| p.is_kthread).count(),
-            snap.pool_overflow,
+            g.procs().as_slice().len(),
+            g.procs().as_slice().iter().filter(|p| p.is_kthread).count(),
+            g.pool_overflow(),
         );
-        assert_eq!(snap.pool_overflow, 0, "default pool should not overflow");
+        assert_eq!(g.pool_overflow(), 0, "default pool should not overflow");
     }
 
     /// cmdline survives the coarse cadence: a PID not refreshed this cycle keeps its
-    /// persistent `Cmd`-store slot, still resolvable through the new snapshot's view.
+    /// persistent `Cmd`-store slot, still resolvable directly from the store.
     #[test]
     fn cmdline_persists_across_coarse_cycles() {
-        let (mut g, cell) = new_test();
-        let mut backend = g.build_backend();
+        let mut g = new_test();
         let me = std::process::id();
-        g.gather(&mut backend);
-        let snap1 = cell.load_full();
+        g.cycle();
         let cmd1 = {
-            let p = snap1.procs.iter().find(|p| p.pid == me).expect("self c1");
-            String::from_utf8_lossy(snap1.cmdline(p)).into_owned()
+            let p = *g
+                .procs()
+                .as_slice()
+                .iter()
+                .find(|p| p.pid == me)
+                .expect("self c1");
+            String::from_utf8_lossy(g.cmdline(&p)).into_owned()
         };
         assert!(!cmd1.is_empty(), "self cmdline should be present");
 
         // A second cycle (no time for argv to change) must still resolve the cmdline from
-        // the persistent slot — no re-copy, but the new snapshot's resolver sees it.
-        g.gather(&mut backend);
-        let snap2 = cell.load_full();
+        // the persistent slot — no re-copy.
+        g.cycle();
         let cmd2 = {
-            let p = snap2.procs.iter().find(|p| p.pid == me).expect("self c2");
-            String::from_utf8_lossy(snap2.cmdline(p)).into_owned()
+            let p = *g
+                .procs()
+                .as_slice()
+                .iter()
+                .find(|p| p.pid == me)
+                .expect("self c2");
+            String::from_utf8_lossy(g.cmdline(&p)).into_owned()
         };
         assert_eq!(cmd1, cmd2, "cmdline must persist across cycles");
-    }
-
-    /// Generational lease across the double buffer: a snapshot held by the "UI" must keep
-    /// resolving a PID's cmdline even after that PID dies and a later gather evicts it —
-    /// eviction *demotes* the slot, and GC (lagging by [`GC_LAG`]) must not reclaim it while
-    /// the older snapshot still references it. This is the safety property the shared,
-    /// persistent `Cmd` store rests on (the per-snapshot arena reset could never violate it,
-    /// but a shared store can if the lease is wrong).
-    #[test]
-    fn held_snapshot_resolves_dead_pid_cmdline() {
-        let (mut g, cell) = new_test();
-        let mut backend = g.build_backend();
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let cpid = child.id();
-
-        g.gather(&mut backend); // gen 1: child alive, cmdline read fresh
-        let held = cell.load_full(); // UI leases gen 1 (and its Cmd-store slots)
-        let cmd_before = {
-            let p = held
-                .procs
-                .iter()
-                .find(|p| p.pid == cpid)
-                .expect("child in gen 1");
-            String::from_utf8_lossy(held.cmdline(p)).into_owned()
-        };
-        assert!(
-            cmd_before.contains("sleep"),
-            "child cmdline was {cmd_before:?}"
-        );
-
-        child.kill().unwrap();
-        child.wait().unwrap();
-
-        // gen 2: child gone → evicted from the cache, its cmd slot demoted at gen 2. GC runs
-        // at min_live = gen2 − GC_LAG, which cannot reach gen 2 → the slot is kept.
-        g.gather(&mut backend);
-
-        let p = held
-            .procs
-            .iter()
-            .find(|p| p.pid == cpid)
-            .expect("child still present in the held gen-1 snapshot");
-        assert_eq!(
-            String::from_utf8_lossy(held.cmdline(p)),
-            cmd_before,
-            "held snapshot must keep resolving the dead PID's cmdline (generational lease)"
-        );
     }
 
     /// The win: an unchanged cmdline is **not** re-interned each cycle, so the `Cmd` store's
@@ -1342,30 +1282,29 @@ mod tests {
     /// re-interned), the store would grow by ~one slot per userspace PID per cycle.
     #[test]
     fn cmd_store_does_not_grow_per_cycle() {
-        let (mut g, cell) = new_test();
-        let mut backend = g.build_backend();
+        let mut g = new_test();
         let me = std::process::id();
 
-        // Warm up: settle cmdlines and let births/deaths reach steady state. Drop each
-        // snapshot so the gatherer recycles buffers freely (no lease stall).
+        // Warm up: settle cmdlines and let births/deaths reach steady state.
         for _ in 0..6 {
-            g.gather(&mut backend);
-            drop(cell.load_full());
+            g.cycle();
         }
         let slots_warm = g.table.cmd_store.slot_count();
-        let userspace = {
-            let s = cell.load_full();
-            s.procs.iter().filter(|p| !p.is_kthread).count()
-        };
+        let userspace = g
+            .procs()
+            .as_slice()
+            .iter()
+            .filter(|p| !p.is_kthread)
+            .count();
 
         for _ in 0..30 {
-            g.gather(&mut backend);
-            drop(cell.load_full());
+            g.cycle();
         }
         let slots_after = g.table.cmd_store.slot_count();
 
         // Slack covers genuine churn (new userspace PIDs over ~18 s); the disaster mode
-        // would be `userspace × 30` extra slots.
+        // would be `userspace × 30` extra slots. (Freed slots are also reused now, so this is
+        // an even tighter bound than under the old demote/gc lease.)
         let growth = slots_after - slots_warm;
         assert!(
             growth <= userspace.max(64),
@@ -1373,10 +1312,14 @@ mod tests {
              unchanged cmdlines are being re-interned"
         );
 
-        // And the latest snapshot still resolves self correctly.
-        let s = cell.load_full();
-        let p = s.procs.iter().find(|p| p.pid == me).expect("self");
-        assert!(!s.cmdline(p).is_empty(), "self cmdline must resolve");
+        // And the latest buffer still resolves self correctly.
+        let p = *g
+            .procs()
+            .as_slice()
+            .iter()
+            .find(|p| p.pid == me)
+            .expect("self");
+        assert!(!g.cmdline(&p).is_empty(), "self cmdline must resolve");
     }
 
     /// §3a: a sequentially-allocated new process is caught by the skip-cycle birth probe
@@ -1384,12 +1327,14 @@ mod tests {
     /// disabled (`enum_every` huge) so the birth can *only* be found by the probe.
     #[test]
     fn birth_probe_catches_sequential_birth_within_one_cycle() {
-        let (mut g, cell) = new_test();
+        let mut g = new_test();
         g.config.enum_every = 1_000_000; // effectively no full re-scan → births only via probe
         g.config.probe_width = 1_000_000; // window spans (max_live, ns_last_pid] regardless of W
-        let mut backend = g.build_backend();
-        g.gather(&mut backend); // generation 0 → full scan seeds the maintained live set
-        assert!(cell.load().procs.iter().any(|p| p.pid == 1), "set seeded");
+        g.cycle(); // generation 0 → full scan seeds the maintained live set
+        assert!(
+            g.procs().as_slice().iter().any(|p| p.pid == 1),
+            "set seeded"
+        );
 
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -1397,8 +1342,8 @@ mod tests {
             .expect("spawn sleep");
         let child_pid = child.id();
 
-        g.gather(&mut backend); // generation 1 → SKIP cycle: probe must discover the new child
-        let caught = cell.load().procs.iter().any(|p| p.pid == child_pid);
+        g.cycle(); // generation 1 → SKIP cycle: probe must discover the new child
+        let caught = g.procs().as_slice().iter().any(|p| p.pid == child_pid);
 
         child.kill().unwrap();
         child.wait().unwrap();
@@ -1413,32 +1358,31 @@ mod tests {
     /// the next full scan, and no phantom row is left behind.
     #[test]
     fn death_caught_same_cycle_on_skip() {
-        let (mut g, cell) = new_test();
+        let mut g = new_test();
         g.config.enum_every = 1_000_000; // force skip cycles after the first
-        let mut backend = g.build_backend();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn sleep");
         let child_pid = child.id();
 
-        g.gather(&mut backend); // generation 0 → full scan sees the (still-live) child
+        g.cycle(); // generation 0 → full scan sees the (still-live) child
         assert!(
-            cell.load().procs.iter().any(|p| p.pid == child_pid),
+            g.procs().as_slice().iter().any(|p| p.pid == child_pid),
             "child must be observed while alive"
         );
 
         child.kill().unwrap();
         child.wait().unwrap();
 
-        g.gather(&mut backend); // generation 1 → SKIP cycle: held read ESRCH ⇒ death caught now
-        let snap = cell.load();
+        g.cycle(); // generation 1 → SKIP cycle: held read ESRCH ⇒ death caught now
+        let procs = g.procs().as_slice();
         assert!(
-            !snap.procs.iter().any(|p| p.pid == child_pid),
+            !procs.iter().any(|p| p.pid == child_pid),
             "death must be caught the same skip cycle, not deferred to the next full scan"
         );
         assert!(
-            snap.procs.iter().all(|p| p.state != b'?'),
+            procs.iter().all(|p| p.state != b'?'),
             "no phantom row may survive the death"
         );
     }

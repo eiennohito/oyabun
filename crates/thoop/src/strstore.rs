@@ -196,6 +196,19 @@ impl<const N: usize, S> StrStore<N, S> {
         }
     }
 
+    /// Immediately reclaim a reference's slot to the free list — no lease. No-op for the
+    /// empty ref (which owns no slot). For consumers with no cross-thread reader holding a
+    /// stale handle: a changed/dead string's slot is reusable at once (the [`demote`] +
+    /// [`gc`] path is for snapshot-leased data instead).
+    ///
+    /// [`demote`]: Self::demote
+    /// [`gc`]: Self::gc
+    pub fn free(&mut self, sr: StringRef<S>) {
+        if !sr.is_empty() {
+            self.inner.free(Ref::new(sr.idx));
+        }
+    }
+
     /// Reclaim demoted slots whose generation `min_live` has passed.
     pub fn gc(&mut self, min_live: u64) {
         self.inner.gc(min_live);
@@ -267,6 +280,24 @@ mod tests {
             assert_eq!(s.get(*r), expect.as_bytes());
         }
         assert_eq!(resolver.resolve(StringRef::EMPTY), b"");
+    }
+
+    #[test]
+    fn free_reclaims_immediately_and_ignores_empty() {
+        let arena = Arena::new(0);
+        let mut s: StrStore<32, Tag> = wired(&arena, 4);
+        let a = s.intern(Gen::ALIVE, b"first");
+        s.free(a);
+        assert_eq!(
+            s.free_count(),
+            1,
+            "freed slot returns to the free list at once"
+        );
+        let b = s.intern(Gen::ALIVE, b"second");
+        assert_eq!(s.get(b), b"second");
+        assert_eq!(s.free_count(), 0, "freed slot reused without gc");
+        s.free(StringRef::EMPTY); // owns no slot → no-op, must not panic / free slot 0
+        assert_eq!(s.free_count(), 0);
     }
 
     #[test]

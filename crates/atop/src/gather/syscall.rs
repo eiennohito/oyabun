@@ -8,16 +8,16 @@
 //! the PID was reused) the fd is reopened. When more PIDs are live than the pool can
 //! hold (low `RLIMIT_NOFILE`), the overflow falls back to transient open→read→close.
 //!
-//! Reads land in a reused scratch buffer (not the snapshot arena); `parse_stat` then
-//! copies the ~15 B `comm` into the arena. `uid`/`cmdline` are **not** read here — they
-//! are slow-changing fields owned by `ProcCache`. This backend produces only the
-//! volatile stat fields (comm + numerics, fresh every cycle).
+//! Reads land in a reused scratch buffer; `parse_stat` then copies the ~15 B `comm` inline
+//! into the process row. `uid`/`cmdline` are **not** read here — they are slow-changing
+//! fields owned by the `ProcTable`. This backend produces only the volatile stat fields
+//! (comm + numerics, fresh every cycle).
 
 use std::os::fd::RawFd;
 
 use crate::gather::parse::{self};
 use crate::gather::{PidMap, STAT_SLOT};
-use crate::snapshot::Snapshot;
+use crate::procs::Procs;
 use crate::sys::ProcPath;
 
 /// A held `/proc/<pid>/stat` fd plus the incarnation it was opened against.
@@ -51,10 +51,10 @@ impl SyscallBackend {
         }
     }
 
-    /// Re-read every live PID's stat into the snapshot. `pids` is sorted; `snap` has a
+    /// Re-read every live PID's stat into `procs`. `pids` is sorted; `procs` has a
     /// tombstone per PID at the matching index. Returns the count of PIDs that could
     /// not get a persistent slot and used the transient fallback (overflow).
-    pub fn collect(&mut self, pids: &[u32], snap: &mut Snapshot, page_size: u64) -> u32 {
+    pub fn collect(&mut self, pids: &[u32], procs: &mut Procs, page_size: u64) -> u32 {
         self.cur_gen = self.cur_gen.wrapping_add(1);
         let cur_gen = self.cur_gen;
         let mut overflow = 0u32;
@@ -64,7 +64,7 @@ impl SyscallBackend {
                 Some(h) => {
                     // SAFETY: held fd is ours; rewind to regenerate the single-show file.
                     unsafe { libc::lseek(h.fd, 0, libc::SEEK_SET) };
-                    match fill_stat(h.fd, i, snap, page_size, &mut self.scratch) {
+                    match fill_stat(h.fd, i, procs, page_size, &mut self.scratch) {
                         Some(start_time) if start_time == h.start_time => {
                             h.seen_gen = cur_gen;
                         }
@@ -77,10 +77,10 @@ impl SyscallBackend {
                             close_fd(h.fd);
                             self.held.remove(&pid);
                             if self
-                                .open_and_fill(pid, i, snap, page_size, cur_gen)
+                                .open_and_fill(pid, i, procs, page_size, cur_gen)
                                 .is_none()
                             {
-                                snap.tombstone(i); // death/reopen-fail: no phantom row
+                                procs.tombstone(i); // death/reopen-fail: no phantom row
                             }
                         }
                     }
@@ -88,10 +88,10 @@ impl SyscallBackend {
                 None => {
                     if self.held.len() < self.pool_cap {
                         if self
-                            .open_and_fill(pid, i, snap, page_size, cur_gen)
+                            .open_and_fill(pid, i, procs, page_size, cur_gen)
                             .is_none()
                         {
-                            snap.tombstone(i); // vanished before open
+                            procs.tombstone(i); // vanished before open
                         }
                     } else {
                         // Pool full: transient read, no persistent slot.
@@ -99,12 +99,12 @@ impl SyscallBackend {
                         if !read_transient(
                             pid,
                             i,
-                            snap,
+                            procs,
                             page_size,
                             &mut self.stat_path,
                             &mut self.scratch,
                         ) {
-                            snap.tombstone(i); // transient read failed
+                            procs.tombstone(i); // transient read failed
                         }
                     }
                 }
@@ -115,13 +115,13 @@ impl SyscallBackend {
         overflow
     }
 
-    /// Open `/proc/<pid>/stat`, fill the snapshot, and install the fd into the pool.
+    /// Open `/proc/<pid>/stat`, fill the row, and install the fd into the pool.
     /// Returns the parsed `start_time` on success.
     fn open_and_fill(
         &mut self,
         pid: u32,
         idx: usize,
-        snap: &mut Snapshot,
+        procs: &mut Procs,
         page_size: u64,
         cur_gen: u32,
     ) -> Option<u64> {
@@ -131,7 +131,7 @@ impl SyscallBackend {
         if fd < 0 {
             return None;
         }
-        if let Some(st) = fill_stat(fd, idx, snap, page_size, &mut self.scratch) {
+        if let Some(st) = fill_stat(fd, idx, procs, page_size, &mut self.scratch) {
             self.held.insert(
                 pid,
                 HeldFd {
@@ -174,13 +174,13 @@ fn close_fd(fd: RawFd) {
 }
 
 /// Read an open stat `fd` (positioned at 0) into `scratch`, parse it, and write the
-/// result into `snap.procs[idx]` — copying `comm` out of `scratch` into `snap.strings`.
+/// result into `procs` row `idx` — copying `comm` out of `scratch` inline into the row.
 /// Returns the parsed `start_time`, or `None` on read failure (ESRCH/EOF) or parse
 /// failure. Does **not** close `fd`.
 fn fill_stat(
     fd: RawFd,
     idx: usize,
-    snap: &mut Snapshot,
+    procs: &mut Procs,
     page_size: u64,
     scratch: &mut [u8],
 ) -> Option<u64> {
@@ -192,12 +192,7 @@ fn fill_stat(
     let len = usize::try_from(n).unwrap_or(0).min(scratch.len());
     let f = parse::parse_stat(&scratch[..len])?;
     let start_time = f.start_time;
-    f.write_into(
-        &mut snap.procs[idx],
-        page_size,
-        &scratch[..len],
-        &mut snap.strings,
-    );
+    f.write_into(procs.row_mut(idx), page_size, &scratch[..len]);
     Some(start_time)
 }
 
@@ -208,7 +203,7 @@ fn fill_stat(
 pub(crate) fn read_transient(
     pid: u32,
     idx: usize,
-    snap: &mut Snapshot,
+    procs: &mut Procs,
     page_size: u64,
     path: &mut ProcPath,
     scratch: &mut [u8],
@@ -219,7 +214,7 @@ pub(crate) fn read_transient(
     if fd < 0 {
         return false;
     }
-    let ok = fill_stat(fd, idx, snap, page_size, scratch).is_some();
+    let ok = fill_stat(fd, idx, procs, page_size, scratch).is_some();
     close_fd(fd);
     ok
 }
@@ -227,8 +222,17 @@ pub(crate) fn read_transient(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gather::INIT_BUF;
     use std::time::{Duration, Instant};
+    use thoop::Arena;
+
+    /// A wired, arena-backed `Procs` for backend tests. The returned `Box<Arena>` must be
+    /// kept alive alongside the `Procs` (the buffer caches its pinned address).
+    fn test_procs() -> (Box<Arena>, Procs) {
+        let arena = Box::new(Arena::new(0));
+        let mut procs = Procs::new(&arena, 256);
+        procs.wire(&arena);
+        (arena, procs)
+    }
 
     fn enum_pids() -> Vec<u32> {
         let dir = crate::sys::ProcDir::open().unwrap();
@@ -248,11 +252,16 @@ mod tests {
         let pids = vec![me];
         let mut backend = SyscallBackend::new(64);
 
-        let mut a = Snapshot::new(INIT_BUF);
+        let (_aa, mut a) = test_procs();
         a.push_tombstone(me);
         backend.collect(&pids, &mut a, page_size);
         a.compact();
-        let ticks1 = a.procs.iter().find(|p| p.pid == me).expect("self c1").ticks;
+        let ticks1 = a
+            .as_slice()
+            .iter()
+            .find(|p| p.pid == me)
+            .expect("self c1")
+            .ticks;
         assert_eq!(backend.held.len(), 1, "self fd held after cycle 1");
         let fd1 = backend.held[&me].fd;
 
@@ -263,11 +272,16 @@ mod tests {
         }
         std::hint::black_box(x);
 
-        let mut b = Snapshot::new(INIT_BUF);
+        let (_ab, mut b) = test_procs();
         b.push_tombstone(me);
         backend.collect(&pids, &mut b, page_size);
         b.compact();
-        let ticks2 = b.procs.iter().find(|p| p.pid == me).expect("self c2").ticks;
+        let ticks2 = b
+            .as_slice()
+            .iter()
+            .find(|p| p.pid == me)
+            .expect("self c2")
+            .ticks;
         assert_eq!(backend.held.len(), 1, "fd reused, not reopened");
         assert_eq!(
             backend.held[&me].fd, fd1,
@@ -297,7 +311,7 @@ mod tests {
             v.sort_unstable();
             v
         };
-        let mut a = Snapshot::new(INIT_BUF);
+        let (_aa, mut a) = test_procs();
         for &p in &pids {
             a.push_tombstone(p);
         }
@@ -309,7 +323,7 @@ mod tests {
 
         // Next cycle enumerates only self → the child's fd is evicted.
         let only_me = vec![me];
-        let mut b = Snapshot::new(INIT_BUF);
+        let (_ab, mut b) = test_procs();
         b.push_tombstone(me);
         backend.collect(&only_me, &mut b, page_size);
         assert_eq!(backend.held.len(), 1, "vanished PID evicted");
@@ -323,7 +337,7 @@ mod tests {
         let page_size = crate::sys::page_size();
         let pids = enum_pids();
         let mut backend = SyscallBackend::new(4);
-        let mut a = Snapshot::new(INIT_BUF);
+        let (_arena, mut a) = test_procs();
         for &p in &pids {
             a.push_tombstone(p);
         }
@@ -334,7 +348,7 @@ mod tests {
         assert!(overflow > 0, "pool_cap=4 must overflow");
         assert_eq!(backend.held.len(), 4, "pool holds exactly its capacity");
         assert!(
-            a.procs.iter().any(|p| p.pid == 1),
+            a.as_slice().iter().any(|p| p.pid == 1),
             "pid 1 present despite overflow"
         );
     }
@@ -357,7 +371,7 @@ mod tests {
         let mut pids = vec![me, dead];
         pids.sort_unstable();
         let mut backend = SyscallBackend::new(64);
-        let mut a = Snapshot::new(INIT_BUF);
+        let (_arena, mut a) = test_procs();
         for &p in &pids {
             a.push_tombstone(p);
         }
@@ -365,15 +379,15 @@ mod tests {
         a.compact();
 
         assert!(
-            a.procs.iter().any(|p| p.pid == me),
+            a.as_slice().iter().any(|p| p.pid == me),
             "live self must survive"
         );
         assert!(
-            !a.procs.iter().any(|p| p.pid == dead),
+            !a.as_slice().iter().any(|p| p.pid == dead),
             "dead PID must be tombstoned, not left as a phantom row"
         );
         assert!(
-            a.procs.iter().all(|p| p.state != b'?'),
+            a.as_slice().iter().all(|p| p.state != b'?'),
             "no phantom row (state '?') may survive compact"
         );
     }

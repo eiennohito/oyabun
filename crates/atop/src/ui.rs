@@ -19,7 +19,7 @@ use std::io::Write;
 use etch::{Cell, ColSpec, Color, Frame, Schema, Style};
 
 use crate::app::App;
-use crate::snapshot::{NONE, SystemStats};
+use crate::procs::{NONE, SystemStats};
 
 /// Number of terminal rows consumed by the system stats header.
 pub const HEADER_LINES: u16 = 3;
@@ -48,15 +48,15 @@ pub fn columns() -> Schema {
 
 pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
     let (width, height) = frame.size();
-    let snap = app.snapshot();
+    let sys = *app.sys();
     let wsz = width as usize;
 
     // Each stat line is gated on the values that feed it: a width change forces a full
     // repaint anyway, so the data alone is the gate. On interactive (non-gather) frames
     // the build closures never run — no `format!`, no allocation.
-    frame.line(0, snap.sys, |l| build_cpu_line(l, &snap.sys, wsz));
-    frame.line(1, snap.sys, |l| build_mem_line(l, &snap.sys, wsz));
-    frame.line(2, snap.sys, |l| build_info_line(l, &snap.sys));
+    frame.line(0, sys, |l| build_cpu_line(l, &sys, wsz));
+    frame.line(1, sys, |l| build_mem_line(l, &sys, wsz));
+    frame.line(2, sys, |l| build_info_line(l, &sys));
     frame.header(HEADER_LINES, schema, HEADER_STYLE);
 
     let body_height = height.saturating_sub(CHROME_LINES);
@@ -64,7 +64,11 @@ pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
 
     let footer_row = height.saturating_sub(1);
     let row_count = app.rows().len();
-    frame.line(footer_row, row_count, |l| build_footer(l, row_count));
+    let overflow = app.pool_overflow();
+    // Gate on both, so an overflow change repaints the footer.
+    frame.line(footer_row, (row_count, overflow), |l| {
+        build_footer(l, row_count, overflow);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -163,11 +167,18 @@ fn build_info_line(l: &mut etch::Line, sys: &SystemStats) {
     l.fill(' ');
 }
 
-fn build_footer(l: &mut etch::Line, visible_rows: usize) {
+fn build_footer(l: &mut etch::Line, visible_rows: usize, pool_overflow: u32) {
     let text = format!(
         " Rows: {visible_rows} | q:quit k:kill ↑↓:scroll Enter/→:expand ←:collapse PgUp/PgDn Home/End"
     );
     l.span(&text, Color::DarkGrey);
+    // A low `RLIMIT_NOFILE` is the only realistic cause; surface it rather than degrade silently.
+    if pool_overflow > 0 {
+        l.span(
+            &format!(" [!{pool_overflow} fd-overflow: raise ulimit -n]"),
+            Color::Yellow,
+        );
+    }
     l.fill(' ');
 }
 
@@ -176,14 +187,14 @@ fn build_footer(l: &mut etch::Line, visible_rows: usize) {
 // ---------------------------------------------------------------------------
 
 fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_height: u16) {
-    let snap = app.snapshot();
+    let procs = app.procs().as_slice();
     let scroll = app.scroll();
     let rows = app.rows();
 
     // Phase 1: advance guide state over rows above the viewport (no rendering).
     let mut guides: Vec<bool> = Vec::with_capacity(16);
     for row in rows.iter().take(scroll) {
-        let p = &snap.procs[row.proc_idx];
+        let p = &procs[row.proc_idx];
         advance_guides(&mut guides, row.depth as usize, p.next_sibling != NONE);
     }
 
@@ -195,7 +206,7 @@ fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_
             .skip(scroll)
             .take(body_height as usize)
         {
-            let p = &snap.procs[row.proc_idx];
+            let p = &procs[row.proc_idx];
             let depth = row.depth as usize;
             let has_children = p.first_child != NONE;
             let has_next = p.next_sibling != NONE;
@@ -218,9 +229,9 @@ fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_
             );
             advance_guides(&mut guides, depth, has_next);
 
-            let cmdline = snap.cmdline(p);
+            let cmdline = app.cmdline(p);
             let (text, is_name) = if cmdline.is_empty() {
-                (snap.name(p), true)
+                (p.comm(), true)
             } else {
                 (cmdline, false)
             };
@@ -243,8 +254,8 @@ fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_
                 r.field(Pct(cpu));
                 r.field(Pct(peak));
                 r.field(Mem(mem));
-                // Command: content hash (arena offsets aren't stable across snapshots)
-                // + tree prefix + collapse suffix.
+                // Command: content hash (a changed cmdline reuses a freed store slot, so the
+                // handle isn't a stable content identity) + tree prefix + collapse suffix.
                 r.fill(
                     (prefix.as_str(), text, is_name, suffix_n),
                     |c: &mut Cell| {

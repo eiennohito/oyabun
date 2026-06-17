@@ -97,6 +97,15 @@ impl<T: Flat> TypedBuf<T> {
         self.len = 0;
     }
 
+    /// Shrink to `len` elements, dropping the tail. O(1), no drops (`T: Copy`). A `len`
+    /// larger than the current length is ignored (truncate never grows). The compaction
+    /// primitive: an in-place retain writes survivors into the prefix, then truncates.
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.len {
+            self.len = len;
+        }
+    }
+
     /// Ensure room for at least `min_capacity` elements, relocating if short.
     pub fn reserve(&mut self, min_capacity: usize) {
         if min_capacity > self.cap {
@@ -164,6 +173,25 @@ mod tests {
         assert_eq!(b.len(), 0);
         b.push(5);
         assert_eq!(b.as_slice()[0], 5, "reuse after clear starts at 0");
+    }
+
+    #[test]
+    fn truncate_shrinks_only() {
+        let arena = Arena::new(0);
+        let mut b: TypedBuf<u32> = wired(&arena, 4);
+        for i in 0..10u32 {
+            b.push(i);
+        }
+        b.truncate(3);
+        assert_eq!(b.as_slice(), &[0, 1, 2]);
+        b.truncate(99); // larger than len → ignored
+        assert_eq!(b.len(), 3);
+        b.push(42);
+        assert_eq!(
+            b.as_slice(),
+            &[0, 1, 2, 42],
+            "truncate leaves the tail reusable"
+        );
     }
 
     /// Oracle: random push/clear/index churn matches a `Vec`, across growth relocations.

@@ -73,6 +73,17 @@ impl App {
         self.gatherer.pool_overflow()
     }
 
+    /// Whether the privileged BPF observation source is active.
+    pub fn is_privileged(&self) -> bool {
+        self.gatherer.is_privileged()
+    }
+
+    /// Short-lived processes (born+died between cycles) caught by BPF fork/exit events this
+    /// cycle — invisible to a snapshot-only tool. Always 0 in `/proc` mode.
+    pub fn short_lived(&self) -> u32 {
+        self.gatherer.short_lived()
+    }
+
     pub fn selected(&self) -> usize {
         self.selected
     }

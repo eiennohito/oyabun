@@ -4,6 +4,8 @@
 //! the borrow checker proves the two never overlap, so there is no publish, no double buffer,
 //! and no cross-thread lease.
 
+#[cfg(feature = "bpf")]
+mod bpf;
 mod parse;
 mod syscall;
 mod uring;
@@ -425,13 +427,18 @@ struct ProcTable {
     last: Option<Instant>,
     clk_tck: u64,
     refresh_n: u32,
+    /// The active source already fills the row's `uid` (the BPF task iterator carries it), so
+    /// the cmdline read here must **not** overwrite it — a failed/permission-denied cmdline
+    /// open would otherwise clobber a good uid with `u32::MAX`. The `/proc` path leaves this
+    /// `false`: there, uid has no source but this table's cmdline-fd `fstat`.
+    source_provides_uid: bool,
     cmd_path: ProcPath,
     /// Reused read buffer for `/proc/<pid>/cmdline` (no per-cycle allocation).
     scratch: Vec<u8>,
 }
 
 impl ProcTable {
-    fn new(arena: &Arena, clk_tck: u64, refresh_n: u32) -> Self {
+    fn new(arena: &Arena, clk_tck: u64, refresh_n: u32, source_provides_uid: bool) -> Self {
         Self {
             index: PidIndex::new(arena, PIDINDEX_MIN_CAP),
             cpu: GenStore::new(arena, CPURING_MIN_SLOTS),
@@ -440,6 +447,7 @@ impl ProcTable {
             last: None,
             clk_tck,
             refresh_n,
+            source_provides_uid,
             cmd_path: ProcPath::new(),
             scratch: vec![0u8; CMD_SLOT],
         }
@@ -540,7 +548,11 @@ impl ProcTable {
             };
             let pm = self.refresh_meta(meta_ref, reused, fresh);
 
-            e.uid = pm.uid;
+            // uid: the BPF source already set it on the row; the `/proc` source has no other
+            // source than this table's read, so take it from the refreshed metadata.
+            if !self.source_provides_uid {
+                e.uid = pm.uid;
+            }
             e.cmdline = pm.cmd;
             if !pm.cmd.is_empty() {
                 e.non_ascii |= pm.cmd_non_ascii;
@@ -770,109 +782,117 @@ impl Backend {
     }
 }
 
-/// The single-threaded data producer: enumerates `/proc`, fills the live [`Procs`] buffer, and
-/// builds the tree + system stats. Owns the THP arena, the per-PID stores, the I/O backend, and
-/// the process buffer the renderer reads directly. No `ArcSwap`, no double buffer, no channel —
-/// [`cycle`](Self::cycle) runs to completion before the caller renders, so the borrow checker
-/// proves gather and render never alias.
-pub struct Gatherer {
-    /// Shared THP sub-allocator backing the per-PID stores **and** the process buffer.
-    /// **Boxed so it is pinned**: every store/buffer caches a `*const Arena` (set at `wire`),
-    /// so the gatherer may move freely while the arena's heap address stays fixed.
-    arena: Box<Arena>,
-    /// The live process rows on a huge page — reset and refilled each cycle, read in place.
-    procs: Procs,
+/// The unprivileged `/proc` observation source: maintained live set + cadenced `getdents`
+/// re-scan + skip-cycle birth probe, with an `io_uring`/syscall [`Backend`] reading each PID's
+/// stat. This is everything the gatherer's cycle does *before* the per-PID table / tree build —
+/// extracted so a privileged [`Source`] can replace the whole enumerate-and-read step.
+struct ProcState {
     /// I/O backend, built once on the owning thread (the sole ring submitter).
     backend: Backend,
     proc_dir: ProcDir,
     pids: Vec<u32>,
     dent_buf: Vec<u8>,
-    /// Unified per-PID table (CPU history + uid/cmdline + the shared PID index).
-    table: ProcTable,
-    sys_cpu: SysCpuAccum,
-    /// System-wide stats for this cycle.
-    sys: SystemStats,
-    /// Head of the root sibling chain (via `next_sibling`), or [`NONE`].
-    first_root: u32,
-    /// Live PIDs this cycle that exceeded the pool and used the transient fallback (0 common).
-    pool_overflow: u32,
-    tree_stack: Vec<u32>,
-    tree_order: Vec<u32>,
     /// Persistent-fd pool capacity, retained for the mid-run `io_uring`→syscall downgrade.
     pool_cap: u32,
     config: Config,
     /// `pid_max` (the PID-counter wrap point), read once at startup — bounds the probe
     /// window so it never generates an impossible PID.
     pid_max: u32,
-    page_size: u64,
-    generation: u64,
 }
 
-impl Gatherer {
-    /// Build the gatherer on the **calling thread**, which must stay the only thread that uses
-    /// it: the arena + stores are `!Send`, and the `io_uring` ring binds to its creator. The
-    /// arena is boxed (pinned) so the stores/buffer can cache a `*const Arena` during `wire`.
-    /// `proc_dir` is opened by the caller (a fallible op kept out of here).
-    #[must_use]
-    pub fn new(page_size: u64, proc_dir: ProcDir) -> Self {
+impl ProcState {
+    fn new(proc_dir: ProcDir) -> Self {
         let pool_cap = pool_capacity();
         let config = Config::from_env();
-        let arena = Box::new(Arena::new(0));
-        let mut table = ProcTable::new(&arena, clk_tck(), cmdline_refresh_n());
-        table.wire(&arena); // arena is pinned (boxed) → stores may cache its address
-        let mut procs = Procs::new(&arena, INITIAL_ROWS);
-        procs.wire(&arena);
         let backend = Backend::from_config(pool_cap, &config);
         Self {
-            arena,
-            procs,
             backend,
             proc_dir,
             pids: Vec::new(),
             dent_buf: vec![0u8; 64 * 1024],
-            table,
-            sys_cpu: SysCpuAccum::new(),
-            sys: SystemStats::default(),
-            first_root: NONE,
-            pool_overflow: 0,
-            tree_stack: Vec::new(),
-            tree_order: Vec::new(),
             pool_cap,
             config,
             pid_max: sys::read_pid_max(),
-            page_size,
-            generation: 0,
         }
     }
 
-    /// The live process rows (read by render).
-    #[must_use]
-    pub fn procs(&self) -> &Procs {
-        &self.procs
-    }
+    /// Fill `procs` with the live set's stat fields, leaving it **compacted and PID-sorted**.
+    /// `prev_gen` (the just-finished generation) drives the enumeration cadence and the
+    /// skip-cycle leader gate; `index` is the per-PID table's index, read by that gate to tell
+    /// a known PID from a probe-introduced non-leader thread. Returns the sample instant and
+    /// the pool-overflow count.
+    fn populate(
+        &mut self,
+        procs: &mut Procs,
+        index: &PidIndex,
+        page_size: u64,
+        prev_gen: u64,
+    ) -> (Instant, u32) {
+        // Enumeration cadence (§3): a full `getdents` re-scan every K cycles is the resync
+        // that catches any birth the probe missed (non-sequential, burst > W, post-wrap);
+        // skip cycles reuse the maintained live set plus a cheap sequential-birth probe.
+        // The set is rebuilt from survivors below, so deaths drop the same cycle (held read →
+        // `ESRCH` → re-tombstone → compact) — the full scan is only for births, never pruning.
+        if prev_gen.is_multiple_of(self.config.enum_every) {
+            self.proc_dir.read_pids(&mut self.dent_buf, &mut self.pids);
+            self.pids.sort_unstable();
+            self.pids.dedup();
+        } else {
+            self.probe_births();
+        }
+        let now = Instant::now();
 
-    /// System-wide stats for the latest cycle.
-    #[must_use]
-    pub fn sys(&self) -> &SystemStats {
-        &self.sys
-    }
+        Self::prepare(procs, &self.pids);
 
-    /// Head of the root sibling chain, or [`NONE`].
-    #[must_use]
-    pub fn first_root(&self) -> u32 {
-        self.first_root
-    }
+        let overflow = if let Ok(overflow) = self.backend.collect(&self.pids, procs, page_size) {
+            overflow
+        } else {
+            // io_uring failed mid-cycle: drop to syscall permanently and redo the fill.
+            self.backend = Backend::Syscall(SyscallBackend::new(self.pool_cap));
+            Self::prepare(procs, &self.pids);
+            self.backend
+                .collect(&self.pids, procs, page_size)
+                .unwrap_or(0)
+        };
 
-    /// Live PIDs that overflowed the persistent-fd pool this cycle (0 in the common case).
-    #[must_use]
-    pub fn pool_overflow(&self) -> u32 {
-        self.pool_overflow
-    }
+        // Before compact: rows with real PIDs but unfilled (state='?' = TOMBSTONE default) are
+        // rows `fill` never submitted a read for AND never tombstoned.
+        #[cfg(debug_assertions)]
+        {
+            for (i, r) in procs.as_slice().iter().enumerate() {
+                if r.pid != 0 && r.state == b'?' {
+                    eprintln!(
+                        "[UNFILLED] idx={i} pid={} ppid={} state=? mem={} ticks={} start_time={}",
+                        r.pid, r.ppid, r.mem_bytes, r.ticks, r.start_time,
+                    );
+                }
+            }
+        }
 
-    /// A row's cmdline bytes, resolved directly from the `Cmd` store (no lease).
-    #[must_use]
-    pub fn cmdline(&self, e: &ProcessEntry) -> &[u8] {
-        self.table.cmdline(e)
+        procs.compact();
+
+        // Thread-leader backstop (syscall backend): the uring backend rejects non-leader
+        // threads inline; the syscall backend has no inline filter, so this post-compact pass
+        // catches any non-leader thread a probe introduced (uring: a no-op — already gone).
+        if !prev_gen.is_multiple_of(self.config.enum_every) {
+            let mut re_compact = false;
+            for row in procs.as_mut_slice() {
+                if index.get(row.pid).is_none() && !sys::is_thread_group_leader(row.pid) {
+                    row.pid = 0;
+                    re_compact = true;
+                }
+            }
+            if re_compact {
+                procs.compact();
+            }
+        }
+
+        // Rebuild the maintained live set from survivors (PID-sorted, since `compact` preserves
+        // order): deaths and probe misses fall out now, confirmed births stay.
+        self.pids.clear();
+        self.pids.extend(procs.as_slice().iter().map(|p| p.pid));
+
+        (now, overflow)
     }
 
     /// Skip-cycle birth probe (§3a): append up to `probe_width` candidate PIDs just above
@@ -882,14 +902,10 @@ impl Gatherer {
     /// join the maintained set, misses fail their open and are re-tombstoned (§3b, the
     /// hygiene that makes speculative opens safe). In steady state `ns_last_pid` equals our
     /// max, so the window is empty and the probe costs **zero** opens. A burst > W, a
-    /// non-sequential birth, or a post-wrap low PID (the live max cannot follow the counter
-    /// below itself) waits for the next full scan — a probe hit-rate, never a correctness,
-    /// concern, because the full scan is the backstop.
+    /// non-sequential birth, or a post-wrap low PID waits for the next full scan — a probe
+    /// hit-rate, never a correctness, concern, because the full scan is the backstop.
     ///
-    /// **Precondition**: `self.pids` is sorted ascending and holds the current live set —
-    /// the probe reads the max (`last`) as its anchor and appends strictly-larger candidates
-    /// to stay sorted. The survivor rebuild after `compact` upholds this. `ns_last_pid` is
-    /// read from the gatherer's own PID namespace (the only one whose numbering it tracks).
+    /// **Precondition**: `self.pids` is sorted ascending and holds the current live set.
     fn probe_births(&mut self) {
         debug_assert!(
             self.pids.windows(2).all(|w| w[0] <= w[1]),
@@ -913,92 +929,210 @@ impl Gatherer {
         }
     }
 
+    /// Reset and pre-size the process buffer, seeding a tombstone for every PID in sorted
+    /// order. `reserve` keeps the per-cycle tombstone fill from relocating the buffer chunk
+    /// mid-fill — a performance choice, since a grow self-heals harmlessly.
+    fn prepare(procs: &mut Procs, pids: &[u32]) {
+        procs.clear();
+        procs.reserve(pids.len());
+        for &pid in pids {
+            procs.push_tombstone(pid);
+        }
+    }
+}
+
+/// Where the live process rows come from. Selected once at startup ([`Gatherer::with_source`]):
+/// the privileged BPF source if it loads (caps present), else the unprivileged `/proc` source.
+/// The rest of a cycle — the per-PID table, tree build, system stats — is source-agnostic.
+enum Source {
+    Proc(Box<ProcState>),
+    #[cfg(feature = "bpf")]
+    Bpf(Box<bpf::BpfSource>),
+}
+
+/// The single-threaded data producer: fills the live [`Procs`] buffer from a [`Source`], then
+/// builds the per-PID table + tree + system stats. Owns the THP arena, the per-PID stores, and
+/// the process buffer the renderer reads directly. No `ArcSwap`, no double buffer, no channel —
+/// [`cycle`](Self::cycle) runs to completion before the caller renders, so the borrow checker
+/// proves gather and render never alias.
+pub struct Gatherer {
+    /// Shared THP sub-allocator backing the per-PID stores **and** the process buffer.
+    /// **Boxed so it is pinned**: every store/buffer caches a `*const Arena` (set at `wire`),
+    /// so the gatherer may move freely while the arena's heap address stays fixed.
+    arena: Box<Arena>,
+    /// The live process rows on a huge page — reset and refilled each cycle, read in place.
+    procs: Procs,
+    /// The observation source (privileged BPF or unprivileged `/proc`), chosen at startup.
+    source: Source,
+    /// Unified per-PID table (CPU history + uid/cmdline + the shared PID index).
+    table: ProcTable,
+    sys_cpu: SysCpuAccum,
+    /// System-wide stats for this cycle.
+    sys: SystemStats,
+    /// Head of the root sibling chain (via `next_sibling`), or [`NONE`].
+    first_root: u32,
+    /// Live PIDs this cycle that exceeded the pool and used the transient fallback (0 common;
+    /// `/proc` source only — the BPF source has no fd pool).
+    pool_overflow: u32,
+    /// Processes that were born and died between this and the previous cycle, caught only by
+    /// the BPF fork/exit events (the snapshot never saw them). 0 in `/proc` mode.
+    short_lived: u32,
+    tree_stack: Vec<u32>,
+    tree_order: Vec<u32>,
+    page_size: u64,
+    generation: u64,
+}
+
+impl Gatherer {
+    /// Build the gatherer on the **calling thread**, which must stay the only thread that uses
+    /// it: the arena + stores are `!Send`, and the `io_uring` ring binds to its creator. The
+    /// arena is boxed (pinned) so the stores/buffer can cache a `*const Arena` during `wire`.
+    /// Probes the privileged BPF source first; on success the `/proc` backend is never built.
+    /// `proc_dir` is opened by the caller (a fallible op kept out of here).
+    #[must_use]
+    pub fn new(page_size: u64, proc_dir: ProcDir) -> Self {
+        Self::with_source(page_size, proc_dir, true)
+    }
+
+    /// Like [`new`](Self::new) but `allow_bpf` gates the privileged probe — `false` forces the
+    /// `/proc` source (the proc-path tests assert proc-specific behaviour and must not flip to
+    /// BPF when run under `caprun`).
+    fn with_source(page_size: u64, proc_dir: ProcDir, allow_bpf: bool) -> Self {
+        let clk_tck = clk_tck();
+        let arena = Box::new(Arena::new(0));
+
+        // Probe the privileged source first; its presence decides who owns uid. Its landing
+        // buffer is allocated in the shared arena (wired below, once the arena is pinned).
+        #[cfg(feature = "bpf")]
+        let bpf = if allow_bpf {
+            bpf::BpfSource::probe(&arena, page_size, clk_tck)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "bpf"))]
+        let bpf: Option<std::convert::Infallible> = {
+            let _ = allow_bpf;
+            None
+        };
+
+        let source_provides_uid = bpf.is_some();
+
+        let mut table = ProcTable::new(&arena, clk_tck, cmdline_refresh_n(), source_provides_uid);
+        table.wire(&arena); // arena is pinned (boxed) → stores may cache its address
+        let mut procs = Procs::new(&arena, INITIAL_ROWS);
+        procs.wire(&arena);
+
+        let source = match bpf {
+            #[cfg(feature = "bpf")]
+            Some(mut b) => {
+                b.wire(&arena); // bind the landing buffer now that the arena is pinned
+                Source::Bpf(Box::new(b))
+            }
+            None => Source::Proc(Box::new(ProcState::new(proc_dir))),
+        };
+
+        Self {
+            arena,
+            procs,
+            source,
+            table,
+            sys_cpu: SysCpuAccum::new(),
+            sys: SystemStats::default(),
+            first_root: NONE,
+            pool_overflow: 0,
+            short_lived: 0,
+            tree_stack: Vec::new(),
+            tree_order: Vec::new(),
+            page_size,
+            generation: 0,
+        }
+    }
+
+    /// The live process rows (read by render).
+    #[must_use]
+    pub fn procs(&self) -> &Procs {
+        &self.procs
+    }
+
+    /// System-wide stats for the latest cycle.
+    #[must_use]
+    pub fn sys(&self) -> &SystemStats {
+        &self.sys
+    }
+
+    /// Head of the root sibling chain, or [`NONE`].
+    #[must_use]
+    pub fn first_root(&self) -> u32 {
+        self.first_root
+    }
+
+    /// Live PIDs that overflowed the persistent-fd pool this cycle (0 in the common case;
+    /// always 0 in privileged mode — there is no fd pool).
+    #[must_use]
+    pub fn pool_overflow(&self) -> u32 {
+        self.pool_overflow
+    }
+
+    /// Short-lived processes (born+died between cycles) caught by the BPF fork/exit events
+    /// this cycle — invisible to a snapshot-only tool. Always 0 in `/proc` mode.
+    #[must_use]
+    pub fn short_lived(&self) -> u32 {
+        self.short_lived
+    }
+
+    /// Whether the privileged BPF source is active.
+    #[must_use]
+    #[cfg_attr(not(feature = "bpf"), allow(clippy::unused_self))] // always false without the feature
+    pub fn is_privileged(&self) -> bool {
+        #[cfg(feature = "bpf")]
+        {
+            matches!(self.source, Source::Bpf(_))
+        }
+        #[cfg(not(feature = "bpf"))]
+        {
+            false
+        }
+    }
+
+    /// A row's cmdline bytes, resolved directly from the `Cmd` store (no lease).
+    #[must_use]
+    pub fn cmdline(&self, e: &ProcessEntry) -> &[u8] {
+        self.table.cmdline(e)
+    }
+
     /// Run one gather cycle, filling [`procs`](Self::procs) + [`sys`](Self::sys) in place. The
     /// caller renders the same buffer afterward; the two never overlap, so this needs no
     /// publish, no swap, and no GC lease — slots are freed eagerly and retired arena regions
     /// reclaimed at once (`min_live` = the just-finished generation).
     pub fn cycle(&mut self) {
-        // Enumeration cadence (§3): a full `getdents` re-scan every K cycles is the resync
-        // that catches any birth the probe missed (non-sequential, burst > W, post-wrap);
-        // skip cycles reuse the maintained live set plus a cheap sequential-birth probe.
-        // `self.pids` is rebuilt from survivors after `compact` (below), so deaths drop the
-        // same cycle (held read → `ESRCH` → re-tombstone → compact) — the full scan is only
-        // for births, never for pruning.
-        if self.generation.is_multiple_of(self.config.enum_every) {
-            self.proc_dir.read_pids(&mut self.dent_buf, &mut self.pids);
-            self.pids.sort_unstable();
-            self.pids.dedup();
-        } else {
-            self.probe_births();
-        }
-        let now = Instant::now();
-
-        // The generation being built. It advances every cycle (no skip path now), so it stays
-        // in lock-step with the per-PID cadence and the arena's region-retirement tagging.
+        // The generation being built. It advances every cycle, in lock-step with the per-PID
+        // cadence and the arena's region-retirement tagging.
         let building_gen = self.generation + 1;
         self.arena.set_gen(building_gen);
 
-        Self::prepare(&mut self.procs, &self.pids);
-
-        let overflow = if let Ok(overflow) =
-            self.backend
-                .collect(&self.pids, &mut self.procs, self.page_size)
-        {
-            overflow
-        } else {
-            // io_uring failed mid-cycle: drop to syscall permanently and redo the fill.
-            self.backend = Backend::Syscall(SyscallBackend::new(self.pool_cap));
-            Self::prepare(&mut self.procs, &self.pids);
-            self.backend
-                .collect(&self.pids, &mut self.procs, self.page_size)
-                .unwrap_or(0)
+        // Source-specific: fill `procs` with the live set (compacted, PID-sorted). The `/proc`
+        // source enumerates + reads stat; the BPF source reads the task iterator + drains the
+        // fork/exit ring. Both leave the same shape for the common tail below.
+        let (now, pool_overflow, short_lived) = match &mut self.source {
+            Source::Proc(p) => {
+                let (now, overflow) = p.populate(
+                    &mut self.procs,
+                    &self.table.index,
+                    self.page_size,
+                    self.generation,
+                );
+                (now, overflow, 0)
+            }
+            #[cfg(feature = "bpf")]
+            Source::Bpf(b) => {
+                let (now, short_lived) = b.populate(&mut self.procs);
+                (now, 0, short_lived)
+            }
         };
-        self.pool_overflow = overflow;
+        self.pool_overflow = pool_overflow;
+        self.short_lived = short_lived;
 
-        // Before compact: find rows with real PIDs but unfilled (state='?' = TOMBSTONE default).
-        // These are rows that `fill` never submitted a read for AND never tombstoned.
-        #[cfg(debug_assertions)]
-        {
-            let rows = self.procs.as_slice();
-            for (i, r) in rows.iter().enumerate() {
-                if r.pid != 0 && r.state == b'?' {
-                    eprintln!(
-                        "[UNFILLED] idx={i} pid={} ppid={} state=? mem={} ticks={} start_time={}",
-                        r.pid, r.ppid, r.mem_bytes, r.ticks, r.start_time,
-                    );
-                }
-            }
-        }
-
-        self.procs.compact();
-
-        // Thread-leader backstop (syscall backend): the uring backend rejects non-leader
-        // threads inline in `reap_and_process` (one `pidfd_open` per new chain). The
-        // syscall backend has no inline filter, so this post-compact pass catches any
-        // non-leader thread that a probe introduced. For the uring backend this is
-        // a no-op — those rows were already tombstoned before compact.
-        if !self.generation.is_multiple_of(self.config.enum_every) {
-            let mut re_compact = false;
-            for row in self.procs.as_mut_slice() {
-                if self.table.index.get(row.pid).is_none() && !sys::is_thread_group_leader(row.pid)
-                {
-                    row.pid = 0;
-                    re_compact = true;
-                }
-            }
-            if re_compact {
-                self.procs.compact();
-            }
-        }
-
-        // Rebuild the maintained live set from survivors (PID-sorted, since `compact`
-        // preserves order): deaths and probe misses fall out now, confirmed births stay.
-        // The next skip cycle reuses this set; the next full scan replaces it wholesale.
-        self.pids.clear();
-        self.pids
-            .extend(self.procs.as_slice().iter().map(|p| p.pid));
-
-        // One unified per-PID pass: CPU% + uid + cmdline handle on the surviving entries (a
+        // One unified per-PID pass: CPU% + (uid +) cmdline handle on the surviving entries (a
         // single index lookup each).
         self.table.update(&mut self.procs, now, building_gen);
         self.first_root = tree::build(
@@ -1019,17 +1153,6 @@ impl Gatherer {
         // is not started), `min_live` = the current generation reclaims immediately.
         self.arena.gc(building_gen);
     }
-
-    /// Reset and pre-size the process buffer, seeding a tombstone for every PID in sorted
-    /// order. `reserve` keeps the per-cycle tombstone fill from relocating the buffer chunk
-    /// mid-fill — a performance choice, since a grow self-heals harmlessly.
-    fn prepare(procs: &mut Procs, pids: &[u32]) {
-        procs.clear();
-        procs.reserve(pids.len());
-        for &pid in pids {
-            procs.push_tombstone(pid);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1037,10 +1160,22 @@ mod tests {
     use super::*;
 
     /// Build a gatherer on the current (test) thread (the single-threaded owner): the arena +
-    /// stores are `!Send`, so they are constructed where they are used.
+    /// stores are `!Send`, so they are constructed where they are used. Forces the `/proc`
+    /// source (`allow_bpf = false`) — these tests assert proc-path behaviour (birth probe,
+    /// same-cycle death, getdents flicker) and must not flip to BPF when run under `caprun`.
     fn new_test() -> Gatherer {
         let proc_dir = ProcDir::open().expect("open /proc");
-        Gatherer::new(crate::sys::page_size(), proc_dir)
+        Gatherer::with_source(crate::sys::page_size(), proc_dir, false)
+    }
+
+    /// The `/proc` source's tuning knobs, for tests that drive the enumeration cadence.
+    /// Panics if the gatherer is not in `/proc` mode (it always is here — `new_test`).
+    fn proc_config(g: &mut Gatherer) -> &mut Config {
+        match &mut g.source {
+            Source::Proc(p) => &mut p.config,
+            #[cfg(feature = "bpf")]
+            Source::Bpf(_) => panic!("test gatherer must be /proc mode"),
+        }
     }
 
     #[test]
@@ -1398,8 +1533,8 @@ mod tests {
     #[test]
     fn birth_probe_catches_sequential_birth_within_one_cycle() {
         let mut g = new_test();
-        g.config.enum_every = 1_000_000; // effectively no full re-scan → births only via probe
-        g.config.probe_width = 1_000_000; // window spans (max_live, ns_last_pid] regardless of W
+        proc_config(&mut g).enum_every = 1_000_000; // no full re-scan → births only via probe
+        proc_config(&mut g).probe_width = 1_000_000; // window spans (max_live, ns_last_pid]
         g.cycle(); // generation 0 → full scan seeds the maintained live set
         assert!(
             g.procs().as_slice().iter().any(|p| p.pid == 1),
@@ -1442,8 +1577,8 @@ mod tests {
         .expect("write electron app");
 
         let mut g = new_test();
-        g.config.enum_every = 2;
-        g.config.probe_width = 8;
+        proc_config(&mut g).enum_every = 2;
+        proc_config(&mut g).probe_width = 8;
 
         // Seed.
         g.cycle();
@@ -1545,7 +1680,7 @@ mod tests {
     #[test]
     fn death_caught_same_cycle_on_skip() {
         let mut g = new_test();
-        g.config.enum_every = 1_000_000; // force skip cycles after the first
+        proc_config(&mut g).enum_every = 1_000_000; // force skip cycles after the first
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -1571,5 +1706,51 @@ mod tests {
             procs.iter().all(|p| p.state != b'?'),
             "no phantom row may survive the death"
         );
+    }
+
+    /// Full privileged cycle through the real [`Gatherer`]: source selection picks BPF, and the
+    /// source-agnostic tail (CPU%, cmdline via `/proc`, tree build) runs over the iterator's
+    /// rows. In particular the BPF-provided uid must survive the cmdline refresh (the
+    /// `source_provides_uid` guard) and the cmdline must still resolve. Skips without caps;
+    /// run under `tools/caprun cargo test`.
+    #[test]
+    fn bpf_mode_end_to_end() {
+        let proc_dir = ProcDir::open().expect("open /proc");
+        let mut g = Gatherer::with_source(crate::sys::page_size(), proc_dir, true);
+        if !g.is_privileged() {
+            eprintln!("not privileged (no caps?) — skipping bpf end-to-end");
+            return;
+        }
+
+        g.cycle();
+        g.cycle(); // second cycle exercises CPU% windowing + cmdline cadence in bpf mode
+
+        let procs = g.procs().as_slice();
+        assert!(procs.iter().any(|p| p.pid == 1), "pid 1 missing");
+        assert!(
+            procs.windows(2).all(|w| w[0].pid < w[1].pid),
+            "rows must be PID-sorted"
+        );
+        assert_ne!(g.first_root(), NONE, "tree must have a root");
+        assert_eq!(g.pool_overflow(), 0, "no fd pool in bpf mode");
+
+        let me = std::process::id();
+        let mine = *procs.iter().find(|p| p.pid == me).expect("self");
+        assert_eq!(
+            mine.uid,
+            unsafe { libc::getuid() },
+            "uid kept from the iterator"
+        );
+        assert!(
+            !g.cmdline(&mine).is_empty(),
+            "cmdline must resolve via /proc in bpf mode"
+        );
+
+        // Every non-root parent index resolves to the right PID (tree integrity).
+        for p in procs {
+            if p.parent_idx != NONE {
+                assert_eq!(procs[p.parent_idx as usize].pid, p.ppid);
+            }
+        }
     }
 }

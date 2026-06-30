@@ -9,3 +9,8 @@ CLAUDE.local.md
 __pycache__/
 # perf profiling dumps (perf record writes to CWD; rotates perf.data.old)
 /perf.*
+# compiled caprun wrapper (source is tracked; binary is setuid root)
+/tools/caprun
+# BPF CO-RE header: build-only (regenerated from the builder's kernel BTF by `just bpf`),
+# not needed at runtime (the committed .o carries its own BTF). 3 MB — not worth committing.
+/bpf/vmlinux.h

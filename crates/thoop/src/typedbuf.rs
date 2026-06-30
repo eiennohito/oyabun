@@ -146,6 +146,19 @@ impl<T: Flat> TypedBuf<T> {
         // SAFETY: `0..len` initialised; &mut self gives unique access.
         unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.len) }
     }
+
+    /// The chunk's **entire capacity** viewed as raw bytes — a landing area for bulk external
+    /// fill (e.g. `read(2)`) that is later reinterpreted (e.g. `zerocopy`). Sound for any `T`
+    /// because bytes carry no validity invariant (unlike `&mut [T]`, which `Flat`'s mere `Copy`
+    /// bound would not justify over not-yet-written cells). The base is `align_of::<T>()`-
+    /// aligned, so choose `T` for the alignment the reinterpretation needs (e.g. `u64` ⇒ 8).
+    /// Independent of [`len`](Self::len): the caller tracks how many bytes it actually wrote.
+    pub fn byte_capacity_mut(&mut self) -> &mut [u8] {
+        let n = self.cap * Self::stride();
+        // SAFETY: the chunk holds `cap` × stride bytes; `&mut self` is unique access; every
+        // byte pattern is a valid `u8`. Base synced via `ptr`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr().cast::<u8>(), n) }
+    }
 }
 
 #[cfg(test)]

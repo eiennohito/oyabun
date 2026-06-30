@@ -6,9 +6,18 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+default = ["bpf"]
+# Privileged BPF observation layer (task iterator + fork/exit tracepoints).
+# On by default; disabling drops the aya/zerocopy deps entirely and the binary runs the
+# unprivileged /proc backend unconditionally — the "absent privileged layer" build.
+bpf = ["dep:aya", "dep:zerocopy"]
+
 [dependencies]
 etch = { path = "../etch" }
 thoop = { path = "../thoop" }
 crossterm = "0.29"
 libc = "0.2"
 io-uring = "0.7.12"
+aya = { version = "0.14", optional = true }
+zerocopy = { version = "0.8", features = ["derive"], optional = true }

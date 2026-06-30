@@ -65,10 +65,14 @@ pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
     let footer_row = height.saturating_sub(1);
     let row_count = app.rows().len();
     let overflow = app.pool_overflow();
-    // Gate on both, so an overflow change repaints the footer.
-    frame.line(footer_row, (row_count, overflow), |l| {
-        build_footer(l, row_count, overflow);
-    });
+    let privileged = app.is_privileged();
+    let short_lived = app.short_lived();
+    // Gate on every value the footer shows, so a change in any of them repaints it.
+    frame.line(
+        footer_row,
+        (row_count, overflow, privileged, short_lived),
+        |l| build_footer(l, row_count, overflow, privileged, short_lived),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -167,9 +171,24 @@ fn build_info_line(l: &mut etch::Line, sys: &SystemStats) {
     l.fill(' ');
 }
 
-fn build_footer(l: &mut etch::Line, visible_rows: usize, pool_overflow: u32) {
+fn build_footer(
+    l: &mut etch::Line,
+    visible_rows: usize,
+    pool_overflow: u32,
+    privileged: bool,
+    short_lived: u32,
+) {
+    // Mode tag: which observation source is live (BPF privileged vs /proc).
+    let (tag, tag_color) = if privileged {
+        ("bpf", Color::Green)
+    } else {
+        ("proc", Color::DarkGrey)
+    };
+    l.span(" [", Color::DarkGrey);
+    l.span(tag, tag_color);
+    l.span("] ", Color::DarkGrey);
     let text = format!(
-        " Rows: {visible_rows} | q:quit k:kill ↑↓:scroll Enter/→:expand ←:collapse PgUp/PgDn Home/End"
+        "Rows: {visible_rows} | q:quit k:kill ↑↓:scroll Enter/→:expand ←:collapse PgUp/PgDn Home/End"
     );
     l.span(&text, Color::DarkGrey);
     // A low `RLIMIT_NOFILE` is the only realistic cause; surface it rather than degrade silently.
@@ -178,6 +197,10 @@ fn build_footer(l: &mut etch::Line, visible_rows: usize, pool_overflow: u32) {
             &format!(" [!{pool_overflow} fd-overflow: raise ulimit -n]"),
             Color::Yellow,
         );
+    }
+    // Short-lived processes caught only by the BPF fork/exit events this cycle.
+    if short_lived > 0 {
+        l.span(&format!(" [+{short_lived} short-lived]"), Color::Cyan);
     }
     l.fill(' ');
 }

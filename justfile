@@ -65,6 +65,19 @@ build-profiling: _require-cargo
 run-profiling *ARGS: _require-cargo
     @RUSTFLAGS="-C force-frame-pointers=yes" cargo run --profile profiling -- {{ ARGS }}
 
+# --- BPF (dev-only) ---
+
+# Rebuild the committed BPF object (needs clang + libbpf headers). Run after editing
+# bpf/*.c or bpf/atop_types.h, then commit the regenerated bpf/atop.bpf.o. A normal
+# `cargo build` embeds the committed object and needs none of this toolchain.
+bpf:
+    @{{ _run }} bpf make -C bpf
+
+# Regenerate bpf/vmlinux.h from the running kernel's BTF (needs bpftool). Only when
+# retargeting a different kernel — the committed header works across kernels via CO-RE.
+bpf-vmlinux:
+    @{{ _run }} bpf-vmlinux make -C bpf vmlinux
+
 # --- Pre-commit ---
 
 # Pre-commit checklist: format, lint, check, test

@@ -60,10 +60,14 @@ Per-module detail lives in `docs/ARCHITECTURE.md` — read it before the code.
 ```
 crates/
   atop/     process-manager TUI: one thread, serialized gather→render loop
-    gather/ read /proc, parse, CPU%, tree; fill the arena row buffer in place
+    gather/ source (/proc or BPF) fills rows; CPU%, tree; common tail
+    gather/bpf/ privileged source: emit-on-change iter + fork/free (feature "bpf")
   etch/     retained-mode, value-gated terminal renderer
   thoop/    THP storage primitives (MmapRegion, Arena, GenStore, TypedBuf, ThpMap, …)
+bpf/        BPF C sources + committed .o (clang/bpftool dev-only; `just bpf`)
 docs/       ARCHITECTURE.md (design — read first), GOALS.md, plans/
+tools/      caprun.c — setuid cap wrapper (setup: scripts/setup-caps.sh)
+scripts/    setup-caps.sh, perf-toggle.sh, run-logged.sh
 ```
 
 ## Project Goals

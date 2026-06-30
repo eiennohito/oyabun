@@ -258,6 +258,22 @@ impl Procs {
         &mut self.rows.as_mut_slice()[idx]
     }
 
+    /// Push a fully-built row by value. The BPF source constructs each row from the task
+    /// iterator's output and appends it directly (no tombstone-then-fill step, since the
+    /// iterator only ever emits live processes). (`/proc`-only builds don't call this.)
+    #[cfg_attr(not(feature = "bpf"), allow(dead_code))]
+    pub fn push(&mut self, e: ProcessEntry) {
+        self.rows.push(e);
+    }
+
+    /// Sort rows by ascending PID — the tree build's binary-search precondition. The `/proc`
+    /// path enumerates PIDs sorted and fills by index, so it never needs this; the BPF task
+    /// iterator's output order is not guaranteed sorted, so its source sorts once after fill.
+    #[cfg_attr(not(feature = "bpf"), allow(dead_code))]
+    pub fn sort_by_pid(&mut self) {
+        self.rows.as_mut_slice().sort_unstable_by_key(|e| e.pid);
+    }
+
     /// Push a tombstone slot for a PID, to be filled in place by a backend and compacted out
     /// if the read failed. Returns its index.
     pub fn push_tombstone(&mut self, pid: u32) -> usize {

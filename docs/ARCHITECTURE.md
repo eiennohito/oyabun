@@ -270,6 +270,103 @@ Surplus PIDs use the transient read and are counted into the gatherer's pool-ove
 (footer-surfaced) — no silent cap. Degrades to "today minus the storm" (transient closes are `files->file_lock`,
 brief). Realistic only under low container fd limits.
 
+## Observation sources — `/proc` vs privileged BPF
+
+A cycle has two halves: a **source** fills the row buffer with identity + volatile stat
+fields, then a **source-agnostic tail** (the per-PID table's CPU%/cmdline, the tree build,
+the system stats) runs unchanged. Everything above this section is the unprivileged `/proc`
+source. The privileged source is a BPF object — a task iterator plus fork/free tracepoints —
+selected once at startup; if it fails to load (missing caps, no kernel BTF, too-old kernel)
+the `/proc` source runs and nothing else differs. This is *why* the split is a source
+boundary and not a new I/O backend: the BPF task iterator replaces enumeration **and** the
+stat read **and** the uid lookup in one pull, so it displaces the whole `/proc` front half,
+not just the read mechanism. The privileged layer can also be compiled out entirely — it is
+the one feature whose dependencies (the BPF loader, the zero-copy interpreter) are absent
+from the unprivileged build.
+
+**The iterator is one binary pull, not N text reads.** The kernel walks every task and writes
+a fixed C struct per thread-group leader; userspace reads the stream into one aligned buffer and
+interprets it in place as a typed slice — no per-PID kernel crossing, no `seq_printf` formatting
+in the kernel, no byte-walk parse in userspace. The struct *is* the parsed result. The shared
+layout (a C header, mirrored by a Rust struct that asserts the same size on both sides) is the
+contract; same machine ⇒ same endianness ⇒ no conversion on the wire.
+
+**Emit-on-change: the walk is unavoidable, the transfer is not.** There is no kernel signal for
+"a sleeping process's rss/utime moved", so polling every task each cycle is the only way to
+observe change — the walk stays O(tasks). But the program *writes* a row only when the
+process's observable state changed since last cycle, so the bytes crossing to userspace and the
+parse are proportional to churn, not process count; on an idle box (the target of the near-zero
+idle goal) the stream is nearly empty. This was the fix for the measured cost: the read syscall
+was dominated by `copy_to_user` of the full set every cycle. The change test is a per-leader
+kernel hash of the **hot** fields — the ones that move without the process running (CPU time,
+run state, resident pages that reclaim/swap edit while it sleeps, and the parent on reparenting)
+— so an unchanged hash bails *before* reading the **cold** fields (uid, nice, thread count, start
+time, name) or writing anything. Cold fields refresh only on a change or a resync, so a sleeping
+process that is *only* reniced or reparented lags until the next resync — cosmetic, and bounded
+by it. (A collision in the 64-bit hash, vanishingly unlikely, would also self-heal at the next
+resync, so it is bounded-stale, not a correctness hole.)
+
+The maintained full set lives in userspace: a cycle applies the delta to it, drains the
+birth/reap events, then materializes the whole set into the row buffer so the source-agnostic
+tail runs unchanged. **CPU% stays exact under deltas** precisely because CPU time is a hot field
+— any activity forces a re-emit, so the history ring always sees a correct per-interval delta,
+and a process absent from the delta genuinely consumed nothing that interval (a true zero, not a
+missed sample).
+
+**Units convert in Rust, identity is load-bearing.** The kernel exposes CPU time and start
+time in nanoseconds; the row carries clock ticks, matching the `/proc` path's semantics so the
+CPU-history ring is identical regardless of source. The start-time conversion is *not*
+cosmetic: it must equal `/proc` field 22 to the tick, because race-safe kill re-reads that
+field as the incarnation discriminator — a mismatch would make kill refuse. The conversion
+divisor is constant for the process, so it is computed once. The run-state char is mapped from
+raw kernel state bits in one tested place (a faithful port of the kernel's own mapping); an
+exotic unmapped combo degrades to a placeholder, never to a wrong identity.
+
+**uid ownership is source-specific.** The `/proc` source has no uid in stat, so the per-PID
+table reads it (free, riding the cmdline fd's `fstat`); the BPF source carries uid in the
+iterator output. So the table must *not* overwrite a source-provided uid from the cmdline read
+— a permission-denied cmdline open would otherwise clobber a good uid. `cmdline` itself stays
+a `/proc` read on the coarse cadence in both modes (it lives in process memory, not
+`task_struct`).
+
+**fork/free tracepoints — births in the delta, deaths on reap.** Births now flow through the
+delta itself (a new PID has no prior hash, so the walk emits it), leaving the fork tracepoint
+one job: short-lived pairing. Removal keys off the **reap** (`release_task`), *not* exit —
+because a zombie is still a live entry the walk keeps showing as `Z` (its hot fields freeze, so
+it re-emits once on zombifying then bails: O(1), never per-cycle). The reap tracepoint is
+**RCU-deferred** (it fires from an RCU callback, not synchronously at the wait), so a removal
+lands within roughly a grace period of the reap — far inside the cycle interval, so effectively
+next-cycle, the same latency a synchronous signal would give at this cadence. **Short-lived**
+processes — a reap whose fork was never reconciled by any snapshot, i.e. born and gone *between*
+two walks — are what a snapshot-only tool can never see, surfaced as a footer count.
+
+**Resync is the desync backstop, not the steady state.** A forced full snapshot (every leader
+re-emitted) is the only way to evict a death whose reap event was dropped when the event ring
+overflowed, and to recover any other drift. It rebuilds the maintained set from scratch — so it
+is armed only by a detected overflow (a kernel drop counter moved) or a slow periodic tick,
+**never every cycle**, because a full snapshot is exactly the per-cycle transfer cost
+emit-on-change exists to avoid. A resync whose read fails leaves the prior set intact (rather
+than blanking) and re-arms, since a plain delta could not refill a cleared set.
+
+**Deferred — open-coded iterator (no `read()`).** The remaining transfer cost is the `read()`
+syscall that triggers the seq_file walk. An open-coded `bpf_iter_task` in a `SEC("syscall")`
+program, triggered by one `bpf_prog_test_run` with the delta landing in an mmap'd ring, would
+drop even that. It is *not* built because the pinned aya version cannot load a `SEC("syscall")`
+program, and the kernel registers the task-iterator kfuncs only for program types whose sole
+`test_run`-able trigger cannot legally call them — so the library, not the kernel, is the block.
+Revisit when aya gains syscall-program support.
+
+**Build model: the artifact is the dependency.** The BPF programs are tiny C, compiled with
+clang against a CO-RE type header generated from the kernel's BTF; only the compiled object is
+committed and embedded at build time, so a normal `cargo build` needs neither clang nor bpftool
+— exactly the stance taken toward any generated artifact. The type header is *build-only*: it
+is not committed (it is large, and the right one is the rebuilder's own kernel, generated on
+demand) and not read at runtime — the committed object carries its own BTF, and the loader
+applies CO-RE relocations against the running kernel's BTF, so one object works across kernel
+versions without recompilation (the fields read are stable ABI). The cap wrapper
+(`tools/caprun`) grants exactly the needed capabilities without full root; agent sessions and
+dev runs use it instead of interactive sudo.
+
 ## Tree build
 
 `procs` sorted by PID ⇒ parent lookup is a binary search; child lists are built by
@@ -412,6 +509,14 @@ allocation (which could relocate it).
 
 macOS (`sysctl`/`libproc`) backend; thread-group (TGID) handling; CEF/Chromium-aware
 collapse + persisted collapse rules; config + state-cache files; `sudo` escalation
-for protected processes; disk-I/O (`/proc/pid/io`) and other columns (exe path);
-per-core CPU bars (toggle); netlink/delta enumeration instead of full rescan;
-gatherer pause on `SIGTSTP`/background.
+for protected processes; disk-I/O and other columns (exe path); per-core CPU bars
+(toggle); gatherer pause on `SIGTSTP`/background.
+
+**Privileged mode** is partially implemented: the emit-on-change task iterator (delta process
+snapshot) and the fork/free tracepoints (births in the delta, reap-based removal, short-lived
+capture) work and fall back to the `/proc` source when the object can't load. Still to do — the
+open-coded/no-`read()` iterator (deferred on the BPF library, see above) and the network-I/O
+probes that
+*motivated* the privileged layer (per-PID TCP/UDP throughput via `fentry`, no unprivileged
+equivalent) and filesystem-I/O from the iterator's accounting fields. See
+`docs/plans/privileged-mode.md` for the remaining design.

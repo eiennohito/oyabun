@@ -59,8 +59,26 @@ Collapse rules live in the state cache. Matching: check inode first (survives re
 
 ## I/O monitoring
 
-- **Disk I/O**: per-process read/write bytes from `/proc/pid/io`. Nearly free — same cost as `/proc/pid/stat`, fits zero-copy arena model. Visibility-gated (only read for visible processes when I/O column shown). Requires same-user or `CAP_SYS_PTRACE`/root for other users' processes.
-- **Network I/O**: future goal. Requires eBPF for per-process throughput (no procfs equivalent). v1 shows socket count from fd scanning as a "has network activity" indicator.
+- **Disk I/O**: per-process read/write bytes from `/proc/pid/io`. Nearly free — same cost as
+  `/proc/pid/stat`, fits zero-copy arena model. Visibility-gated (only read for visible
+  processes when I/O column shown). Requires same-user or `CAP_SYS_PTRACE`/root for other
+  users' processes. In privileged mode, read from `task->ioac` in the BPF task iterator
+  (zero marginal cost).
+- **Network I/O**: per-process TCP/UDP throughput via eBPF (`fentry` on `tcp_sendmsg` /
+  `tcp_recvmsg` / `udp_sendmsg` / `udp_recvmsg`). No unprivileged alternative exists —
+  this is what motivates the privileged mode. Accumulated in per-CPU BPF hashmaps, read
+  once per cycle. Fallback (unprivileged): socket count from fd scan as a "has network
+  activity" indicator.
+
+## Privileged mode
+
+Optional, capability-based (not full root). A single BPF object loaded at startup replaces
+the `/proc` observation pipeline when capabilities are available, and adds network I/O
+(which has no unprivileged path). Falls back transparently to the unprivileged backend.
+See `docs/plans/privileged-mode.md` for the full design.
+
+Required capabilities: `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`.
+Granted via `tools/caprun` (a setuid wrapper — see `scripts/setup-caps.sh`).
 
 ## Stretch goals
 

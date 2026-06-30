@@ -13,6 +13,10 @@ use crate::procs::ProcessEntry;
 const PF_KTHREAD: u64 = 0x0020_0000;
 
 pub struct StatFields {
+    /// The PID parsed from the first field of the stat line (`<pid> (comm) ...`).
+    /// The uring backend cross-checks this against `ctx.pid` — a mismatch means
+    /// the read hit a stale fixed-descriptor slot holding a different process's fd.
+    pub parsed_pid: u32,
     pub ppid: u32,
     pub state: u8,
     pub priority: i8,
@@ -77,6 +81,8 @@ impl StatFields {
 #[allow(clippy::cast_possible_truncation)]
 pub fn parse_stat(slot: &[u8]) -> Option<StatFields> {
     let open = slot.iter().position(|&b| b == b'(')?;
+    // PID is the decimal token before the first ' (' — always the first field.
+    let parsed_pid = u32::try_from(parse_u64(slot.get(..open.checked_sub(1)?)?)?).ok()?;
     let close = slot.iter().rposition(|&b| b == b')')?;
     if close <= open + 1 {
         return None;
@@ -106,6 +112,7 @@ pub fn parse_stat(slot: &[u8]) -> Option<StatFields> {
     let rss_pages = parse_u64(it.next()?)?; // 21
 
     Some(StatFields {
+        parsed_pid,
         ppid,
         state,
         priority,

@@ -101,9 +101,13 @@ impl App {
     }
 
     /// Flatten the tree into display order, skipping collapsed subtrees. Restores selection
-    /// onto `keep_pid` if present (selection-follow across refreshes). Reads the arena-backed
-    /// process buffer; `rows` is a heap `Vec`, so its growth never relocates that buffer.
+    /// onto `keep_pid` if present (selection-follow across refreshes), and anchors scroll so the
+    /// selected row stays at the same screen line — minimizing visible row movement from
+    /// births/deaths outside the viewport. Reads the arena-backed process buffer; `rows` is a
+    /// heap `Vec`, so its growth never relocates that buffer.
     fn rebuild_rows(&mut self, keep_pid: Option<u32>) {
+        let anchor_offset = self.selected.saturating_sub(self.scroll);
+        let mut pid_survived = false;
         {
             let App {
                 gatherer,
@@ -139,9 +143,13 @@ impl App {
 
             if let Some(idx) = found {
                 *selected = idx;
+                pid_survived = true;
             }
         }
         self.clamp_selection();
+        if pid_survived {
+            self.scroll = self.selected.saturating_sub(anchor_offset);
+        }
     }
 
     // --- navigation ---

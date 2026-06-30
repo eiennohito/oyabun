@@ -897,12 +897,19 @@ impl Gatherer {
         );
         let w = self.config.probe_width;
         let Some(&anchor) = self.pids.last() else {
-            return; // no live set yet — the next full scan seeds it
+            return;
         };
         let frontier = sys::read_ns_last_pid().unwrap_or(anchor.saturating_add(w));
         let hi = anchor.saturating_add(w).min(frontier).min(self.pid_max);
         for cand in anchor.saturating_add(1)..=hi {
-            self.pids.push(cand); // > current max ⇒ appends keep `pids` sorted
+            self.pids.push(cand);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let n_added = hi.saturating_sub(anchor);
+            if n_added > 0 {
+                eprintln!("[probe] anchor={anchor} frontier={frontier} hi={hi} added={n_added}");
+            }
         }
     }
 
@@ -918,14 +925,10 @@ impl Gatherer {
         // same cycle (held read → `ESRCH` → re-tombstone → compact) — the full scan is only
         // for births, never for pruning.
         if self.generation.is_multiple_of(self.config.enum_every) {
-            // Full scan: `getdents` order is unspecified, so sort (the tree build's
-            // binary-search precondition) and dedup the wholesale-replaced set.
             self.proc_dir.read_pids(&mut self.dent_buf, &mut self.pids);
             self.pids.sort_unstable();
             self.pids.dedup();
         } else {
-            // Skip cycle: `self.pids` is already sorted + unique (the survivor rebuild leaves
-            // it so) and the probe only appends strictly-larger candidates, so no re-sort.
             self.probe_births();
         }
         let now = Instant::now();
@@ -952,7 +955,41 @@ impl Gatherer {
         };
         self.pool_overflow = overflow;
 
+        // Before compact: find rows with real PIDs but unfilled (state='?' = TOMBSTONE default).
+        // These are rows that `fill` never submitted a read for AND never tombstoned.
+        #[cfg(debug_assertions)]
+        {
+            let rows = self.procs.as_slice();
+            for (i, r) in rows.iter().enumerate() {
+                if r.pid != 0 && r.state == b'?' {
+                    eprintln!(
+                        "[UNFILLED] idx={i} pid={} ppid={} state=? mem={} ticks={} start_time={}",
+                        r.pid, r.ppid, r.mem_bytes, r.ticks, r.start_time,
+                    );
+                }
+            }
+        }
+
         self.procs.compact();
+
+        // Thread-leader backstop (syscall backend): the uring backend rejects non-leader
+        // threads inline in `reap_and_process` (one `pidfd_open` per new chain). The
+        // syscall backend has no inline filter, so this post-compact pass catches any
+        // non-leader thread that a probe introduced. For the uring backend this is
+        // a no-op — those rows were already tombstoned before compact.
+        if !self.generation.is_multiple_of(self.config.enum_every) {
+            let mut re_compact = false;
+            for row in self.procs.as_mut_slice() {
+                if self.table.index.get(row.pid).is_none() && !sys::is_thread_group_leader(row.pid)
+                {
+                    row.pid = 0;
+                    re_compact = true;
+                }
+            }
+            if re_compact {
+                self.procs.compact();
+            }
+        }
 
         // Rebuild the maintained live set from survivors (PID-sorted, since `compact`
         // preserves order): deaths and probe misses fall out now, confirmed births stay.
@@ -1383,6 +1420,122 @@ mod tests {
         assert!(
             caught,
             "sequential birth (pid {child_pid}) must be caught by the probe within 1 cycle"
+        );
+    }
+
+    /// Detect the getdents flicker: PIDs that oscillate in/out of the survivor set
+    /// across full-scan / skip-cycle alternation. Uses the real gather `cycle()` with
+    /// Electron to trigger the kernel `/proc` enumeration gotcha.
+    #[test]
+    fn probe_flicker_detection() {
+        use std::collections::HashSet;
+        use std::process::Command;
+        use std::thread;
+
+        let app_dir = std::path::PathBuf::from("/tmp/atop-electron-test");
+        let _ = std::fs::create_dir_all(&app_dir);
+        std::fs::write(
+            app_dir.join("index.js"),
+            b"const{app}=require('electron');\
+              app.on('ready',()=>{setTimeout(()=>process.exit(),60000)});",
+        )
+        .expect("write electron app");
+
+        let mut g = new_test();
+        g.config.enum_every = 2;
+        g.config.probe_width = 8;
+
+        // Seed.
+        g.cycle();
+
+        // Launch Electron, let it settle.
+        let mut electron = Command::new("electron39")
+            .args(["--no-sandbox"])
+            .arg(&app_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn electron39");
+        thread::sleep(Duration::from_secs(2));
+
+        // Track PID sets across cycles to find oscillations.
+        let mut prev_pids: HashSet<u32> = HashSet::new();
+        let mut added_hist: HashMap<u32, u32> = HashMap::new();
+        let mut removed_hist: HashMap<u32, u32> = HashMap::new();
+
+        for _round in 0..60 {
+            thread::sleep(Duration::from_millis(500));
+            g.cycle();
+
+            let cur_pids: HashSet<u32> = g.procs().as_slice().iter().map(|p| p.pid).collect();
+
+            if !prev_pids.is_empty() {
+                for &pid in &cur_pids {
+                    if !prev_pids.contains(&pid) {
+                        *added_hist.entry(pid).or_default() += 1;
+                    }
+                }
+                for &pid in &prev_pids {
+                    if !cur_pids.contains(&pid) {
+                        *removed_hist.entry(pid).or_default() += 1;
+                    }
+                }
+            }
+            prev_pids = cur_pids;
+        }
+
+        let _ = electron.kill();
+        let _ = electron.wait();
+
+        // A PID that was both added AND removed multiple times is oscillating.
+        let mut oscillators = Vec::new();
+        for (&pid, &adds) in &added_hist {
+            let removes = removed_hist.get(&pid).copied().unwrap_or(0);
+            if adds >= 2 && removes >= 2 {
+                oscillators.push((pid, adds, removes));
+            }
+        }
+        oscillators.sort_unstable();
+
+        if !oscillators.is_empty() {
+            eprintln!("=== {} oscillating PIDs ===", oscillators.len());
+            for &(pid, adds, removes) in &oscillators {
+                eprint!("  pid={pid} added={adds}x removed={removes}x");
+                // Read /proc/<pid>/stat
+                let stat_path = format!("/proc/{pid}/stat");
+                if let Ok(stat) = std::fs::read_to_string(&stat_path) {
+                    eprint!(" stat={}", stat.trim());
+                } else {
+                    eprint!(" stat=GONE");
+                }
+                // Read key fields from /proc/<pid>/status
+                let status_path = format!("/proc/{pid}/status");
+                if let Ok(status) = std::fs::read_to_string(&status_path) {
+                    for line in status.lines() {
+                        if line.starts_with("Tgid:")
+                            || line.starts_with("Pid:")
+                            || line.starts_with("PPid:")
+                            || line.starts_with("Name:")
+                            || line.starts_with("Threads:")
+                        {
+                            eprint!(" {}", line.trim());
+                        }
+                    }
+                }
+                eprintln!();
+            }
+        }
+
+        assert!(
+            oscillators.is_empty(),
+            "{} PIDs oscillate across cycles (getdents flicker):\n  {}",
+            oscillators.len(),
+            oscillators
+                .iter()
+                .map(|(pid, a, r)| format!("pid={pid} +{a}x -{r}x"))
+                .collect::<Vec<_>>()
+                .join("\n  "),
         );
     }
 

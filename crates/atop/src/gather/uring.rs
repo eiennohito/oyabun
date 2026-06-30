@@ -38,7 +38,7 @@ use thoop::MmapRegion;
 use crate::gather::syscall::read_transient;
 use crate::gather::{PidMap, STAT_SLOT, parse};
 use crate::procs::Procs;
-use crate::sys::ProcPath;
+use crate::sys::{self, ProcPath};
 
 /// Default number of concurrent read slots in the landing pad — the in-flight read
 /// bound. The pad is `read_slots × STAT_SLOT` bytes of pinned, registered memory (fixed
@@ -89,8 +89,12 @@ struct Ctx {
     /// The `OpenAt` of a new chain failed (process gone before open) — the slot was
     /// never installed, so it is freed without a close.
     open_failed: bool,
+    /// Raw CQE result of the open (diagnostic: the error code when `open_failed` is true).
+    open_res: i32,
     /// The `ReadFixed` returned data.
     read_ok: bool,
+    /// Raw CQE result of the read (diagnostic: the error code when `read_ok` is false).
+    read_res: i32,
 }
 
 pub struct UringBackend {
@@ -283,14 +287,21 @@ impl UringBackend {
                 &mut self.stat_path,
                 scratch,
             ) {
-                procs.tombstone(job.pid_idx); // incarnation truly gone — no phantom row
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[uring] reopen transient failed: pid={} idx={}",
+                    job.pid, job.pid_idx
+                );
+                procs.tombstone(job.pid_idx);
             }
         }
         for i in 0..self.overflow_buf.len() {
             let (idx, pid) = self.overflow_buf[i];
             let scratch = self.read_pad.slice_mut(scratch_off, STAT_SLOT);
             if !read_transient(pid, idx, procs, page_size, &mut self.stat_path, scratch) {
-                procs.tombstone(idx); // transient overflow read failed
+                #[cfg(debug_assertions)]
+                eprintln!("[uring] overflow transient failed: pid={pid} idx={idx}");
+                procs.tombstone(idx);
             }
         }
         let overflow = u32::try_from(self.overflow_buf.len()).unwrap_or(u32::MAX);
@@ -392,6 +403,11 @@ impl UringBackend {
                 // fd-pool exhausted (not pad-full — `read_free` still has slots here):
                 // this PID gets no persistent descriptor, so defer it to the transient
                 // overflow pass. `*next` advances — overflow is a real disposition, not a retry.
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[uring] overflow: pid={pid} idx={idx} held={} free_fixed=0",
+                    self.held.len()
+                );
                 self.overflow_buf.push((idx, pid));
             } else {
                 // Fixed slot free but the landing pad is full: break with `*next` unchanged
@@ -434,12 +450,16 @@ impl UringBackend {
                 continue;
             };
             if op == OP_OPEN {
+                ctx.open_res = res;
                 if res < 0 {
                     ctx.open_failed = true;
                 }
-            } else if res > 0 {
-                ctx.stat_len = u32::try_from(res).unwrap_or(0).min(STAT_SLOT as u32);
-                ctx.read_ok = true;
+            } else {
+                ctx.read_res = res;
+                if res > 0 {
+                    ctx.stat_len = u32::try_from(res).unwrap_or(0).min(STAT_SLOT as u32);
+                    ctx.read_ok = true;
+                }
             }
             ctx.pending -= 1;
             if ctx.pending == 0 {
@@ -456,31 +476,70 @@ impl UringBackend {
             let ctx = self.ctxs[fixed as usize];
             let idx = ctx.pid_idx as usize;
             if ctx.read_ok {
-                // No `start_time` re-check is needed here (unlike a re-open-by-path
-                // backend). An open `/proc/<pid>/stat` fd pins the kernel `struct pid`,
-                // so the PID number cannot be recycled while we hold the descriptor:
-                // a successful read is always the same incarnation, and a dead task
-                // yields `ESRCH` (the read-fail branch below), never another process's
-                // stat. Reuse only becomes possible after we close the slot on `ESRCH`.
                 let slot = self
                     .read_pad
                     .bytes(ctx.read_slot as usize * STAT_SLOT, ctx.stat_len as usize);
                 if let Some(f) = parse::parse_stat(slot) {
+                    // New chain (open_res > 0): two gates before accepting.
+                    if ctx.open_res > 0 {
+                        // 1. PID cross-check: the stat line's PID must match what we
+                        //    asked for. A mismatch means the read hit a stale fd.
+                        if f.parsed_pid != ctx.pid {
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[uring] PID MISMATCH: expected={} parsed={} fixed={fixed}",
+                                ctx.pid, f.parsed_pid,
+                            );
+                            self.held.remove(&ctx.pid);
+                            let _ = self.ring.submitter().register_files_update(fixed, &[-1]);
+                            self.free_fixed.push(fixed);
+                            self.read_free.push(ctx.read_slot);
+                            procs.tombstone(idx);
+                            continue;
+                        }
+                        // 2. Thread-leader gate: reject non-leader threads whose TID
+                        //    falls in the probe window (`/proc` VFS gotcha — `open`
+                        //    resolves any task, `getdents` returns only TGIDs).
+                        //    `pidfd_open(pid, 0)` — one syscall, EINVAL for non-leaders.
+                        if !sys::is_thread_group_leader(ctx.pid) {
+                            self.held.remove(&ctx.pid);
+                            let _ = self.ring.submitter().register_files_update(fixed, &[-1]);
+                            self.free_fixed.push(fixed);
+                            self.read_free.push(ctx.read_slot);
+                            procs.tombstone(idx);
+                            continue;
+                        }
+                    }
                     f.write_into(procs.row_mut(idx), page_size, slot);
                 } else {
-                    procs.tombstone(idx); // unparseable read → no phantom row
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[uring] parse failed: pid={} len={} first_bytes={:?}",
+                        ctx.pid,
+                        ctx.stat_len,
+                        &slot[..slot.len().min(40)],
+                    );
+                    procs.tombstone(idx);
                 }
                 self.read_free.push(ctx.read_slot);
             } else if ctx.open_failed {
                 // New PID vanished before open — slot never installed.
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[uring] open failed: pid={} fixed={fixed} open_res={}",
+                    ctx.pid, ctx.open_res,
+                );
                 self.held.remove(&ctx.pid);
                 self.free_fixed.push(fixed);
                 self.read_free.push(ctx.read_slot);
-                procs.tombstone(idx); // speculative/new PID gone before open
+                procs.tombstone(idx);
             } else {
-                // Installed fd read failed (`ESRCH`: the incarnation exited; closing the
-                // fd now unpins the PID, so a reused incarnation is read fresh below).
-                // The transient re-read is *deferred* to after the ring fully drains.
+                // Installed fd read failed — log the raw CQE result for diagnosis.
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[uring] read failed: pid={} fixed={fixed} res={} open_failed={}",
+                    ctx.pid, ctx.read_res, ctx.open_failed,
+                );
                 let _ = self.ring.submitter().register_files_update(fixed, &[-1]);
                 self.held.remove(&ctx.pid);
                 self.free_fixed.push(fixed);

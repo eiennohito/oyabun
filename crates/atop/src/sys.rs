@@ -340,6 +340,24 @@ pub fn kill_verified(pid: u32, start_time: u64, sig: i32) -> bool {
     sent
 }
 
+/// Is this task a thread group leader (a real process, not a non-leader thread)?
+/// Uses `pidfd_open(pid, 0)` — one syscall, no file I/O. Returns `EINVAL` for
+/// non-leader threads (kernel ≥ 5.3, the same floor as `io_uring`). The birth probe
+/// uses this to reject threads whose TID falls in the speculative window: `open`
+/// resolves any `/proc/<tid>` via VFS lookup, but only TGIDs appear in `getdents`.
+#[allow(clippy::cast_possible_truncation)] // syscall returns c_long; fd fits i32
+pub fn is_thread_group_leader(pid: u32) -> bool {
+    // SAFETY: pidfd_open is a thin wrapper around a PID lookup; flags=0 restricts
+    // to thread group leaders (EINVAL for non-leaders).
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+        true
+    } else {
+        false
+    }
+}
+
 /// Field 22 of `/proc/<pid>/stat` — process start time (jiffies since boot), the
 /// discriminator that distinguishes PID reuse. `None` if the PID is gone.
 ///

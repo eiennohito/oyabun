@@ -130,7 +130,10 @@ cost is kernel-side dirent materialization, so the only unprivileged lever is fr
   allocation frontier. New arrivals are caught within one cycle; in steady state the window
   is empty (zero cost). Bursts and the post-wrap low range wait for the full re-scan — a
   hit-rate, not a correctness, concern (the failed speculative reads rely on the hygiene
-  rule above).
+  rule above). A **thread-leader gate** (`pidfd_open`, one syscall) rejects non-leader
+  threads: `/proc/<N>` resolves any task ID via VFS lookup (PIDs and TIDs alike), but
+  `getdents` returns only TGIDs — without the gate, worker threads whose TID falls in the
+  probe window would appear as phantom processes that flicker on alternating cycles.
 
 This enumeration cadence is the shared component the scale-observation plan's per-PID
 *sampling* cadence builds on — the two are independent knobs.

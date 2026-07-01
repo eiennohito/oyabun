@@ -32,6 +32,8 @@ Before proposing a fix: what general capability does this case need? Does the sy
 - **NEVER commit unless the user literally says "commit."** When committing, run `/precommit`.
 - **Commit to `main` directly** — no feature branches. No remote/PR workflow yet, so branches are pure overhead.
 - **Use `just`**, not raw commands. Never pipe `just` output through filters.
+- **Both feature configs must be green.** `bpf` is default-on; `just precommit` runs `test` (bpf) and `test-nobpf` (`--no-default-features`) so a `cfg`-gated regression in either build is caught.
+- **Default-suite tests can't hard-require optional external tools.** A test that needs an absent binary aborts the whole suite; mark it `#[ignore]` (with run instructions) or skip gracefully.
 
 ## Workflow
 
@@ -56,6 +58,13 @@ The goal is not to deliver 100% of the plan; it's to deliver 120% at better qual
 
 Module (not file) overviews, ≤60 chars each; a single-file module gets none.
 Per-module detail lives in `docs/ARCHITECTURE.md` — read it before the code.
+
+**`mod.rs` is aggregator-only.** A `mod.rs` is either (a) the module's *only* file and
+under ~500 lines, or (b) — once the module has sibling files — nothing but `mod`
+declarations, re-exports, and the module-level doc; all logic moves to a peer file (e.g.
+`Gatherer` lives in `gather/gatherer.rs`, not `gather/mod.rs`). Rationale: the module's
+entry point stays a readable map, and each file tracks one concept instead of accreting into
+a grab-bag. A module small enough for one file uses `foo.rs`, not `foo/mod.rs`.
 
 ```
 crates/

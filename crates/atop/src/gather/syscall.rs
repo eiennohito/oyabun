@@ -15,8 +15,9 @@
 
 use std::os::fd::RawFd;
 
-use crate::gather::parse::{self};
-use crate::gather::{PidMap, STAT_SLOT};
+use super::config::STAT_SLOT;
+use super::fxhash::PidMap;
+use super::parse;
 use crate::procs::Procs;
 use crate::sys::ProcPath;
 

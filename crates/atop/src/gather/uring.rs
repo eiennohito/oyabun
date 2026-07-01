@@ -35,18 +35,13 @@ use io_uring::{IoUring, opcode, squeue, types};
 
 use thoop::MmapRegion;
 
-use crate::gather::syscall::read_transient;
-use crate::gather::{PidMap, STAT_SLOT, parse};
+use super::config::STAT_SLOT;
+use super::fxhash::PidMap;
+use super::parse;
+use super::syscall::read_transient;
 use crate::procs::Procs;
 use crate::sys::{self, ProcPath};
 
-/// Default number of concurrent read slots in the landing pad — the in-flight read
-/// bound. The pad is `read_slots × STAT_SLOT` bytes of pinned, registered memory (fixed
-/// regardless of PID count). Larger ⇒ fewer wait rounds per cycle at high PID counts but
-/// more pinned memory; 512 × 1 KiB = 512 KiB is a comfortable, lock-limit-friendly
-/// default. Overridable via `ATOP_READ_SLOTS` — the pinned-memory ↔ wakeups dial for the
-/// backend A/B this split unblocks.
-pub(crate) const READ_SLOTS: usize = 512;
 /// The landing pad is the only registered buffer, at this fixed index.
 const READ_BUF_INDEX: u16 = 0;
 
@@ -576,7 +571,7 @@ impl UringBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gather::RING_ENTRIES;
+    use crate::gather::config::{READ_SLOTS, RING_ENTRIES};
     use std::time::{Duration, Instant};
     use thoop::Arena;
 
@@ -698,7 +693,7 @@ mod tests {
         let pids = enum_pids();
         let (_arena, mut a) = test_procs();
         let Some(mut uring) = UringBackend::probe(
-            crate::gather::MAX_POOL,
+            crate::gather::config::MAX_POOL,
             RING_ENTRIES,
             RING_ENTRIES as usize,
             8,

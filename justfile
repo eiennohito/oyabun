@@ -35,9 +35,14 @@ check: _require-cargo
 
 # --- Test ---
 
-# Run all tests
+# Run all tests (default features — privileged BPF layer compiled in)
 test: _require-cargo
     @{{ _run }} test-rust cargo test --workspace
+
+# Run atop's tests with the privileged layer compiled out (the "absent BPF" build). Only
+# atop has the `bpf` feature, so etch/thoop are already covered by `test`.
+test-nobpf: _require-cargo
+    @{{ _run }} test-nobpf cargo test -p atop --no-default-features
 
 # Run a filtered subset (e.g. `just testf thpmap -p thoop`); FILTER matches test names
 testf FILTER *ARGS: _require-cargo
@@ -80,12 +85,13 @@ bpf-vmlinux:
 
 # --- Pre-commit ---
 
-# Pre-commit checklist: format, lint, check, test
+# Pre-commit checklist: format, lint, check, test (BPF on + BPF off)
 precommit: _require-cargo
     @just fmt
     @just lint
     @just check
     @just test
+    @just test-nobpf
     @echo ""
     @echo "Pre-commit done. Logs: $ATOP_LOGDIR/"
 

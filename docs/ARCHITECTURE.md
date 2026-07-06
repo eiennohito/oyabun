@@ -264,6 +264,29 @@ low-volume ops stay synchronous):
   is gone. PID reuse (`start_time` change) and eviction free the slot at once (no lease — see
   the storage policy above).
 
+**Deleted-binary and capability signals** are cold metadata on this same coarse cadence, for
+the same reason cmdline is: they change slowly and are read from `/proc`, so re-reading every
+cycle would be waste. Their *lifecycle rules differ by how each transitions*:
+
+- A deleted **exe** is **absorbing** — once the kernel marks `/proc/pid/exe` `" (deleted)"` the
+  original inode is gone and can never come back for that incarnation — so it is probed only
+  while still unmarked, then latched for the process's life (a cheap `readlink`, re-tried on the
+  cmdline cadence until it fires, so a mid-run package upgrade is still caught).
+- A deleted **library** is **transient** (a process can unmap the old `.so` and load a
+  replacement), so it must be re-resolved periodically. Because scanning a whole `maps` file is
+  the heavy check, it is bounded two ways: a coarse per-process re-check interval *and* a hard
+  cap on scans started per cycle. The whole population is covered over many cycles at a cost
+  independent of process count — no per-cycle work proportional to PID count. Exe deletion takes
+  visual priority, so a flagged exe skips the (redundant) maps scan.
+
+The USER column is colored by **effective capability level, not uid ownership**, because on
+Linux *what a process can do* is the security-interesting axis, not who owns it: a root process
+that dropped its capabilities is harmless, while a non-root process holding a dangerous
+capability is not. The level (none / partial / full, from `/proc/pid/status` `CapEff` masked to
+`cap_last_cap`) is read only through the settling window and then cached — effective caps are
+fixed at `exec` and effectively immutable for a process's observable life, so unlike exe/lib
+this needs no steady-state re-read at all. The username still shows as the cell's text.
+
 ### Overflow (more live PIDs than the pool holds)
 
 Surplus PIDs use the transient read and are counted into the gatherer's pool-overflow tally
@@ -427,6 +450,32 @@ display width explicitly — `glyph(s, w)` for known-width tree connectors (`●
 walks that already scan comm/cmdline). Integration tests (`vt100`) assert both the
 rendered screen and that an unchanged frame emits **zero** bytes.
 
+`Cell` is also the **terminal trust boundary**: `comm`/`cmdline` are attacker-controllable
+(any local user's `argv`, or `prctl(PR_SET_NAME)`), so every text path through it neutralizes
+control characters (C0/C1) to a placeholder before they can reach the terminal's *control*
+channel as raw escapes — uniformly on both the ASCII and the wide-char path, since the
+`non_ascii` flag routes a string with even one high byte through the latter. A root operator
+watching an unprivileged user's processes must not have escape sequences injected into their
+terminal.
+
+**Color is 24-bit and it carries meaning.** etch emits only truecolor — no ANSI-16 named
+colors, no 256-color fallback — so a cell's color can be a *continuous function of its value*
+rather than a bucket. Magnitude columns (CPU%, peak, RSS, nice) map through semantic gradients
+whose *shape* encodes what the magnitude means to the reader: near-zero recedes into the
+background, a normal level is calm, an alarming level is hot. RSS is log-scaled, so one
+perceptual step is roughly an order of magnitude (a linear ramp would make megabytes and
+gigabytes indistinguishable); nice diverges from a neutral zero. CPU% has one deliberate
+*discrete* break: exactly-zero is a hard step to a dim idle tone and any nonzero jumps to a
+visible floor, because "used nothing" and "used a sliver" are categorically different, not
+adjacent magnitudes that should blend. Categorical columns (state, user, tree glyphs) use
+named colors — there is no ordering to interpolate. This is *why* the
+per-cell gate hashes the value **and** its style: a gradient-band crossing must repaint even
+when the formatted text is byte-identical. The Command cell is multi-colored (dim path prefix,
+bright basename, muted tree connectors, an alarm tint when the binary or a linked library was
+deleted), so it records color *runs* the fill painter emits with per-run escapes. Row-level
+color is selection only (a background); process state no longer tints the whole row — that
+flickered, and magnitude/kind now live in the per-cell colors instead.
+
 Not yet done (deliberately deferred, measured first): terminal **scroll regions**
 (`CSI S`/`T`) so a ±1 scroll shifts the terminal's own buffer instead of repainting the
 visible window. The value-gated renderer already removed both ratatui hot spots; scroll
@@ -465,6 +514,21 @@ integer hash is fast and *not* hash-flood-resistant — which PID keys do not ne
 default `SipHash` would be slow for.
 The ring is updated through a copy-free in-place borrow that never spans another store's
 allocation (which could relocate it).
+
+**Display state is derived from the ring, not point-sampled.** The kernel state byte answers
+"was this task on-CPU at the microsecond we read `/proc`?" — which flickers `S`↔`R` for a
+low-but-active process. The S column instead shows a *derived* state: `R` when the CPU ring
+recorded any ticks across a short recent window, otherwise the raw byte. This makes `R` stable
+(a 1% process reads `R` continuously) and makes `D`/`Z`/`T` trustworthy (they appear only when
+the process genuinely isn't executing). The raw byte stays in the row untouched — kill-safety
+and the task-state tallies read *it*, never the derived one, because they must reflect the true
+kernel state, not the "is it active" question the display answers.
+
+**System-wide CPU% is windowed the same way.** The machine-wide rate differences a ring of
+recent `/proc/stat` snapshots at its two endpoints (the same multi-second window as per-process
+CPU), not a single interval. A bare `cur − prev` delta at this cadence resolves only a few tens
+of jiffies, so a transient burst dominates one sample then vanishes — the bar jumps. The
+user/sys/iowait split is preserved because every counter is differenced over the same endpoints.
 
 ## Dependencies
 

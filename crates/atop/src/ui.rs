@@ -16,9 +16,10 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::io::Write;
 
-use etch::{Cell, ColSpec, Color, Frame, Schema, Style};
+use etch::{Cell, ColSpec, Frame, Rgb, Schema, Style};
 
 use crate::app::App;
+use crate::palette;
 use crate::procs::{NONE, SystemStats};
 
 /// Number of terminal rows consumed by the system stats header.
@@ -28,7 +29,7 @@ pub const CHROME_LINES: u16 = HEADER_LINES + 2;
 /// First screen row of the process list (after the 3 stat lines + column header).
 const BODY_TOP: u16 = HEADER_LINES + 1;
 
-const HEADER_STYLE: Style = Style::fg(Color::Cyan).bold();
+const HEADER_STYLE: Style = Style::fg(palette::LABEL).bold();
 
 /// The table's column structure — declared once, shared by header and body rows.
 #[must_use]
@@ -93,12 +94,12 @@ fn build_cpu_line(l: &mut etch::Line, sys: &SystemStats, width: usize) {
     let io = (sys.cpu_iowait_bp as usize * bar_width / 10000).min(bar_width - user - system);
     let empty = bar_width - user - system - io;
 
-    l.span(label, Color::Cyan);
-    l.bar(user, '|', Color::Green);
-    l.bar(system, '|', Color::Red);
-    l.bar(io, '|', Color::Blue);
-    l.bar(empty, ' ', Color::Reset);
-    l.span(&suffix, Color::Cyan);
+    l.span(label, palette::LABEL);
+    l.bar(user, '|', palette::BAR_BUSY);
+    l.bar(system, '|', palette::BAR_SYS);
+    l.bar(io, '|', palette::BAR_IO);
+    l.gap(empty);
+    l.span(&suffix, palette::LABEL);
 }
 
 #[allow(
@@ -123,20 +124,20 @@ fn build_mem_line(l: &mut etch::Line, sys: &SystemStats, width: usize) {
     let cached_cells = (cached_frac * mem_bar as f64) as usize;
     let mem_empty = mem_bar.saturating_sub(used_cells + cached_cells);
 
-    l.span(mem_prefix, Color::Cyan);
-    l.bar(used_cells, '|', Color::Green);
-    l.bar(cached_cells, '|', Color::Yellow);
-    l.bar(mem_empty, ' ', Color::Reset);
-    l.span(&mem_suffix, Color::Cyan);
+    l.span(mem_prefix, palette::LABEL);
+    l.bar(used_cells, '|', palette::BAR_BUSY);
+    l.bar(cached_cells, '|', palette::BAR_CACHE);
+    l.gap(mem_empty);
+    l.span(&mem_suffix, palette::LABEL);
 
     let swap_frac = frac(sys.swap_used, sys.swap_total, 1.0);
     let swap_cells = (swap_frac * swap_bar as f64) as usize;
     let swap_empty = swap_bar.saturating_sub(swap_cells);
 
-    l.span(swap_prefix, Color::Cyan);
-    l.bar(swap_cells, '|', Color::Red);
-    l.bar(swap_empty, ' ', Color::Reset);
-    l.span(&swap_suffix, Color::Cyan);
+    l.span(swap_prefix, palette::LABEL);
+    l.bar(swap_cells, '|', palette::BAR_SYS);
+    l.gap(swap_empty);
+    l.span(&swap_suffix, palette::LABEL);
 }
 
 /// `num / den` clamped to `[0, cap]`; 0 when `den == 0`.
@@ -167,7 +168,7 @@ fn build_info_line(l: &mut etch::Line, sys: &SystemStats) {
         sys.tasks_zombie,
         format_uptime(sys.uptime_secs),
     );
-    l.span(&text, Color::White);
+    l.span(&text, palette::INFO);
     l.fill(' ');
 }
 
@@ -180,27 +181,27 @@ fn build_footer(
 ) {
     // Mode tag: which observation source is live (BPF privileged vs /proc).
     let (tag, tag_color) = if privileged {
-        ("bpf", Color::Green)
+        ("bpf", palette::BAR_BUSY)
     } else {
-        ("proc", Color::DarkGrey)
+        ("proc", palette::FOOTER)
     };
-    l.span(" [", Color::DarkGrey);
+    l.span(" [", palette::FOOTER);
     l.span(tag, tag_color);
-    l.span("] ", Color::DarkGrey);
+    l.span("] ", palette::FOOTER);
     let text = format!(
         "Rows: {visible_rows} | q:quit k:kill ↑↓:scroll Enter/→:expand ←:collapse PgUp/PgDn Home/End"
     );
-    l.span(&text, Color::DarkGrey);
+    l.span(&text, palette::FOOTER);
     // A low `RLIMIT_NOFILE` is the only realistic cause; surface it rather than degrade silently.
     if pool_overflow > 0 {
         l.span(
             &format!(" [!{pool_overflow} fd-overflow: raise ulimit -n]"),
-            Color::Yellow,
+            palette::WARN,
         );
     }
     // Short-lived processes caught only by the BPF fork/exit events this cycle.
     if short_lived > 0 {
-        l.span(&format!(" [+{short_lived} short-lived]"), Color::Cyan);
+        l.span(&format!(" [+{short_lived} short-lived]"), palette::NOTICE);
     }
     l.fill(' ');
 }
@@ -263,53 +264,129 @@ fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_
             } else {
                 0
             };
-            let non_ascii = p.non_ascii;
 
-            let style = row_style(selected, p.state);
-            let user = app.uid_name(p.uid);
+            // Selection is the only row-level color: a distinct background, applied to every
+            // cell. A change flips the row-level style below, forcing a full-row repaint (so
+            // the bg reaches every cell); otherwise each cell gates and colors independently.
+            let bg = selected.then_some(palette::SELECTION_BG);
+            let cmd = CommandCell {
+                prefix: prefix.as_str(),
+                prefix_cols,
+                text,
+                is_name,
+                is_kthread: p.is_kthread,
+                non_ascii: p.non_ascii,
+                suffix_n,
+                basename_fg: basename_color(p.exe_deleted, p.uses_deleted_lib),
+            };
 
-            table.row(u64::from(p.pid), style, |r| {
-                r.field(p.pid);
-                r.field(user);
-                r.field(p.state as char);
-                r.field(p.nice);
-                r.field(p.num_threads);
-                r.field(Pct(cpu));
-                r.field(Pct(peak));
-                r.field(Mem(mem));
-                // Command: content hash (a changed cmdline reuses a freed store slot, so the
-                // handle isn't a stable content identity) + tree prefix + collapse suffix.
+            table.row(u64::from(p.pid), Style::NONE.with_bg(bg), |r| {
+                r.field(p.pid); // PID inherits the row style (no per-cell color)
+                r.styled_field(app.uid_name(p.uid), cell(Some(palette::caps(p.caps)), bg));
+                r.styled_field(
+                    p.display_state as char,
+                    cell(Some(palette::state(p.display_state)), bg),
+                );
+                r.styled_field(p.nice, cell(Some(palette::nice(p.nice)), bg));
+                r.styled_field(p.num_threads, cell(palette::threads(p.num_threads), bg));
+                r.styled_field(Pct(cpu), cell(Some(palette::cpu(cpu)), bg));
+                r.styled_field(Pct(peak), cell(Some(palette::cpu(peak)), bg));
+                r.styled_field(Mem(mem), cell(Some(palette::rss(mem)), bg));
+                // Command gate: content hash (a changed cmdline reuses a freed store slot, so
+                // the handle isn't a stable content identity) + tree prefix + collapse suffix +
+                // the flags that drive its per-span colors.
                 r.fill(
-                    (prefix.as_str(), text, is_name, suffix_n),
-                    |c: &mut Cell| {
-                        write_command(c, &prefix, prefix_cols, text, is_name, non_ascii, suffix_n);
-                    },
+                    (
+                        cmd.prefix,
+                        cmd.text,
+                        cmd.is_name,
+                        cmd.is_kthread,
+                        cmd.suffix_n,
+                        cmd.basename_fg,
+                    ),
+                    |c: &mut Cell| write_command(c, &cmd),
                 );
             });
         }
     });
 }
 
-#[allow(clippy::similar_names)]
-fn write_command(
-    c: &mut Cell,
-    prefix: &str,
+/// A per-cell style: a semantic foreground over the row's (selection) background, built
+/// through etch's `Style` API rather than a raw struct literal.
+fn cell(fg: Option<Rgb>, bg: Option<Rgb>) -> Style {
+    Style::NONE.with_fg(fg).with_bg(bg)
+}
+
+/// The Command-basename color, exe-deleted taking visual priority over deleted-lib.
+fn basename_color(exe_deleted: bool, uses_deleted_lib: bool) -> Rgb {
+    if exe_deleted {
+        palette::EXE_DELETED
+    } else if uses_deleted_lib {
+        palette::LIB_DELETED
+    } else {
+        palette::BASENAME
+    }
+}
+
+/// Everything the Command cell needs to render itself, gathered once per row so the fill
+/// closure (and its gate) has a single value to close over.
+struct CommandCell<'a> {
+    prefix: &'a str,
     prefix_cols: usize,
-    text: &[u8],
+    text: &'a [u8],
+    /// The cmdline was empty/inaccessible, so `text` is the `comm` name, not a command line.
     is_name: bool,
+    is_kthread: bool,
     non_ascii: bool,
     suffix_n: u32,
-) {
-    c.glyph(prefix, prefix_cols);
-    if is_name {
+    basename_fg: Rgb,
+}
+
+fn write_command(c: &mut Cell, cmd: &CommandCell) {
+    c.set_fg(palette::TREE);
+    c.glyph(cmd.prefix, cmd.prefix_cols);
+
+    if cmd.is_kthread {
+        // Kernel thread (no cmdline): synthesize the familiar `[name]` bracket convention
+        // (the kernel stores the name unbracketed), dim.
+        c.set_fg(palette::KTHREAD);
         c.ascii(b"[");
-        push_text(c, text, non_ascii);
+        push_text(c, cmd.text, cmd.non_ascii);
         c.ascii(b"]");
+    } else if cmd.is_name {
+        // Userspace with an empty/inaccessible cmdline: show `comm` plainly — no brackets, it
+        // is a real process — colored as a basename.
+        c.set_fg(cmd.basename_fg);
+        push_text(c, cmd.text, cmd.non_ascii);
     } else {
-        push_text(c, text, non_ascii);
+        write_cmdline(c, cmd.text, cmd.non_ascii, cmd.basename_fg);
     }
-    if suffix_n > 0 {
-        let _ = write!(c, " [+{suffix_n}]");
+
+    if cmd.suffix_n > 0 {
+        c.set_fg(palette::TREE);
+        let _ = write!(c, " [+{}]", cmd.suffix_n);
+    }
+}
+
+/// A userspace command line: dim path prefix, bright (or exe/lib-tinted) basename, and the
+/// arguments in the default color. `argv[0]` runs to the first space; its basename is what
+/// follows the last `/`. Both split points are ASCII bytes, so the slices stay UTF-8-valid.
+fn write_cmdline(c: &mut Cell, text: &[u8], non_ascii: bool, basename_fg: Rgb) {
+    let argv0_end = text.iter().position(|&b| b == b' ').unwrap_or(text.len());
+    let base_start = text[..argv0_end]
+        .iter()
+        .rposition(|&b| b == b'/')
+        .map_or(0, |i| i + 1);
+
+    if base_start > 0 {
+        c.set_fg(palette::PATH);
+        push_text(c, &text[..base_start], non_ascii);
+    }
+    c.set_fg(basename_fg);
+    push_text(c, &text[base_start..argv0_end], non_ascii);
+    if argv0_end < text.len() {
+        c.reset_fg(); // arguments in the terminal default color
+        push_text(c, &text[argv0_end..], non_ascii);
     }
 }
 
@@ -318,19 +395,6 @@ fn push_text(c: &mut Cell, text: &[u8], non_ascii: bool) {
         c.unicode(text);
     } else {
         c.ascii(text);
-    }
-}
-
-fn row_style(selected: bool, state: u8) -> Style {
-    if selected {
-        Style::fg(Color::White).bg(Color::DarkGrey)
-    } else {
-        match state {
-            b'R' => Style::fg(Color::Green),
-            b'Z' => Style::fg(Color::Red),
-            b'T' | b't' => Style::fg(Color::Yellow),
-            _ => Style::NONE,
-        }
     }
 }
 

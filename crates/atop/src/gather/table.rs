@@ -12,10 +12,10 @@ use std::time::Instant;
 use thoop::{Arena, Gen, GenStore, Ref, StrStore, StringRef, ThpMap};
 
 use super::config::{CMD_SLOT, env_u32};
-use super::cpu::{CpuRing, MIN_SAMPLE, elapsed_jiffies};
+use super::cpu::{ACTIVE_SAMPLES, CpuRing, MIN_SAMPLE, elapsed_jiffies};
 use super::parse;
-use crate::procs::{Cmd, ProcessEntry, Procs};
-use crate::sys::ProcPath;
+use crate::procs::{CapLevel, Cmd, ProcessEntry, Procs};
+use crate::sys::{self, ProcPath};
 
 /// A freshly-seen PID reads cmdline/uid every cycle for this many cycles (exec/argv
 /// still settling — `nginx`/`postgres` rewrite their argv after exec) before dropping
@@ -25,6 +25,28 @@ const CMDLINE_SETTLE_GENS: u32 = 3;
 /// `(cur_gen + p) % N == 0`, so ~1/N settled PIDs refresh each cycle (no thundering herd).
 /// At `REFRESH_MS=500` and `N=16`, worst-case staleness ≈ 8 s. See [`cmdline_refresh_n`].
 const CMDLINE_REFRESH_N: u32 = 16;
+
+/// A process must be at least this many cycles old before its first deleted-library maps
+/// scan — matches the settling window used elsewhere (~10 s at `REFRESH_MS=500`), so a
+/// freshly-exec'd process isn't scanned while its mappings are still churning.
+const LIB_SETTLE_GENS: u64 = 20;
+/// Minimum cycles between deleted-library re-scans of the same process (~60 s at 500 ms).
+/// The maps parse is the heavy check, so it is re-resolved rarely — a `dlclose`/`dlopen`
+/// swap is not urgent to surface.
+const LIB_RECHECK_GENS: u64 = 120;
+/// Cap on deleted-library maps scans started per cycle, bounding the I/O cost regardless of
+/// PID count. Due processes are scanned in PID order until the budget runs out; because a
+/// scanned process then isn't due again for `LIB_RECHECK_GENS`, the whole population is
+/// covered every `live_procs / LIB_CHECKS_PER_CYCLE` cycles without a separate cursor.
+const LIB_CHECKS_PER_CYCLE: u32 = 12;
+
+/// The kernel appends this to a `/proc/<pid>/exe` symlink target, or a `/proc/<pid>/maps`
+/// mapping path, once the backing on-disk file is unlinked or replaced.
+const DELETED_SUFFIX: &[u8] = b" (deleted)";
+/// Upper bound on bytes read from a `/proc/<pid>/maps` file — a defensive cap against a
+/// pathologically large address space; a truncated tail can only cause a bounded false
+/// negative, self-healed on the next re-scan.
+const MAPS_MAX: usize = 1 << 20;
 
 /// The generational `Cmd` string store (cmdlines), keyed off the gatherer's `u64`
 /// generation. Slots persist across cycles; an unchanged cmdline keeps its slot.
@@ -66,6 +88,15 @@ struct PidMeta {
     cmd: StringRef<Cmd>,
     /// The cmdline contains a byte ≥ 0x80 (renderer unicode path).
     cmd_non_ascii: bool,
+    /// Effective-capability privilege level (from `/proc/<pid>/status`), refreshed on the
+    /// coarse cadence like uid/cmdline.
+    caps: CapLevel,
+    /// `/proc/<pid>/exe` was marked `" (deleted)"` — the running binary is gone from disk.
+    /// Absorbing per incarnation: once observed, latched here for the process's lifetime.
+    exe_deleted: bool,
+    /// An executable mapping in `/proc/<pid>/maps` points at a deleted file (a replaced .so).
+    /// Transient — re-resolved on the coarse [`LIB_RECHECK_GENS`] cadence.
+    uses_deleted_lib: bool,
 }
 
 impl PidMeta {
@@ -73,6 +104,9 @@ impl PidMeta {
         uid: u32::MAX,
         cmd: StringRef::EMPTY,
         cmd_non_ascii: false,
+        caps: CapLevel::None,
+        exe_deleted: false,
+        uses_deleted_lib: false,
     };
 }
 
@@ -93,6 +127,9 @@ pub(crate) struct PidSlot {
     first_seen_gen: u64,
     /// Generation last seen — evicts vanished PIDs.
     seen_gen: u64,
+    /// Generation of the last deleted-library maps scan (0 = never). Rate-limits the heavy
+    /// scan to once per [`LIB_RECHECK_GENS`]; reset on PID reuse with the rest of the slot.
+    lib_checked_gen: u64,
 }
 
 /// PID → [`PidSlot`], the per-cycle randomly-probed lookup that coordinates every per-PID
@@ -133,6 +170,9 @@ pub(crate) struct ProcTable {
     last: Option<Instant>,
     clk_tck: u64,
     refresh_n: u32,
+    /// Full effective-capability mask for this kernel (`cap_last_cap`), read once at startup —
+    /// a masked `CapEff` equal to it means the process holds every capability.
+    cap_full_mask: u64,
     /// The active source already fills the row's `uid` (the BPF task iterator carries it), so
     /// the cmdline read here must **not** overwrite it — a failed/permission-denied cmdline
     /// open would otherwise clobber a good uid with `u32::MAX`. The `/proc` path leaves this
@@ -157,6 +197,7 @@ impl ProcTable {
             last: None,
             clk_tck,
             refresh_n,
+            cap_full_mask: sys::cap_full_mask(),
             source_provides_uid,
             reader: ProcReader::new(),
         }
@@ -219,6 +260,9 @@ impl ProcTable {
             window.map(|e| u32::try_from(elapsed_jiffies(e, self.clk_tck)).unwrap_or(u32::MAX));
 
         let refresh_n = self.refresh_n;
+        let cap_full_mask = self.cap_full_mask;
+        // Per-cycle budget for the heavy deleted-library maps scan (see [`LIB_CHECKS_PER_CYCLE`]).
+        let mut lib_budget = LIB_CHECKS_PER_CYCLE;
 
         for i in 0..procs.as_slice().len() {
             let mut e = procs.row(i); // copy out — no live row ref spans a store op below
@@ -234,16 +278,7 @@ impl ProcTable {
             });
 
             // CPU ring (hot): mutated in place; its &mut never spans the cmd/meta ops below.
-            let cpu_ref = match prior {
-                Some(s) => s.cpu,
-                None => self.cpu.insert(Gen::ALIVE, CpuRing::new(e.ticks)),
-            };
-            {
-                let ring = self.cpu.get_mut(cpu_ref);
-                ring.sample(e.ticks, jiff, reused, prior.is_some());
-                e.cpu_pct = ring.avg();
-                e.cpu_peak = ring.peak();
-            }
+            let cpu_ref = self.sample_cpu(&mut e, prior, reused, jiff);
 
             // Metadata (cold): uid + cmdline on the cadence.
             let stagger =
@@ -266,8 +301,46 @@ impl ProcTable {
             // Explicit field borrows: `fresh` borrows `self.reader`, refresh_meta touches only
             // `self.meta`/`self.cmd_store` — disjoint, so the cmdline bytes intern straight from
             // the reader's buffer with no intermediate copy.
-            let pm =
+            let mut pm =
                 Self::refresh_meta(&mut self.meta, &mut self.cmd_store, meta_ref, reused, fresh);
+
+            // Deleted-binary detection (userspace only — kthreads have neither exe nor maps).
+            // A PID-reuse resets the flags with the rest of the incarnation (`PidMeta::EMPTY`
+            // from `refresh_meta`), so `pm` already carries the prior incarnation's latched
+            // state where applicable.
+            let first_seen_gen = match prior {
+                Some(s) if !reused => s.first_seen_gen,
+                _ => cur_gen,
+            };
+            let prior_lib_gen = match prior {
+                Some(s) if !reused => s.lib_checked_gen,
+                _ => 0,
+            };
+            // Kernel threads run in-kernel with a full capability set, but they are the kernel,
+            // not privileged userspace — leave their metadata unremarkable and skip the reads.
+            let lib_checked_gen = if e.is_kthread {
+                0
+            } else {
+                Self::refresh_deletions(
+                    &mut self.reader,
+                    &mut pm,
+                    pid,
+                    &mut lib_budget,
+                    DelCtx {
+                        refresh,
+                        // Effective capabilities are fixed at exec and effectively static, so
+                        // read them only through the settling window (new / reused / settling),
+                        // never on the steady-state stagger — a permanent per-tick status read
+                        // for a value that does not change.
+                        cap_refresh: prior.is_none() || reused || settling,
+                        cap_full_mask,
+                        age: cur_gen.wrapping_sub(first_seen_gen),
+                        prior_lib_gen,
+                        cur_gen,
+                    },
+                )
+            };
+            self.meta.assign(meta_ref, pm);
 
             // uid: the BPF source already set it on the row; the `/proc` source has no other
             // source than this table's read, so take it from the refreshed metadata.
@@ -278,16 +351,17 @@ impl ProcTable {
             if !pm.cmd.is_empty() {
                 e.non_ascii |= pm.cmd_non_ascii;
             }
+            e.exe_deleted = pm.exe_deleted;
+            e.uses_deleted_lib = pm.uses_deleted_lib;
+            e.caps = pm.caps;
 
             let slot = PidSlot {
                 cpu: cpu_ref,
                 meta: meta_ref,
                 start_time: e.start_time,
-                first_seen_gen: match prior {
-                    Some(s) if !reused => s.first_seen_gen,
-                    _ => cur_gen,
-                },
+                first_seen_gen,
                 seen_gen: cur_gen,
+                lib_checked_gen,
             };
             // Write the slot back: a known PID overwrites at its already-probed slot (no second
             // probe); a birth inserts (may rehash → relocate sibling chunks, all self-healed).
@@ -330,6 +404,36 @@ impl ProcTable {
                 false
             }
         });
+    }
+
+    /// Fold this cycle's tick observation into the PID's hot CPU ring (creating it for a birth),
+    /// writing the derived `cpu_pct`/`cpu_peak` and the display-state override onto the row.
+    /// Returns the ring's slot for the caller to store in `PidSlot`. The ring `&mut` never spans
+    /// a cmd/meta store op (which could relocate a chunk), so it stays a tight in-place borrow.
+    fn sample_cpu(
+        &mut self,
+        e: &mut ProcessEntry,
+        prior: Option<PidSlot>,
+        reused: bool,
+        jiff: Option<u32>,
+    ) -> Ref<CpuRing> {
+        let cpu_ref = match prior {
+            Some(s) => s.cpu,
+            None => self.cpu.insert(Gen::ALIVE, CpuRing::new(e.ticks)),
+        };
+        let ring = self.cpu.get_mut(cpu_ref);
+        ring.sample(e.ticks, jiff, reused, prior.is_some());
+        e.cpu_pct = ring.avg();
+        e.cpu_peak = ring.peak();
+        // Display-time state: a process that ran in the recent window reads `R` stably;
+        // otherwise the raw kernel state stands (so D/Z/T/X appear only when the process
+        // genuinely isn't executing). Raw `state` is untouched (kill-safety / diagnostics).
+        e.display_state = if ring.had_ticks(ACTIVE_SAMPLES) {
+            b'R'
+        } else {
+            e.state
+        };
+        cpu_ref
     }
 
     /// Update this PID's cold metadata slot and return the new record (also written back).
@@ -375,6 +479,65 @@ impl ProcTable {
         meta.assign(meta_ref, pm);
         pm
     }
+
+    /// Resolve a userspace PID's capability level and deleted-binary flags into `pm`, returning
+    /// the generation of its last deleted-library scan (stored in `PidSlot`). An associated fn
+    /// over the reader + the caller's local `pm` so it composes with the disjoint store borrows
+    /// around it, exactly like [`refresh_meta`](Self::refresh_meta).
+    ///
+    /// Each signal refreshes on the cadence its change-rate warrants: caps only through the
+    /// settling window (`cap_refresh` — they are fixed at exec); exe-deleted is absorbing
+    /// (re-probed on the cmdline cadence only while unmarked, then latched); deleted-lib is
+    /// transient (first scan after settling, then ≤ once per [`LIB_RECHECK_GENS`], globally
+    /// ≤ [`LIB_CHECKS_PER_CYCLE`] per cycle). Exe deletion takes visual priority, so when it is
+    /// set the (heavier, redundant) maps scan is skipped and any prior lib warning cleared.
+    fn refresh_deletions(
+        reader: &mut ProcReader,
+        pm: &mut PidMeta,
+        pid: u32,
+        lib_budget: &mut u32,
+        ctx: DelCtx,
+    ) -> u64 {
+        if ctx.cap_refresh {
+            pm.caps = cap_level(ctx.cap_full_mask, reader.cap_eff(pid));
+        }
+        if ctx.refresh && !pm.exe_deleted {
+            pm.exe_deleted = reader.exe_deleted(pid);
+        }
+        if pm.exe_deleted {
+            pm.uses_deleted_lib = false;
+            return ctx.prior_lib_gen;
+        }
+        let due = ctx.age >= LIB_SETTLE_GENS
+            && (ctx.prior_lib_gen == 0
+                || ctx.cur_gen.wrapping_sub(ctx.prior_lib_gen) >= LIB_RECHECK_GENS);
+        if due && *lib_budget > 0 {
+            pm.uses_deleted_lib = reader.lib_deleted(pid);
+            *lib_budget -= 1;
+            ctx.cur_gen
+        } else {
+            ctx.prior_lib_gen
+        }
+    }
+}
+
+/// Cadence inputs for [`ProcTable::refresh_deletions`], grouped so the call stays a few
+/// arguments. All are per-PID values the caller already computed for the metadata refresh.
+#[derive(Clone, Copy)]
+struct DelCtx {
+    /// The cmdline cadence fired this cycle — the trigger for the (absorbing) exe re-probe.
+    refresh: bool,
+    /// The PID is new / reused / still settling — the only window in which capabilities (fixed
+    /// at exec) are read, so the steady state issues no per-tick status read.
+    cap_refresh: bool,
+    /// Full capability mask for this kernel (for classifying `CapEff`).
+    cap_full_mask: u64,
+    /// Cycles since first seen — gates the first deleted-library scan (settling).
+    age: u64,
+    /// Generation of the prior deleted-library scan (0 = never), for the re-check interval.
+    prior_lib_gen: u64,
+    /// The generation being built.
+    cur_gen: u64,
 }
 
 /// What one `/proc/<pid>` identity read yields: owner `uid`, the cleaned cmdline `bytes`
@@ -410,6 +573,9 @@ impl CmdlineRead<'static> {
 struct ProcReader {
     path: ProcPath,
     buf: Vec<u8>,
+    /// Reused read buffer for whole multi-line `/proc/<pid>` files (`maps`, `status`) — grown
+    /// once to the largest file seen, never per-call allocated.
+    read_buf: Vec<u8>,
 }
 
 impl ProcReader {
@@ -417,7 +583,82 @@ impl ProcReader {
         Self {
             path: ProcPath::new(),
             buf: vec![0u8; CMD_SLOT],
+            read_buf: Vec::new(),
         }
+    }
+
+    /// Read a whole `/proc/<pid>/<suffix>` into [`read_buf`](Self::read_buf), returning the
+    /// slice (capped at [`MAPS_MAX`]). The shared reader for the multi-line files whose field
+    /// we scan for rather than parse positionally.
+    fn read_all(&mut self, pid: u32, suffix: &[u8]) -> &[u8] {
+        let ptr = self.path.write(pid, suffix);
+        // SAFETY: valid C path, read-only.
+        let fd = unsafe { libc::open(ptr, libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            self.read_buf.clear();
+            return &self.read_buf;
+        }
+        self.read_buf.clear();
+        let mut chunk = [0u8; 8192];
+        loop {
+            // SAFETY: chunk is a valid writable buffer; fd is open.
+            let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            let Ok(n) = usize::try_from(n) else { break }; // <0 ⇒ error
+            if n == 0 {
+                break; // EOF
+            }
+            self.read_buf
+                .extend_from_slice(&chunk[..n.min(chunk.len())]);
+            if self.read_buf.len() >= MAPS_MAX {
+                break;
+            }
+        }
+        // SAFETY: our fd, closed once.
+        unsafe { libc::close(fd) };
+        &self.read_buf
+    }
+
+    /// The process's effective-capability mask from `/proc/<pid>/status` (`CapEff:` line, hex).
+    /// 0 if unreadable. Scanned, not positionally parsed — the line's order in `status` is not
+    /// contractual.
+    fn cap_eff(&mut self, pid: u32) -> u64 {
+        self.read_all(pid, b"status");
+        self.read_buf
+            .split(|&b| b == b'\n')
+            .find_map(|line| line.strip_prefix(b"CapEff:").map(parse_hex))
+            .unwrap_or(0)
+    }
+
+    /// Whether `/proc/<pid>/exe` resolves to a target the kernel marked `" (deleted)"` — the
+    /// running binary was unlinked or replaced on disk. One `readlink`, nothing opened; a pure
+    /// suffix check. Uses a local buffer (not `self.buf`), so it never clobbers cmdline bytes a
+    /// caller may still hold.
+    fn exe_deleted(&mut self, pid: u32) -> bool {
+        let ptr = self.path.write(pid, b"exe");
+        let mut target = [0u8; 4096];
+        // SAFETY: valid C path; readlink writes ≤ len bytes into the local buffer (no NUL).
+        let n = unsafe { libc::readlink(ptr, target.as_mut_ptr().cast(), target.len()) };
+        let len = usize::try_from(n).unwrap_or(0).min(target.len());
+        target[..len].ends_with(DELETED_SUFFIX)
+    }
+
+    /// Whether any executable (`x`-perm) mapping in `/proc/<pid>/maps` points at a deleted
+    /// file — a replaced/unlinked shared library. Heavier than [`exe_deleted`] (a whole
+    /// multi-line file), so the caller rate-limits it.
+    fn lib_deleted(&mut self, pid: u32) -> bool {
+        // A maps line is `addr perms offset dev inode path`; an executable mapping has `x` as
+        // the third perms char, and the path is the line's tail — so an exec line ending in
+        // " (deleted)" is a deleted library.
+        self.read_all(pid, b"maps")
+            .split(|&b| b == b'\n')
+            .any(|line| {
+                let perms = line
+                    .split(|&b| b == b' ')
+                    .filter(|f| !f.is_empty())
+                    .nth(1)
+                    .unwrap_or(&[]);
+                perms.get(2) == Some(&b'x') && line.ends_with(DELETED_SUFFIX)
+            })
     }
 
     /// Read `/proc/<pid>/cmdline` (cleaned: NUL→space) plus the owner `uid` from the same fd's
@@ -456,5 +697,114 @@ impl ProcReader {
             bytes: &self.buf[..clean_len as usize],
             non_ascii,
         }
+    }
+}
+
+/// Classify an effective-capability mask against the kernel's full set: nothing, some, or all.
+/// Bits above `cap_last_cap` are masked off first (a process may carry higher bits that this
+/// kernel doesn't define).
+fn cap_level(full_mask: u64, eff: u64) -> CapLevel {
+    match eff & full_mask {
+        0 => CapLevel::None,
+        m if m == full_mask => CapLevel::Full,
+        _ => CapLevel::Partial,
+    }
+}
+
+/// Parse an ASCII hex integer, skipping leading whitespace and stopping at the first non-hex
+/// byte (e.g. the trailing newline). Saturates rather than wraps on overflow (a `CapEff` value
+/// never exceeds 64 bits, so this is a defensive guard, not a real case).
+fn parse_hex(b: &[u8]) -> u64 {
+    let mut v: u64 = 0;
+    for &c in b {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            b' ' | b'\t' => continue,
+            _ => break,
+        };
+        v = (v << 4) | u64::from(d);
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{CapLevel, ProcReader, cap_level, parse_hex};
+
+    #[test]
+    fn cap_level_buckets() {
+        let full = 0x1ff; // a pretend 9-bit capability set
+        assert_eq!(cap_level(full, 0), CapLevel::None);
+        assert_eq!(cap_level(full, full), CapLevel::Full);
+        assert_eq!(cap_level(full, 0x004), CapLevel::Partial);
+        // Bits above the kernel's defined set are masked off before classifying.
+        assert_eq!(cap_level(full, u64::MAX), CapLevel::Full);
+    }
+
+    #[test]
+    fn parse_hex_reads_capeff_field() {
+        assert_eq!(parse_hex(b" 0000000000000000\n"), 0);
+        assert_eq!(parse_hex(b"\t00000000a80425fb\n"), 0xa804_25fb);
+        assert_eq!(parse_hex(b"000001ffffffffff"), 0x1ff_ffff_ffff);
+    }
+
+    #[test]
+    fn own_cap_eff_is_readable() {
+        // Reading our own status must not panic/hang; the value depends on how we were run.
+        let mut r = ProcReader::new();
+        let _ = r.cap_eff(std::process::id());
+    }
+
+    #[test]
+    fn own_exe_and_libs_are_not_deleted() {
+        let mut r = ProcReader::new();
+        let me = std::process::id();
+        assert!(!r.exe_deleted(me), "our own binary is present on disk");
+        assert!(!r.lib_deleted(me), "our own libraries are present on disk");
+    }
+
+    /// A binary unlinked while still running: the kernel marks `/proc/<pid>/exe` " (deleted)".
+    /// Copies a real binary to a temp path, execs it, waits for the exec to complete, then
+    /// unlinks it. Skips (rather than fails) if the environment lacks a binary to copy or the
+    /// temp dir is noexec — the default suite must not hard-require external state.
+    #[test]
+    fn detects_deleted_exe() {
+        let Some(src) = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        else {
+            eprintln!("no sleep binary — skipping");
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("atop_deltest_{}", std::process::id()));
+        if std::fs::copy(src, &path).is_err() {
+            eprintln!("temp copy failed — skipping");
+            return;
+        }
+        let mut child = match std::process::Command::new(&path).arg("30").spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                eprintln!("spawn from temp failed ({e}) — skipping");
+                return;
+            }
+        };
+        // Let the child finish exec'ing before unlinking (unlinking pre-exec would ENOENT the
+        // exec); once running, the inode stays open, so the unlink marks exe " (deleted)".
+        std::thread::sleep(Duration::from_millis(150));
+        let _ = std::fs::remove_file(&path);
+
+        let mut r = ProcReader::new();
+        let deleted = r.exe_deleted(child.id());
+        child.kill().ok();
+        child.wait().ok();
+        assert!(
+            deleted,
+            "a running binary unlinked from disk must read exe_deleted"
+        );
     }
 }

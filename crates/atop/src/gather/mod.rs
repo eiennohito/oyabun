@@ -12,6 +12,7 @@
 //! - [`parse`] — the `/proc/<pid>/stat` byte-wise parser.
 //! - [`table`] — the per-PID [`ProcTable`](table::ProcTable) (CPU history + uid/cmdline + index).
 //! - [`cpu`] — the per-process CPU% ring (per-core rate, moving average + peak).
+//! - [`ring`] — the fixed-capacity wraparound ring both CPU samplers build on.
 //! - [`sysstat`] — the per-cycle system-wide sampler (CPU/mem/load).
 //! - [`config`] — env-overridable tuning knobs + the slot-size/ring constants.
 //! - [`fxhash`] — the fast PID hasher shared by the backends and the BPF source.
@@ -24,6 +25,7 @@ mod fxhash;
 mod gatherer;
 mod parse;
 mod procfs;
+mod ring;
 mod syscall;
 mod sysstat;
 mod table;

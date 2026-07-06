@@ -1,5 +1,6 @@
 mod app;
 mod gather;
+mod palette;
 mod procs;
 mod sys;
 mod tree;

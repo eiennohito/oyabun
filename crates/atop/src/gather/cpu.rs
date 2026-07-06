@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use super::config::REFRESH_MS;
+use super::ring::Ring;
 
 /// CPU averaging / peak window as wall-clock time — the controllable knob (start:
 /// 10 s). Longer = a calmer moving average and a longer spike memory.
@@ -21,6 +22,17 @@ const CPU_WINDOW: usize = {
 /// Below this elapsed interval the rate is too quantized (sub-jiffy) to be
 /// meaningful — carry the windowed values forward instead of sampling.
 pub(crate) const MIN_SAMPLE: Duration = Duration::from_millis(100);
+
+/// Window for the display-state "R" override (see [`CpuRing::had_ticks`]) as wall-clock
+/// time — short enough that a genuinely idle process reverts to its real state within a
+/// couple of seconds, long enough that a low-but-active process reads R without flicker.
+const ACTIVE_WINDOW_MS: u64 = 2_000;
+/// [`ACTIVE_WINDOW_MS`] expressed in samples at the current refresh cadence — the `n`
+/// passed to [`CpuRing::had_ticks`].
+pub(crate) const ACTIVE_SAMPLES: usize = {
+    let n = (ACTIVE_WINDOW_MS / REFRESH_MS) as usize;
+    if n == 0 { 1 } else { n }
+};
 
 /// One measured interval: tick delta and the per-core jiffies it spanned.
 #[derive(Clone, Copy, Default)]
@@ -42,14 +54,13 @@ struct Sample {
 pub(crate) struct CpuRing {
     /// `utime + stime` at the last sample.
     prev_ticks: u64,
-    samples: [Sample; CPU_WINDOW],
-    next: usize,
-    len: usize,
+    /// The recent per-interval samples (storage + wraparound handled by [`Ring`]).
+    ring: Ring<Sample, CPU_WINDOW>,
     sum_ticks: u64,
     sum_jiff: u64,
     /// Cached peak rate (bp). Recomputed lazily only when the peak sample is evicted.
     peak_bp: u32,
-    /// Ring index of the sample that produced `peak_bp` (or `usize::MAX` = dirty).
+    /// Physical ring slot of the sample that produced `peak_bp` (or `usize::MAX` = dirty).
     peak_at: usize,
 }
 
@@ -57,9 +68,7 @@ impl CpuRing {
     pub(crate) fn new(prev_ticks: u64) -> Self {
         Self {
             prev_ticks,
-            samples: [Sample::default(); CPU_WINDOW],
-            next: 0,
-            len: 0,
+            ring: Ring::new(),
             sum_ticks: 0,
             sum_jiff: 0,
             peak_bp: 0,
@@ -96,19 +105,15 @@ impl CpuRing {
     }
 
     fn push(&mut self, ticks: u32, jiff: u32) {
-        let evicting_peak = self.len == CPU_WINDOW && self.next == self.peak_at;
-        if self.len == CPU_WINDOW {
-            let evicted = self.samples[self.next];
+        // The slot about to be overwritten is the peak's ⇒ the peak leaves the window.
+        let evicting_peak = self.ring.len() == CPU_WINDOW && self.ring.write_pos() == self.peak_at;
+        let idx = self.ring.write_pos();
+        if let Some(evicted) = self.ring.push(Sample { ticks, jiff }) {
             self.sum_ticks -= u64::from(evicted.ticks);
             self.sum_jiff -= u64::from(evicted.jiff);
-        } else {
-            self.len += 1;
         }
-        let idx = self.next;
-        self.samples[idx] = Sample { ticks, jiff };
         self.sum_ticks += u64::from(ticks);
         self.sum_jiff += u64::from(jiff);
-        self.next = (self.next + 1) % CPU_WINDOW;
 
         let new_rate = rate(u64::from(ticks), u64::from(jiff));
         if new_rate >= self.peak_bp {
@@ -125,14 +130,27 @@ impl CpuRing {
         rate(self.sum_ticks, self.sum_jiff)
     }
 
+    /// Whether any of the last `n` pushed samples recorded nonzero CPU ticks — i.e. the
+    /// process executed at some point in that recent window. Drives the display-state "R"
+    /// override: a point-sampled state answers "on-CPU this microsecond?", which flickers;
+    /// this answers "active recently?", which is stable. `n` is clamped to the samples held,
+    /// so a young ring (fewer than `n` samples) just examines what it has.
+    pub(crate) fn had_ticks(&self, n: usize) -> bool {
+        let count = n.min(self.ring.len());
+        (1..=count).any(|k| {
+            let i = self.ring.recent_index(k).expect("k ≤ len");
+            self.ring.slot(i).ticks > 0
+        })
+    }
+
     /// Max single-interval rate still in the window. O(1) in the common case;
     /// O(`CPU_WINDOW`) only when the previous peak sample is evicted (~1/window).
     pub(crate) fn peak(&mut self) -> u32 {
         if self.peak_at == usize::MAX {
-            // Dirty: rescan.
+            // Dirty: rescan the live slots (physical `0..len`) for the new max.
             let (mut best, mut best_at) = (0u32, 0usize);
-            for i in 0..self.len {
-                let s = &self.samples[i];
+            for i in 0..self.ring.len() {
+                let s = self.ring.slot(i);
                 let r = rate(u64::from(s.ticks), u64::from(s.jiff));
                 if r >= best {
                     best = r;
@@ -204,6 +222,25 @@ mod tests {
             h.push(50, 50); // overwrite the whole window with 100%
         }
         assert_eq!(h.avg(), 10000, "old samples must be fully evicted");
+    }
+
+    #[test]
+    fn had_ticks_tracks_recent_activity() {
+        let mut h = CpuRing::new(0);
+        assert!(!h.had_ticks(4), "an empty ring has no recent activity");
+        h.push(0, 50); // idle interval
+        assert!(!h.had_ticks(4));
+        h.push(3, 50); // ran this interval
+        assert!(h.had_ticks(4), "recent nonzero ticks ⇒ active");
+        assert!(h.had_ticks(1), "the very last sample was active");
+        // Push enough idle intervals to slide the active one out of a width-2 window but
+        // keep it inside a wider one.
+        h.push(0, 50);
+        assert!(
+            h.had_ticks(4),
+            "active sample still within the 4-wide window"
+        );
+        assert!(!h.had_ticks(1), "the last sample alone was idle");
     }
 
     #[test]

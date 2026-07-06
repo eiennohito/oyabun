@@ -12,7 +12,7 @@ use std::io::{self, Write};
 
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
-use crossterm::style::{Print, SetForegroundColor};
+use crossterm::style::Print;
 use crossterm::terminal::{Clear, ClearType};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -20,7 +20,7 @@ use crate::cell::Cell;
 use crate::hash::gate;
 use crate::line::{Line, Run};
 use crate::schema::{Align, Geom, Schema};
-use crate::style::{self, Color, Style};
+use crate::style::{self, Rgb, Style};
 
 /// Addresses one cell within the retained grid for gate comparison.
 #[derive(Clone, Copy)]
@@ -63,6 +63,8 @@ pub struct Display<W: Write> {
     batch: Vec<u8>,
     /// Reused formatting scratch for one cell/header.
     scratch: String,
+    /// Reused color runs for the multi-colored fill cell (parallels [`line_runs`]).
+    fill_runs: Vec<Run>,
     /// Reused buffers for the [`Line`] builder.
     line_text: String,
     line_runs: Vec<Run>,
@@ -79,6 +81,7 @@ impl<W: Write> Display<W> {
             rows: Vec::new(),
             batch: Vec::new(),
             scratch: String::new(),
+            fill_runs: Vec::new(),
             line_text: String::new(),
             line_runs: Vec::new(),
             must_repaint: true,
@@ -183,7 +186,9 @@ impl<W: Write> Display<W> {
         }
     }
 
-    /// Bind a fixed-width field. On a gate match (and no forced repaint) the value's
+    /// Bind a fixed-width field with an explicit per-cell style. The gate hashes
+    /// `(value, style)`, so a color-band crossing (same value, new color) repaints even
+    /// though the text is unchanged. On a gate match (and no forced repaint) the value's
     /// `Display` impl is never invoked.
     fn paint_field<T: FmtDisplay + Hash>(
         &mut self,
@@ -192,7 +197,7 @@ impl<W: Write> Display<W> {
         geom: Geom,
         value: &T,
     ) {
-        if !self.gate_cell(slot, gate(value)) {
+        if !self.gate_cell(slot, gate(&(value, style))) {
             return;
         }
         self.scratch.clear();
@@ -201,7 +206,8 @@ impl<W: Write> Display<W> {
     }
 
     /// Bind the fill column. The render closure runs only on a gate miss / forced
-    /// repaint; otherwise no formatting happens.
+    /// repaint; otherwise no formatting happens. The cell records color runs the fill
+    /// painter emits with per-run SGR.
     fn paint_fill<G: Hash>(
         &mut self,
         slot: Slot,
@@ -214,8 +220,9 @@ impl<W: Write> Display<W> {
             return;
         }
         self.scratch.clear();
+        self.fill_runs.clear();
         {
-            let mut cell = Cell::new(&mut self.scratch, geom.avail as usize);
+            let mut cell = Cell::new(&mut self.scratch, &mut self.fill_runs, geom.avail as usize);
             render(&mut cell);
         }
         paint_fill_emit(
@@ -225,6 +232,7 @@ impl<W: Write> Display<W> {
             geom.sep,
             style,
             &self.scratch,
+            &self.fill_runs,
         );
     }
 
@@ -265,11 +273,8 @@ impl<W: Write> Display<W> {
         let _ = queue!(self.batch, MoveTo(0, row));
         for run in &self.line_runs {
             let slice = &self.line_text[run.start..run.start + run.len];
-            if run.color == Color::Reset {
-                let _ = queue!(self.batch, Print(slice));
-            } else {
-                let _ = queue!(self.batch, SetForegroundColor(run.color), Print(slice));
-            }
+            style::set_fg(&mut self.batch, run.fg);
+            let _ = queue!(self.batch, Print(slice));
         }
         style::reset(&mut self.batch);
         let _ = queue!(self.batch, Clear(ClearType::UntilNewLine));
@@ -420,10 +425,17 @@ pub struct Row<'d, 's, W: Write> {
 }
 
 impl<W: Write> Row<'_, '_, W> {
-    /// Bind the next fixed column to a value. The value is both formatted (`Display`)
-    /// and gated (`Hash`) — they are the same value, so the gate can never drift from
-    /// what's shown.
+    /// Bind the next fixed column to a value in the row's style. The value is both
+    /// formatted (`Display`) and gated (`Hash`) — the same value for both, so the gate
+    /// can never drift from what's shown.
     pub fn field<T: FmtDisplay + Hash>(&mut self, value: T) {
+        self.styled_field(value, self.style);
+    }
+
+    /// Like [`field`](Self::field) but overrides the row style for this one cell — the
+    /// per-cell coloring path (magnitude gradients, categorical roles). The gate hashes
+    /// `(value, style)`, so a same-value color-band crossing still repaints.
+    pub fn styled_field<T: FmtDisplay + Hash>(&mut self, value: T, style: Style) {
         let i = self.idx;
         self.idx += 1;
         let geom = self.schema.geom(i);
@@ -432,7 +444,7 @@ impl<W: Write> Row<'_, '_, W> {
             idx: i,
             full: self.full,
         };
-        self.d.paint_field(slot, self.style, geom, &value);
+        self.d.paint_field(slot, style, geom, &value);
     }
 
     /// Bind the fill column: an explicit gate plus a render closure (run only on a
@@ -520,20 +532,35 @@ fn paint_fixed(out: &mut Vec<u8>, row: u16, geom: Geom, style: Style, content: &
     }
 }
 
-fn paint_fill_emit(out: &mut Vec<u8>, row: u16, x: u16, sep: u16, style: Style, content: &str) {
+fn paint_fill_emit(
+    out: &mut Vec<u8>,
+    row: u16,
+    x: u16,
+    sep: u16,
+    style: Style,
+    content: &str,
+    runs: &[Run],
+) {
     let _ = queue!(out, MoveTo(x, row));
-    let styled = !style.is_default();
-    if styled {
-        style.enter(out);
-    }
+    // The base style (selection bg / bold) applies to the whole cell; each run overrides
+    // only the foreground (a `None` run falls back to the style's fg).
+    style.enter(out);
     write_spaces(out, sep as usize);
-    let _ = queue!(out, Print(content));
+    let mut cur: Option<Option<Rgb>> = None;
+    for run in runs {
+        let fg = run.fg.or(style.fg);
+        if cur != Some(fg) {
+            style::set_fg(out, fg);
+            cur = Some(fg);
+        }
+        let _ = queue!(out, Print(&content[run.start..run.start + run.len]));
+    }
     // Clear to EOL: erases a shrunken cmdline's tail, and (under a selection bg)
     // extends the highlight to the screen edge.
     let _ = queue!(out, Clear(ClearType::UntilNewLine));
-    if styled {
-        style::reset(out);
-    }
+    // Always reset: a colored run leaves foreground state that must not bleed into the
+    // next row even when the base style itself was the terminal default.
+    style::reset(out);
 }
 
 /// Append `content` aligned within a fixed column's geometry to a string (header use).

@@ -21,6 +21,23 @@ pub const COMM_CAP: usize = 15;
 /// the `Cmd` store, never another store.
 pub struct Cmd;
 
+/// A process's effective-capability privilege level — the security-interesting axis on Linux
+/// (a root process that dropped its caps is harmless; a non-root process holding
+/// `CAP_SYS_ADMIN` is not). Derived from `/proc/<pid>/status` `CapEff` masked to the kernel's
+/// `cap_last_cap`. Drives the USER column's color. `#[repr(u8)]` with `None` = 0 so a zeroed
+/// row is a valid, unremarkable value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[repr(u8)]
+pub enum CapLevel {
+    /// No effective capabilities — an ordinary unprivileged process (the common case).
+    #[default]
+    None,
+    /// Some, but not all, capabilities — holds specific elevated privileges.
+    Partial,
+    /// The complete capability set — root-equivalent, can do anything.
+    Full,
+}
+
 /// System-wide resource snapshot, computed once per gather cycle.
 #[derive(Clone, Copy, Default, Hash)]
 pub struct SystemStats {
@@ -93,13 +110,25 @@ impl InlineComm {
 
 /// Per-process record. POD (`Flat`) — lives in a [`TypedBuf`] on huge pages; `clear` drops
 /// nothing, enabling zero-alloc reuse each cycle.
+// A flat data row of independent per-process signals, not a configuration struct — the several
+// `bool` flags each mean a distinct thing and are set from unrelated sources, so bundling them
+// would only obscure them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy)]
 pub struct ProcessEntry {
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
-    /// Process state char (`R`, `S`, `Z`, …) as a raw byte.
+    /// Process state char (`R`, `S`, `Z`, …) as a raw byte — the point-sampled kernel
+    /// state. Load-bearing for kill-safety and diagnostics; the S *column* renders
+    /// [`display_state`](Self::display_state) instead.
     pub state: u8,
+    /// Display-time state for the S column: `R` if the process accumulated CPU ticks in
+    /// the recent window (see [`CpuRing::had_ticks`](crate::gather)), else the raw
+    /// [`state`](Self::state). Answers "is this process active?" rather than "was it
+    /// on-CPU the instant we sampled?", so it doesn't flicker. Written by the per-PID
+    /// table after the CPU update; never read for kill or task tallies.
+    pub display_state: u8,
     /// Kernel scheduling priority (lower = higher priority). Normal: 20+nice.
     pub priority: i8,
     /// Nice value (−20 … 19). User-controllable scheduling hint.
@@ -133,6 +162,18 @@ pub struct ProcessEntry {
     /// `PF_KTHREAD` set in stat `flags` — a kernel thread. Its `/proc/<pid>/cmdline`
     /// is permanently empty, so the gatherer never reads it (parsed free from stat).
     pub is_kthread: bool,
+    /// The on-disk binary behind `/proc/<pid>/exe` was unlinked or replaced (the kernel
+    /// appends `" (deleted)"` to the symlink target). Absorbing per incarnation — once set,
+    /// latched. Colors the Command basename as an alarm.
+    pub exe_deleted: bool,
+    /// An executable mapping in `/proc/<pid>/maps` points at a deleted/replaced file (e.g. a
+    /// linked `.so` swapped out by a system update). Transient — re-resolved on a coarse
+    /// cadence. Colors the Command basename as a warning (unless `exe_deleted` takes priority).
+    pub uses_deleted_lib: bool,
+    /// Effective-capability privilege level (from `/proc/<pid>/status`, coarse cadence).
+    /// Colors the USER column — the interesting axis is what a process *can do*, not who owns
+    /// it. Kernel threads and unprivileged processes read [`CapLevel::None`].
+    pub caps: CapLevel,
 
     // --- tree links (filled by `tree::build`) ---
     /// Index of parent in the buffer, or [`NONE`] for roots.
@@ -158,6 +199,7 @@ impl ProcessEntry {
         ppid: 0,
         uid: 0,
         state: b'?',
+        display_state: b'?',
         priority: 0,
         nice: 0,
         num_threads: 0,
@@ -170,6 +212,9 @@ impl ProcessEntry {
         cmdline: StringRef::EMPTY,
         non_ascii: false,
         is_kthread: false,
+        exe_deleted: false,
+        uses_deleted_lib: false,
+        caps: CapLevel::None,
         parent_idx: NONE,
         first_child: NONE,
         next_sibling: NONE,

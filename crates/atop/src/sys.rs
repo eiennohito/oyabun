@@ -24,6 +24,22 @@ pub fn num_cpus() -> u32 {
     u32::try_from(v).unwrap_or(1).max(1)
 }
 
+/// The full effective-capability mask for the running kernel: `(1 << (cap_last_cap+1)) − 1`.
+/// Read once at startup from `/proc/sys/kernel/cap_last_cap`; a process whose masked `CapEff`
+/// equals this holds every capability (root-equivalent). Falls back to a 41-bit set
+/// (`CAP_CHECKPOINT_RESTORE`-era) if the file is unreadable.
+pub fn cap_full_mask() -> u64 {
+    let mut buf = [0u8; 32];
+    let data = read_proc_file(c"/proc/sys/kernel/cap_last_cap".as_ptr(), &mut buf);
+    let line = data.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let last = parse_u64_bytes(line).unwrap_or(40);
+    if last >= 63 {
+        u64::MAX
+    } else {
+        (1u64 << (last + 1)) - 1
+    }
+}
+
 /// Soft `RLIMIT_NOFILE` — the ceiling on open fds for this process, which bounds the
 /// persistent-fd pool (a held fd per tracked PID). Containers commonly cap this at
 /// 256/512; tests can lower it with `ulimit -n`. Falls back to 1024 (the historic

@@ -13,13 +13,15 @@
 //! ]);
 //! let mut display = Display::new(io::stdout());
 //!
+//! let cyan = Rgb(0, 200, 200);
 //! let mut frame = display.begin_frame(width, height);
-//! frame.line(0, |l| { l.span("CPU[", Color::Cyan); l.bar(8, '|', Color::Green); l.fill(' '); });
-//! frame.header(1, &schema, Style::fg(Color::Cyan).bold());
+//! frame.line(0, |l| { l.span("CPU[", cyan); l.bar(8, '|', Rgb(0, 200, 0)); l.fill(' '); });
+//! frame.header(1, &schema, Style::fg(cyan).bold());
 //! frame.table(&schema, 2, height - 3, |t| {
 //!     for p in &procs {
 //!         t.row(u64::from(p.pid), Style::NONE, |r| {
 //!             r.field(p.pid);
+//!             r.styled_field(p.cpu, Style::fg(cpu_color(p.cpu)));
 //!             r.fill(p.cmdline_ref, |c| c.ascii(p.cmdline));
 //!         });
 //!     }
@@ -38,4 +40,4 @@ pub use cell::Cell;
 pub use display::{Display, Frame, Row, Table};
 pub use line::Line;
 pub use schema::{Align, ColSpec, Schema};
-pub use style::{Color, Style};
+pub use style::{Rgb, Style};

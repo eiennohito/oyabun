@@ -26,6 +26,8 @@ mod gatherer;
 mod nvml;
 mod parse;
 mod procfs;
+#[cfg(feature = "record")]
+mod record;
 #[cfg(test)]
 pub(crate) mod replay;
 mod ring;

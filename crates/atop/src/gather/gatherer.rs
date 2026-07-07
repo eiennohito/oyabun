@@ -11,6 +11,8 @@ use thoop::Arena;
 use super::config::INITIAL_ROWS;
 use super::nvml::NvmlSampler;
 use super::procfs::ProcSource;
+#[cfg(feature = "record")]
+use super::record::Recorder;
 #[cfg(test)]
 use super::replay::ReplaySource;
 use super::source::{Source, SourceCtx};
@@ -148,6 +150,8 @@ pub struct Gatherer {
     tree_order: Vec<u32>,
     page_size: u64,
     generation: u64,
+    #[cfg(feature = "record")]
+    recorder: Option<Recorder>,
 }
 
 impl Gatherer {
@@ -209,9 +213,14 @@ impl Gatherer {
 
     #[cfg(test)]
     pub(crate) fn replay(stream: super::replay::Stream) -> Self {
+        Self::replay_with_refresh_n(stream, cmdline_refresh_n())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replay_with_refresh_n(stream: super::replay::Stream, refresh_n: u32) -> Self {
         let clk_tck = 100;
         let arena = Box::new(Arena::new(0));
-        let mut table = ProcTable::new(&arena, clk_tck, cmdline_refresh_n(), true);
+        let mut table = ProcTable::new(&arena, clk_tck, refresh_n.max(1), true);
         table.wire(&arena);
         let mut procs = Procs::new(&arena, INITIAL_ROWS);
         procs.wire(&arena);
@@ -253,6 +262,8 @@ impl Gatherer {
             tree_order: Vec::new(),
             page_size,
             generation: 0,
+            #[cfg(feature = "record")]
+            recorder: Recorder::from_env(),
         }
     }
 
@@ -389,6 +400,11 @@ impl Gatherer {
         tree::aggregate(self.procs.as_mut_slice(), &self.tree_order, &mut self.gpu);
 
         self.sys.set_task_counts(self.procs.count_tasks());
+
+        #[cfg(feature = "record")]
+        if let Some(recorder) = &mut self.recorder {
+            recorder.record(result.now, &self.sys, self.procs.as_slice(), &self.table);
+        }
 
         self.generation = building_gen;
 

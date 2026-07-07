@@ -18,6 +18,7 @@ checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
 name = "atop"
 version = "0.1.0"
 dependencies = [
+ "atop-stream",
  "aya",
  "crossterm",
  "etch",
@@ -27,6 +28,10 @@ dependencies = [
  "vt100",
  "zerocopy",
 ]
+
+[[package]]
+name = "atop-stream"
+version = "0.1.0"
 
 [[package]]
 name = "aya"

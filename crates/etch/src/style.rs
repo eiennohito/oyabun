@@ -6,24 +6,14 @@
 //! terminal default.
 
 use crossterm::queue;
-use crossterm::style::{
-    Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-};
+use std::io::Write as _;
+
+use crossterm::style::{Attribute, ResetColor, SetAttribute};
 
 /// A 24-bit RGB color. The one color etch renders; magnitude gradients and categorical
 /// roles alike resolve to an `Rgb` before reaching the paint path.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Rgb(pub u8, pub u8, pub u8);
-
-impl Rgb {
-    fn to_crossterm(self) -> Color {
-        Color::Rgb {
-            r: self.0,
-            g: self.1,
-            b: self.2,
-        }
-    }
-}
 
 /// Foreground/background/bold for a run of text. `None` = terminal default.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -84,10 +74,10 @@ impl Style {
     /// Emit the SGR escapes to enter this style. Caller emits [`reset`] afterwards.
     pub(crate) fn enter(self, out: &mut Vec<u8>) {
         if let Some(fg) = self.fg {
-            let _ = queue!(out, SetForegroundColor(fg.to_crossterm()));
+            set_rgb(out, 38, fg);
         }
         if let Some(bg) = self.bg {
-            let _ = queue!(out, SetBackgroundColor(bg.to_crossterm()));
+            set_rgb(out, 48, bg);
         }
         if self.bold {
             let _ = queue!(out, SetAttribute(Attribute::Bold));
@@ -98,11 +88,18 @@ impl Style {
 /// Emit an SGR foreground color, or reset-to-default for `None`. Used by the run
 /// painters (lines and the multi-colored fill cell) to switch color mid-line.
 pub(crate) fn set_fg(out: &mut Vec<u8>, fg: Option<Rgb>) {
-    let color = fg.map_or(Color::Reset, Rgb::to_crossterm);
-    let _ = queue!(out, SetForegroundColor(color));
+    if let Some(fg) = fg {
+        set_rgb(out, 38, fg);
+    } else {
+        let _ = write!(out, "\x1b[39m");
+    }
 }
 
 /// Full SGR reset (clears fg/bg and attributes). Cheap and unambiguous.
 pub(crate) fn reset(out: &mut Vec<u8>) {
     let _ = queue!(out, SetAttribute(Attribute::Reset), ResetColor);
+}
+
+fn set_rgb(out: &mut Vec<u8>, target: u8, rgb: Rgb) {
+    let _ = write!(out, "\x1b[{target};2;{};{};{}m", rgb.0, rgb.1, rgb.2);
 }

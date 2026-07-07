@@ -12,10 +12,13 @@ default = ["bpf"]
 # On by default; disabling drops the aya/zerocopy deps entirely and the binary runs the
 # unprivileged /proc backend unconditionally — the "absent privileged layer" build.
 bpf = ["dep:aya", "dep:zerocopy"]
+# Optional live capture support. Normal production builds do not compile the DSL support crate.
+record = ["dep:atop-stream"]
 
 [dependencies]
 etch = { path = "../etch" }
 thoop = { path = "../thoop" }
+atop-stream = { path = "../atop-stream", optional = true }
 crossterm = "0.29"
 libc = "0.2"
 io-uring = "0.7.12"
@@ -23,4 +26,5 @@ aya = { version = "0.14", optional = true }
 zerocopy = { version = "0.8", features = ["derive"], optional = true }
 
 [dev-dependencies]
+atop-stream = { path = "../atop-stream" }
 vt100 = "0.16.2"

@@ -239,6 +239,13 @@ impl App {
         self.selected = self.rows.len().saturating_sub(1);
     }
 
+    #[cfg(test)]
+    pub(crate) fn select_row(&mut self, row: usize) {
+        if !self.rows.is_empty() {
+            self.selected = row.min(self.rows.len() - 1);
+        }
+    }
+
     /// Keep the selected row within the viewport. Returns whether scroll moved.
     pub fn adjust_scroll(&mut self, visible_height: usize) -> bool {
         if visible_height == 0 {

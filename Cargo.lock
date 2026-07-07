@@ -24,6 +24,7 @@ dependencies = [
  "io-uring",
  "libc",
  "thoop",
+ "vt100",
  "zerocopy",
 ]
 

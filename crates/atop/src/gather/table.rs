@@ -178,8 +178,6 @@ pub(crate) struct ProcTable {
     /// open would otherwise clobber a good uid with `u32::MAX`. The `/proc` path leaves this
     /// `false`: there, uid has no source but this table's cmdline-fd `fstat`.
     source_provides_uid: bool,
-    /// Reads `/proc/<pid>/cmdline` + uid into buffers it owns (no per-cycle allocation).
-    reader: ProcReader,
 }
 
 impl ProcTable {
@@ -199,7 +197,6 @@ impl ProcTable {
             refresh_n,
             cap_full_mask: sys::cap_full_mask(),
             source_provides_uid,
-            reader: ProcReader::new(),
         }
     }
 
@@ -249,7 +246,13 @@ impl ProcTable {
     /// never held as a `&row` across a store op. The arena-resident stores (and now the index)
     /// self-heal their own bases on the next access; the only rule the caller keeps is not to
     /// span an allocation with a live reference into any arena chunk.
-    pub(crate) fn update(&mut self, procs: &mut Procs, now: Instant, cur_gen: u64) {
+    pub(crate) fn update<R: ProcReader>(
+        &mut self,
+        procs: &mut Procs,
+        now: Instant,
+        cur_gen: u64,
+        reader: &mut R,
+    ) {
         // CPU window: real elapsed since the last sample, or `None` if too soon / first call.
         let window = self
             .last
@@ -288,7 +291,7 @@ impl ProcTable {
                 if e.is_kthread {
                     Some(CmdlineRead::KTHREAD) // kthreads: root-owned, no cmdline, no syscall
                 } else {
-                    Some(self.reader.cmdline_uid(pid))
+                    Some(reader.cmdline_uid(pid))
                 }
             } else {
                 None
@@ -322,7 +325,7 @@ impl ProcTable {
                 0
             } else {
                 Self::refresh_deletions(
-                    &mut self.reader,
+                    reader,
                     &mut pm,
                     pid,
                     &mut lib_budget,
@@ -491,8 +494,8 @@ impl ProcTable {
     /// transient (first scan after settling, then ≤ once per [`LIB_RECHECK_GENS`], globally
     /// ≤ [`LIB_CHECKS_PER_CYCLE`] per cycle). Exe deletion takes visual priority, so when it is
     /// set the (heavier, redundant) maps scan is skipped and any prior lib warning cleared.
-    fn refresh_deletions(
-        reader: &mut ProcReader,
+    fn refresh_deletions<R: ProcReader>(
+        reader: &mut R,
         pm: &mut PidMeta,
         pid: u32,
         lib_budget: &mut u32,
@@ -545,32 +548,42 @@ struct DelCtx {
 /// ≥ 0x80. A **whole** value — the bytes travel *with* their metadata, not as a length into a
 /// buffer the caller owns separately.
 #[derive(Clone, Copy)]
-struct CmdlineRead<'a> {
-    uid: u32,
-    bytes: &'a [u8],
-    non_ascii: bool,
+pub(crate) struct CmdlineRead<'a> {
+    pub(crate) uid: u32,
+    pub(crate) bytes: &'a [u8],
+    pub(crate) non_ascii: bool,
 }
 
 impl CmdlineRead<'static> {
     /// A kernel thread: root-owned, no cmdline — no syscall needed.
-    const KTHREAD: CmdlineRead<'static> = CmdlineRead {
+    pub(crate) const KTHREAD: CmdlineRead<'static> = CmdlineRead {
         uid: 0,
         bytes: &[],
         non_ascii: false,
     };
     /// The open failed (gone / permission denied): identity unknown, no cmdline.
-    const UNKNOWN: CmdlineRead<'static> = CmdlineRead {
+    pub(crate) const UNKNOWN: CmdlineRead<'static> = CmdlineRead {
         uid: u32::MAX,
         bytes: &[],
         non_ascii: false,
     };
 }
 
+/// Supplies per-PID metadata reads for the table pass. Implementors own any scratch buffers
+/// backing returned [`CmdlineRead`] bytes; callers may borrow those bytes only until the next
+/// reader call.
+pub(crate) trait ProcReader {
+    fn cmdline_uid(&mut self, pid: u32) -> CmdlineRead<'_>;
+    fn cap_eff(&mut self, pid: u32) -> u64;
+    fn exe_deleted(&mut self, pid: u32) -> bool;
+    fn lib_deleted(&mut self, pid: u32) -> bool;
+}
+
 /// Reads `/proc/<pid>` files into buffers it **owns** — the path scratch and the read buffer the
 /// result borrows from. Owning both is what lets a read return a whole [`CmdlineRead`] instead
-/// of handing the caller back a length into a buffer it had to pass in. One per [`ProcTable`];
+/// of handing the caller back a length into a buffer it had to pass in. One per [`Gatherer`];
 /// the gather loop reuses it, so a read allocates nothing.
-struct ProcReader {
+pub(crate) struct RealProcReader {
     path: ProcPath,
     buf: Vec<u8>,
     /// Reused read buffer for whole multi-line `/proc/<pid>` files (`maps`, `status`) — grown
@@ -578,8 +591,8 @@ struct ProcReader {
     read_buf: Vec<u8>,
 }
 
-impl ProcReader {
-    fn new() -> Self {
+impl RealProcReader {
+    pub(crate) fn new() -> Self {
         Self {
             path: ProcPath::new(),
             buf: vec![0u8; CMD_SLOT],
@@ -617,7 +630,9 @@ impl ProcReader {
         unsafe { libc::close(fd) };
         &self.read_buf
     }
+}
 
+impl ProcReader for RealProcReader {
     /// The process's effective-capability mask from `/proc/<pid>/status` (`CapEff:` line, hex).
     /// 0 if unreadable. Scanned, not positionally parsed — the line's order in `status` is not
     /// contractual.
@@ -733,7 +748,7 @@ fn parse_hex(b: &[u8]) -> u64 {
 mod tests {
     use std::time::Duration;
 
-    use super::{CapLevel, ProcReader, cap_level, parse_hex};
+    use super::{CapLevel, ProcReader, RealProcReader, cap_level, parse_hex};
 
     #[test]
     fn cap_level_buckets() {
@@ -755,13 +770,13 @@ mod tests {
     #[test]
     fn own_cap_eff_is_readable() {
         // Reading our own status must not panic/hang; the value depends on how we were run.
-        let mut r = ProcReader::new();
+        let mut r = RealProcReader::new();
         let _ = r.cap_eff(std::process::id());
     }
 
     #[test]
     fn own_exe_and_libs_are_not_deleted() {
-        let mut r = ProcReader::new();
+        let mut r = RealProcReader::new();
         let me = std::process::id();
         assert!(!r.exe_deleted(me), "our own binary is present on disk");
         assert!(!r.lib_deleted(me), "our own libraries are present on disk");
@@ -798,7 +813,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         let _ = std::fs::remove_file(&path);
 
-        let mut r = ProcReader::new();
+        let mut r = RealProcReader::new();
         let deleted = r.exe_deleted(child.id());
         child.kill().ok();
         child.wait().ok();

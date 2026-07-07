@@ -13,6 +13,7 @@ use aya::{Btf, Ebpf};
 use thoop::{Arena, TypedBuf};
 use zerocopy::FromBytes;
 
+use super::super::source::{CycleResult, Source, SourceCtx};
 use super::types::{EVENT_FORK, EVENT_FREE, ProcEvent, TaskInfo};
 use crate::fxhash::FxBuildHasher;
 use crate::procs::{ProcessEntry, Procs};
@@ -92,11 +93,22 @@ pub struct BpfSource {
     ns_per_tick: u64,
 }
 
+impl Source for BpfSource {
+    fn populate(&mut self, procs: &mut Procs, _ctx: SourceCtx<'_>) -> CycleResult {
+        let (now, short_lived) = self.scan(procs);
+        CycleResult {
+            now,
+            pool_overflow: 0,
+            short_lived,
+        }
+    }
+}
+
 impl BpfSource {
     /// Try to load the privileged layer. `None` (with a one-line note under `ATOP_FORCE_BPF`
     /// or debug builds) means fall back to `/proc`. `ATOP_NO_BPF` skips the attempt entirely.
     /// The landing buffer is allocated in `arena` (the gatherer's shared THP arena); the result
-    /// must be [`wire`](Self::wire)d once the arena is pinned, before any [`populate`].
+    /// must be [`wire`](Self::wire)d once the arena is pinned, before any [`scan`](Self::scan).
     pub fn probe(arena: &Arena, page_size: u64, clk_tck: u64) -> Option<Self> {
         if std::env::var_os("ATOP_NO_BPF").is_some() {
             return None;
@@ -156,7 +168,7 @@ impl BpfSource {
     }
 
     /// Bind the landing buffer to the (now pinned) arena. Call once after construction, before
-    /// any [`populate`](Self::populate) — like the other arena-resident buffers.
+    /// any [`scan`](Self::scan) — like the other arena-resident buffers.
     pub fn wire(&mut self, arena: &Arena) {
         self.words.wire(arena);
     }
@@ -169,7 +181,7 @@ impl BpfSource {
     /// rest forward. A **resync** (first cycle, a detected ringbuf overflow, or the periodic
     /// backstop) forces a full snapshot and rebuilds the set from it, so a death whose `free`
     /// event was dropped cannot linger.
-    pub fn populate(&mut self, procs: &mut Procs) -> (Instant, u32) {
+    pub fn scan(&mut self, procs: &mut Procs) -> (Instant, u32) {
         self.cycle += 1;
 
         // Decide resync, then tell the BPF program (it reads `emit_all` during the walk). An
@@ -290,7 +302,7 @@ impl BpfSource {
         Ok(link.into_file()?)
     }
 
-    /// Rows the iterator emitted in the last [`populate`](Self::populate) — the change count.
+    /// Rows the iterator emitted in the last [`scan`](Self::scan) — the change count.
     #[cfg(test)]
     fn emitted(&self) -> usize {
         self.last_emitted
@@ -360,8 +372,8 @@ mod tests {
         procs.wire(&arena);
 
         // Two cycles: the second exercises the per-cycle re-attach + ring drain path.
-        src.populate(&mut procs);
-        src.populate(&mut procs);
+        src.scan(&mut procs);
+        src.scan(&mut procs);
 
         let rows = procs.as_slice();
         assert!(rows.len() > 10, "too few processes: {}", rows.len());
@@ -411,7 +423,7 @@ mod tests {
         src.wire(&arena);
         procs.wire(&arena);
 
-        src.populate(&mut procs); // baseline: drain any pre-existing events
+        src.scan(&mut procs); // baseline: drain any pre-existing events
 
         // Each `status()` spawns then reaps — born and dead before the call returns, so all live
         // and die strictly between this and the following snapshots.
@@ -423,7 +435,7 @@ mod tests {
         let mut short_lived = 0u32;
         for _ in 0..20 {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            short_lived += src.populate(&mut procs).1;
+            short_lived += src.scan(&mut procs).1;
             if short_lived > 0 {
                 break;
             }
@@ -450,7 +462,7 @@ mod tests {
         procs.wire(&arena);
 
         // Cycle 1 is a forced resync: it emits every live leader.
-        src.populate(&mut procs);
+        src.scan(&mut procs);
         let full = src.emitted();
         let total = procs.as_slice().len();
         assert!(full > 20, "resync must emit the whole set; got {full}");
@@ -458,7 +470,7 @@ mod tests {
 
         // Cycle 2 is a steady-state delta: only changed processes re-emit, but the row buffer
         // still holds the full set (unchanged ones carried forward by the maintained set).
-        src.populate(&mut procs);
+        src.scan(&mut procs);
         let changed = src.emitted();
         assert!(
             changed < full,
@@ -493,7 +505,7 @@ mod tests {
         let mut procs = Procs::new(&arena, 256);
         src.wire(&arena);
         procs.wire(&arena);
-        src.populate(&mut procs);
+        src.scan(&mut procs);
 
         let found = procs
             .as_slice()
@@ -521,7 +533,7 @@ mod tests {
         let mut procs = Procs::new(&arena, 256);
         src.wire(&arena);
         procs.wire(&arena);
-        src.populate(&mut procs);
+        src.scan(&mut procs);
 
         // pid 2 is kthreadd on Linux — always a kernel thread, root-owned.
         let kthreadd = procs.as_slice().iter().find(|p| p.pid == 2);

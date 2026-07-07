@@ -46,6 +46,19 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_gatherer(gatherer: Gatherer, uid_names: HashMap<u32, Box<str>>) -> Self {
+        Self {
+            gatherer,
+            rows: Vec::new(),
+            collapsed: HashSet::new(),
+            uid_names,
+            selected: 0,
+            scroll: 0,
+            row_scratch: Vec::new(),
+        }
+    }
+
     /// Run one gather cycle, then rebuild the display list (selection follows its PID).
     pub fn gather(&mut self) {
         let keep = self.selected_pid();

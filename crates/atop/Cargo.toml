@@ -21,3 +21,6 @@ libc = "0.2"
 io-uring = "0.7.12"
 aya = { version = "0.14", optional = true }
 zerocopy = { version = "0.8", features = ["derive"], optional = true }
+
+[dev-dependencies]
+vt100 = "0.16.2"

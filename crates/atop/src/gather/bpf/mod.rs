@@ -13,7 +13,7 @@
 //! maintained full set lives in [`BpfSource`]; a cycle applies the delta to it, then
 //! materializes it into the row buffer for the source-agnostic tail.
 //!
-//! Per cycle (`BpfSource::populate`):
+//! Per cycle (`BpfSource::scan`):
 //! - **task iterator** — one `read()` of a binary stream of `TaskInfo` structs, one per
 //!   *changed* leader, interpreted in place via `zerocopy`; upserted into the maintained set.
 //! - **fork/free ringbuf** — `fork` arms short-lived pairing; `free` (the reap, not exit, so a

@@ -6,8 +6,10 @@
 //!
 //! Module map:
 //! - [`gatherer`] — the [`Gatherer`] orchestrator + source selection (the cycle).
+//! - [`source`] — the shared source-output contract each observation source implements.
 //! - [`procfs`] — the unprivileged `/proc` source (enumerate + birth probe + stat read).
 //! - [`bpf`] — the privileged source (emit-on-change task iterator + fork/free), feature-gated.
+//! - [`replay`] — deterministic in-memory streams and render harness for tests.
 //! - [`uring`] / [`syscall`] — the `/proc` source's two I/O backends (persistent-fd pool).
 //! - [`parse`] — the `/proc/<pid>/stat` byte-wise parser.
 //! - [`table`] — the per-PID [`ProcTable`](table::ProcTable) (CPU history + uid/cmdline + index).
@@ -24,7 +26,10 @@ mod gatherer;
 mod nvml;
 mod parse;
 mod procfs;
+#[cfg(test)]
+pub(crate) mod replay;
 mod ring;
+mod source;
 mod syscall;
 mod sysstat;
 mod table;

@@ -11,8 +11,11 @@ use thoop::Arena;
 use super::config::INITIAL_ROWS;
 use super::nvml::NvmlSampler;
 use super::procfs::ProcSource;
+#[cfg(test)]
+use super::replay::ReplaySource;
+use super::source::{Source, SourceCtx};
 use super::sysstat::SystemSampler;
-use super::table::{ProcTable, cmdline_refresh_n};
+use super::table::{ProcReader, ProcTable, RealProcReader, cmdline_refresh_n};
 use crate::procs::{GpuMetrics, GpuProcessStats, NONE, ProcessEntry, Procs, SystemStats};
 use crate::sys::{ProcDir, clk_tck};
 use crate::tree;
@@ -20,10 +23,92 @@ use crate::tree;
 /// Where the live process rows come from. Selected once at startup ([`Gatherer::with_source`]):
 /// the privileged BPF source if it loads (caps present), else the unprivileged `/proc` source.
 /// The rest of a cycle — the per-PID table, tree build, system stats — is source-agnostic.
-enum Source {
+enum ObservationSource {
     Proc(Box<ProcSource>),
     #[cfg(feature = "bpf")]
     Bpf(Box<super::bpf::BpfSource>),
+    #[cfg(test)]
+    Replay(Box<ReplaySource>),
+}
+
+impl ObservationSource {
+    /// Fill the source-output rows, then run the per-PID table pass with the matching metadata
+    /// reader. Replay owns both sides; live sources share the gatherer's real `/proc` reader.
+    fn populate_and_update(
+        &mut self,
+        procs: &mut Procs,
+        table: &mut ProcTable,
+        live_reader: &mut RealProcReader,
+        page_size: u64,
+        prev_gen: u64,
+        building_gen: u64,
+    ) -> super::source::CycleResult {
+        match self {
+            ObservationSource::Proc(p) => Self::populate_with_reader(
+                p.as_mut(),
+                live_reader,
+                procs,
+                table,
+                page_size,
+                prev_gen,
+                building_gen,
+            ),
+            #[cfg(feature = "bpf")]
+            ObservationSource::Bpf(b) => Self::populate_with_reader(
+                b.as_mut(),
+                live_reader,
+                procs,
+                table,
+                page_size,
+                prev_gen,
+                building_gen,
+            ),
+            #[cfg(test)]
+            ObservationSource::Replay(r) => {
+                let result = {
+                    let ctx = SourceCtx {
+                        index: table.index(),
+                        page_size,
+                        prev_gen,
+                    };
+                    r.populate(procs, ctx)
+                };
+                table.update(procs, result.now, building_gen, r.as_mut());
+                result
+            }
+        }
+    }
+
+    fn populate_with_reader<S: Source, R: ProcReader>(
+        source: &mut S,
+        reader: &mut R,
+        procs: &mut Procs,
+        table: &mut ProcTable,
+        page_size: u64,
+        prev_gen: u64,
+        building_gen: u64,
+    ) -> super::source::CycleResult {
+        let result = {
+            let ctx = SourceCtx {
+                index: table.index(),
+                page_size,
+                prev_gen,
+            };
+            source.populate(procs, ctx)
+        };
+        table.update(procs, result.now, building_gen, reader);
+        result
+    }
+
+    #[cfg(test)]
+    fn replay_sys(&self) -> Option<SystemStats> {
+        match self {
+            ObservationSource::Proc(_) => None,
+            #[cfg(feature = "bpf")]
+            ObservationSource::Bpf(_) => None,
+            ObservationSource::Replay(r) => Some(r.sys()),
+        }
+    }
 }
 
 /// The single-threaded data producer: fills the live [`Procs`] buffer from a [`Source`], then
@@ -39,9 +124,11 @@ pub struct Gatherer {
     /// The live process rows on a huge page — reset and refilled each cycle, read in place.
     procs: Procs,
     /// The observation source (privileged BPF or unprivileged `/proc`), chosen at startup.
-    source: Source,
+    source: ObservationSource,
     /// Unified per-PID table (CPU history + uid/cmdline + the shared PID index).
     table: ProcTable,
+    /// Real `/proc/<pid>` metadata reader used by live sources. Replay provides its own reader.
+    reader: RealProcReader,
     sys_sampler: SystemSampler,
     /// Optional runtime NVML sampler, fixed at startup.
     nvml: Option<NvmlSampler>,
@@ -106,9 +193,9 @@ impl Gatherer {
             #[cfg(feature = "bpf")]
             Some(mut b) => {
                 b.wire(&arena); // bind the landing buffer now that the arena is pinned
-                Source::Bpf(Box::new(b))
+                ObservationSource::Bpf(Box::new(b))
             }
-            None => Source::Proc(Box::new(ProcSource::new(proc_dir))),
+            None => ObservationSource::Proc(Box::new(ProcSource::new(proc_dir))),
         };
 
         let nvml = NvmlSampler::probe();
@@ -117,11 +204,44 @@ impl Gatherer {
             ..SystemStats::default()
         };
 
+        Self::from_parts(arena, procs, source, table, nvml, sys, page_size)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replay(stream: super::replay::Stream) -> Self {
+        let clk_tck = 100;
+        let arena = Box::new(Arena::new(0));
+        let mut table = ProcTable::new(&arena, clk_tck, cmdline_refresh_n(), true);
+        table.wire(&arena);
+        let mut procs = Procs::new(&arena, INITIAL_ROWS);
+        procs.wire(&arena);
+
+        Self::from_parts(
+            arena,
+            procs,
+            ObservationSource::Replay(Box::new(ReplaySource::new(stream))),
+            table,
+            None,
+            SystemStats::default(),
+            4096,
+        )
+    }
+
+    fn from_parts(
+        arena: Box<Arena>,
+        procs: Procs,
+        source: ObservationSource,
+        table: ProcTable,
+        nvml: Option<NvmlSampler>,
+        sys: SystemStats,
+        page_size: u64,
+    ) -> Self {
         Self {
             arena,
             procs,
             source,
             table,
+            reader: RealProcReader::new(),
             sys_sampler: SystemSampler::new(),
             nvml,
             sys,
@@ -208,7 +328,7 @@ impl Gatherer {
     pub fn is_privileged(&self) -> bool {
         #[cfg(feature = "bpf")]
         {
-            matches!(self.source, Source::Bpf(_))
+            matches!(self.source, ObservationSource::Bpf(_))
         }
         #[cfg(not(feature = "bpf"))]
         {
@@ -232,39 +352,34 @@ impl Gatherer {
         let building_gen = self.generation + 1;
         self.arena.set_gen(building_gen);
 
-        // Source-specific: fill `procs` with the live set (compacted, PID-sorted). The `/proc`
-        // source enumerates + reads stat; the BPF source reads the task iterator + drains the
-        // fork/exit ring. Both leave the same shape for the common tail below.
-        let (now, pool_overflow, short_lived) = match &mut self.source {
-            Source::Proc(p) => {
-                let (now, overflow) = p.populate(
-                    &mut self.procs,
-                    self.table.index(),
-                    self.page_size,
-                    self.generation,
-                );
-                (now, overflow, 0)
-            }
-            #[cfg(feature = "bpf")]
-            Source::Bpf(b) => {
-                let (now, short_lived) = b.populate(&mut self.procs);
-                (now, 0, short_lived)
-            }
-        };
-        self.pool_overflow = pool_overflow;
-        self.short_lived = short_lived;
+        // Source-specific fill + the matching metadata reader, followed by the common tail.
+        let result = self.source.populate_and_update(
+            &mut self.procs,
+            &mut self.table,
+            &mut self.reader,
+            self.page_size,
+            self.generation,
+            building_gen,
+        );
+        self.pool_overflow = result.pool_overflow;
+        self.short_lived = result.short_lived;
 
-        // One unified per-PID pass: CPU% + (uid +) cmdline handle on the surviving entries (a
-        // single index lookup each).
-        self.table.update(&mut self.procs, now, building_gen);
-
-        // System CPU/memory plus optional GPU telemetry. GPU process fields must be finalized
-        // before the tree fold so collapsed rows include their descendants.
-        self.sys_sampler.update(&mut self.sys);
-        if let Some(nvml) = &mut self.nvml {
-            nvml.sample(&mut self.sys, self.procs.as_slice(), &mut self.gpu);
-        } else {
+        // System CPU/memory plus optional GPU telemetry. Replay streams carry their own system
+        // stats; live sources read the host counters here.
+        #[cfg(test)]
+        let replay_sys = self.source.replay_sys();
+        #[cfg(not(test))]
+        let replay_sys: Option<SystemStats> = None;
+        if let Some(sys) = replay_sys {
+            self.sys = sys;
             self.gpu.clear_unavailable();
+        } else {
+            self.sys_sampler.update(&mut self.sys);
+            if let Some(nvml) = &mut self.nvml {
+                nvml.sample(&mut self.sys, self.procs.as_slice(), &mut self.gpu);
+            } else {
+                self.gpu.clear_unavailable();
+            }
         }
         self.first_root = tree::build(
             self.procs.as_mut_slice(),
@@ -304,9 +419,11 @@ mod tests {
     /// Panics if the gatherer is not in `/proc` mode (it always is here — `new_test`).
     fn proc_config(g: &mut Gatherer) -> &mut Config {
         match &mut g.source {
-            Source::Proc(p) => &mut p.config,
+            ObservationSource::Proc(p) => &mut p.config,
             #[cfg(feature = "bpf")]
-            Source::Bpf(_) => panic!("test gatherer must be /proc mode"),
+            ObservationSource::Bpf(_) => panic!("test gatherer must be /proc mode"),
+            #[cfg(test)]
+            ObservationSource::Replay(_) => panic!("test gatherer must be /proc mode"),
         }
     }
 

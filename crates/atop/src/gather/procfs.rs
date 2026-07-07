@@ -7,6 +7,7 @@
 use std::time::Instant;
 
 use super::config::{Config, RING_ENTRIES, force_syscall, pool_capacity};
+use super::source::{CycleResult, Source, SourceCtx};
 use super::syscall::SyscallBackend;
 use super::table::PidIndex;
 use super::uring::UringBackend;
@@ -64,6 +65,17 @@ pub(crate) struct ProcSource {
     pid_max: u32,
 }
 
+impl Source for ProcSource {
+    fn populate(&mut self, procs: &mut Procs, ctx: SourceCtx<'_>) -> CycleResult {
+        let (now, pool_overflow) = self.scan(procs, ctx.index, ctx.page_size, ctx.prev_gen);
+        CycleResult {
+            now,
+            pool_overflow,
+            short_lived: 0,
+        }
+    }
+}
+
 impl ProcSource {
     pub(crate) fn new(proc_dir: ProcDir) -> Self {
         let pool_cap = pool_capacity();
@@ -85,7 +97,7 @@ impl ProcSource {
     /// skip-cycle leader gate; `index` is the per-PID table's index, read by that gate to tell
     /// a known PID from a probe-introduced non-leader thread. Returns the sample instant and
     /// the pool-overflow count.
-    pub(crate) fn populate(
+    pub(crate) fn scan(
         &mut self,
         procs: &mut Procs,
         index: &PidIndex,

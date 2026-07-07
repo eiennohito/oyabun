@@ -105,9 +105,10 @@ pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
 // ---------------------------------------------------------------------------
 
 fn build_cpu_line(l: &mut etch::Line, sys: &SystemStats, width: usize) {
+    let busy_bp = sys.cpu_user_bp + sys.cpu_sys_bp + sys.cpu_iowait_bp;
     let suffix = format!(
         " {:.1}%]  ({} cores)",
-        f64::from(sys.cpu_user_bp + sys.cpu_sys_bp + sys.cpu_iowait_bp) / 100.0,
+        system_cpu_pct_on_process_scale(busy_bp, sys.num_cores),
         sys.num_cores
     );
     let label = "CPU[";
@@ -124,6 +125,11 @@ fn build_cpu_line(l: &mut etch::Line, sys: &SystemStats, width: usize) {
     l.bar(io, '|', palette::BAR_IO);
     l.gap(empty);
     l.span(&suffix, palette::LABEL);
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn system_cpu_pct_on_process_scale(busy_bp: u32, cores: u32) -> f64 {
+    f64::from(busy_bp) * f64::from(cores) / 100.0
 }
 
 #[allow(
@@ -721,6 +727,13 @@ mod tests {
         assert_eq!(Pct(0).to_string(), "0.00%");
         assert_eq!(Pct(1234).to_string(), "12.34%");
         assert_eq!(Pct(40000).to_string(), "400.00%");
+    }
+
+    #[test]
+    fn system_cpu_header_uses_process_cpu_scale() {
+        assert_eq!(system_cpu_pct_on_process_scale(10_000, 1), 100.0);
+        assert_eq!(system_cpu_pct_on_process_scale(10_000, 8), 800.0);
+        assert_eq!(system_cpu_pct_on_process_scale(2_500, 8), 200.0);
     }
 
     #[test]

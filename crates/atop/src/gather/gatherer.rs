@@ -9,10 +9,11 @@
 use thoop::Arena;
 
 use super::config::INITIAL_ROWS;
+use super::nvml::NvmlSampler;
 use super::procfs::ProcSource;
 use super::sysstat::SystemSampler;
 use super::table::{ProcTable, cmdline_refresh_n};
-use crate::procs::{NONE, ProcessEntry, Procs, SystemStats};
+use crate::procs::{GpuMetrics, GpuProcessStats, NONE, ProcessEntry, Procs, SystemStats};
 use crate::sys::{ProcDir, clk_tck};
 use crate::tree;
 
@@ -42,8 +43,12 @@ pub struct Gatherer {
     /// Unified per-PID table (CPU history + uid/cmdline + the shared PID index).
     table: ProcTable,
     sys_sampler: SystemSampler,
+    /// Optional runtime NVML sampler, fixed at startup.
+    nvml: Option<NvmlSampler>,
     /// System-wide stats for this cycle.
     sys: SystemStats,
+    /// Sparse per-process GPU telemetry for the latest cycle.
+    gpu: GpuProcessStats,
     /// Head of the root sibling chain (via `next_sibling`), or [`NONE`].
     first_root: u32,
     /// Live PIDs this cycle that exceeded the pool and used the transient fallback (0 common;
@@ -106,13 +111,21 @@ impl Gatherer {
             None => Source::Proc(Box::new(ProcSource::new(proc_dir))),
         };
 
+        let nvml = NvmlSampler::probe();
+        let sys = SystemStats {
+            gpu_count: nvml.as_ref().map_or(0, NvmlSampler::device_count),
+            ..SystemStats::default()
+        };
+
         Self {
             arena,
             procs,
             source,
             table,
             sys_sampler: SystemSampler::new(),
-            sys: SystemStats::default(),
+            nvml,
+            sys,
+            gpu: GpuProcessStats::default(),
             first_root: NONE,
             pool_overflow: 0,
             short_lived: 0,
@@ -153,6 +166,40 @@ impl Gatherer {
     #[must_use]
     pub fn short_lived(&self) -> u32 {
         self.short_lived
+    }
+
+    /// Whether a usable NVIDIA device set was discovered at startup.
+    #[must_use]
+    pub fn gpu_available(&self) -> bool {
+        self.nvml.is_some()
+    }
+
+    #[must_use]
+    pub fn gpu_process_available(&self) -> bool {
+        self.nvml
+            .as_ref()
+            .is_some_and(NvmlSampler::process_available)
+    }
+
+    #[must_use]
+    pub fn gpu_process_sample_available(&self) -> bool {
+        self.gpu.available()
+    }
+
+    #[must_use]
+    pub fn gpu_for_pid(&self, pid: u32) -> Option<GpuMetrics> {
+        self.gpu.live(pid)
+    }
+
+    #[must_use]
+    pub fn subtree_gpu_for_pid(&self, pid: u32) -> Option<GpuMetrics> {
+        self.gpu.subtree(pid)
+    }
+
+    /// Empty physical-device indices, or `None` when both context lists were not available.
+    #[must_use]
+    pub fn empty_gpus(&self) -> Option<&[u32]> {
+        self.nvml.as_ref().and_then(NvmlSampler::empty_devices)
     }
 
     /// Whether the privileged BPF source is active.
@@ -210,15 +257,22 @@ impl Gatherer {
         // One unified per-PID pass: CPU% + (uid +) cmdline handle on the surviving entries (a
         // single index lookup each).
         self.table.update(&mut self.procs, now, building_gen);
+
+        // System CPU/memory plus optional GPU telemetry. GPU process fields must be finalized
+        // before the tree fold so collapsed rows include their descendants.
+        self.sys_sampler.update(&mut self.sys);
+        if let Some(nvml) = &mut self.nvml {
+            nvml.sample(&mut self.sys, self.procs.as_slice(), &mut self.gpu);
+        } else {
+            self.gpu.clear_unavailable();
+        }
         self.first_root = tree::build(
             self.procs.as_mut_slice(),
             &mut self.tree_stack,
             &mut self.tree_order,
         );
-        tree::aggregate(self.procs.as_mut_slice(), &self.tree_order);
+        tree::aggregate(self.procs.as_mut_slice(), &self.tree_order, &mut self.gpu);
 
-        // System-wide stats (tiny reads, ~3 μs total).
-        self.sys_sampler.update(&mut self.sys);
         self.sys.set_task_counts(self.procs.count_tasks());
 
         self.generation = building_gen;

@@ -16,8 +16,8 @@
 use std::os::fd::RawFd;
 
 use super::config::STAT_SLOT;
-use super::fxhash::PidMap;
 use super::parse;
+use crate::fxhash::PidMap;
 use crate::procs::Procs;
 use crate::sys::ProcPath;
 

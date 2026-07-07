@@ -16,25 +16,36 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::io::Write;
 
-use etch::{Cell, ColSpec, Frame, Rgb, Schema, Style};
+use etch::{Cell, ColSpec, Frame, Rgb, Row, Schema, Style};
 
 use crate::app::App;
 use crate::palette;
-use crate::procs::{NONE, SystemStats};
+use crate::procs::{GpuMetric, NONE, SystemStats};
 
-/// Number of terminal rows consumed by the system stats header.
-pub const HEADER_LINES: u16 = 3;
-/// Total non-process rows: header + column header + footer.
-pub const CHROME_LINES: u16 = HEADER_LINES + 2;
-/// First screen row of the process list (after the 3 stat lines + column header).
-const BODY_TOP: u16 = HEADER_LINES + 1;
+const CPU_HEADER_LINES: u16 = 3;
+
+/// Number of terminal rows consumed by the fixed-startup system header.
+#[must_use]
+pub const fn header_lines(gpu: bool) -> u16 {
+    CPU_HEADER_LINES + gpu as u16
+}
+
+/// Total non-process rows: system header + column header + footer.
+#[must_use]
+pub const fn chrome_lines(gpu: bool) -> u16 {
+    header_lines(gpu) + 2
+}
 
 const HEADER_STYLE: Style = Style::fg(palette::LABEL).bold();
 
 /// The table's column structure — declared once, shared by header and body rows.
 #[must_use]
-pub fn columns() -> Schema {
-    Schema::new(vec![
+pub fn columns(gpu: bool) -> Schema {
+    Schema::new(column_specs(gpu))
+}
+
+fn column_specs(gpu: bool) -> Vec<ColSpec> {
+    let mut columns = vec![
         ColSpec::right("PID", 2, 7),
         ColSpec::left("USER", 1, 8),
         ColSpec::left("S", 1, 1),
@@ -42,26 +53,39 @@ pub fn columns() -> Schema {
         ColSpec::right("THR", 1, 4),
         ColSpec::right("CPU%", 1, 7),
         ColSpec::right("PEAK", 1, 7),
-        ColSpec::right("RSS", 1, 8),
-        ColSpec::fill("Command", 2),
-    ])
+    ];
+    if gpu {
+        columns.push(ColSpec::right("GPU%", 1, 7));
+        columns.push(ColSpec::right("VRAM", 1, 8));
+    }
+    columns.push(ColSpec::right("RSS", 1, 8));
+    columns.push(ColSpec::fill("Command", 2));
+    columns
 }
 
 pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
     let (width, height) = frame.size();
     let sys = *app.sys();
     let wsz = width as usize;
+    let gpu = app.gpu_available();
+    let header_lines = header_lines(gpu);
 
     // Each stat line is gated on the values that feed it: a width change forces a full
     // repaint anyway, so the data alone is the gate. On interactive (non-gather) frames
     // the build closures never run — no `format!`, no allocation.
     frame.line(0, sys, |l| build_cpu_line(l, &sys, wsz));
     frame.line(1, sys, |l| build_mem_line(l, &sys, wsz));
-    frame.line(2, sys, |l| build_info_line(l, &sys));
-    frame.header(HEADER_LINES, schema, HEADER_STYLE);
+    if gpu {
+        frame.line(2, (sys, app.empty_gpus()), |l| {
+            build_gpu_line(l, &sys, app.empty_gpus(), wsz);
+        });
+    }
+    let info_row = if gpu { 3 } else { 2 };
+    frame.line(info_row, sys, |l| build_info_line(l, &sys));
+    frame.header(header_lines, schema, HEADER_STYLE);
 
-    let body_height = height.saturating_sub(CHROME_LINES);
-    render_body(frame, app, schema, body_height);
+    let body_height = height.saturating_sub(chrome_lines(gpu));
+    render_body(frame, app, schema, header_lines + 1, body_height);
 
     let footer_row = height.saturating_sub(1);
     let row_count = app.rows().len();
@@ -172,6 +196,88 @@ fn build_info_line(l: &mut etch::Line, sys: &SystemStats) {
     l.fill(' ');
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn build_gpu_line(
+    l: &mut etch::Line,
+    sys: &SystemStats,
+    empty_devices: Option<&[u32]>,
+    width: usize,
+) {
+    let gpu_value = sys.gpu_util_bp.map_or_else(
+        || " -]".to_owned(),
+        |bp| format!(" {:.1}%]", f64::from(bp) / 100.0),
+    );
+    let vram_value = sys.vram.map_or_else(
+        || " -]".to_owned(),
+        |vram| format!(" {}/{}]", Mem(vram.used), Mem(vram.total)),
+    );
+    let empty = empty_devices
+        .filter(|devices| !devices.is_empty())
+        .map(|devices| format!("  Empty: {}", format_ranges(devices)))
+        .unwrap_or_default();
+    let gpu_prefix = "GPU[";
+    let vram_prefix = "  VRAM[";
+    let chrome =
+        gpu_prefix.len() + gpu_value.len() + vram_prefix.len() + vram_value.len() + empty.len();
+    let total_bar = width.saturating_sub(chrome).max(8);
+    let gpu_bar = total_bar / 2;
+    let vram_bar = total_bar - gpu_bar;
+
+    let gpu_den = u64::from(sys.gpu_count).saturating_mul(10_000);
+    let gpu_cells = if let Some(gpu_util_bp) = sys.gpu_util_bp {
+        normalized_cells(u64::from(gpu_util_bp), gpu_den, gpu_bar)
+    } else {
+        0
+    };
+    let vram_cells = if let Some(vram) = sys.vram {
+        normalized_cells(vram.used, vram.total, vram_bar)
+    } else {
+        0
+    };
+
+    l.span(gpu_prefix, palette::LABEL);
+    l.bar(gpu_cells, '|', palette::BAR_BUSY);
+    l.gap(gpu_bar - gpu_cells);
+    l.span(&gpu_value, palette::LABEL);
+    l.span(vram_prefix, palette::LABEL);
+    l.bar(vram_cells, '|', palette::BAR_SYS);
+    l.gap(vram_bar - vram_cells);
+    l.span(&vram_value, palette::LABEL);
+    if !empty.is_empty() {
+        l.span(&empty, palette::INFO);
+    }
+}
+
+fn normalized_cells(value: u64, capacity: u64, width: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    usize::try_from((value.saturating_mul(width as u64) / capacity).min(width as u64))
+        .unwrap_or(width)
+}
+
+fn format_ranges(indices: &[u32]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < indices.len() {
+        let start = indices[i];
+        let mut end = start;
+        while i + 1 < indices.len() && indices[i + 1] == end.saturating_add(1) {
+            i += 1;
+            end = indices[i];
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        let _ = write!(out, "{start}");
+        if end != start {
+            let _ = write!(out, "-{end}");
+        }
+        i += 1;
+    }
+    out
+}
+
 fn build_footer(
     l: &mut etch::Line,
     visible_rows: usize,
@@ -210,7 +316,13 @@ fn build_footer(
 // Process list body
 // ---------------------------------------------------------------------------
 
-fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_height: u16) {
+fn render_body<W: Write>(
+    frame: &mut Frame<W>,
+    app: &App,
+    schema: &Schema,
+    body_top: u16,
+    body_height: u16,
+) {
     let procs = app.procs().as_slice();
     let scroll = app.scroll();
     let rows = app.rows();
@@ -223,7 +335,7 @@ fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_
     }
 
     let mut prefix = String::with_capacity(64);
-    frame.table(schema, BODY_TOP, body_height, |table| {
+    frame.table(schema, body_top, body_height, |table| {
         for (display_idx, row) in rows
             .iter()
             .enumerate()
@@ -236,11 +348,11 @@ fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_
             let has_next = p.next_sibling != NONE;
             let selected = display_idx == app.selected();
 
-            let (cpu, peak, mem) = if row.collapsed && p.subtree_size > 0 {
-                (p.subtree_cpu, p.cpu_peak, p.subtree_mem)
-            } else {
-                (p.cpu_pct, p.cpu_peak, p.mem_bytes)
-            };
+            let metrics = p.effective_metrics(
+                row.collapsed,
+                app.gpu_for_pid(p.pid),
+                app.subtree_gpu_for_pid(p.pid),
+            );
 
             prefix.clear();
             let prefix_cols = build_prefix(
@@ -289,9 +401,21 @@ fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_
                 );
                 r.styled_field(p.nice, cell(Some(palette::nice(p.nice)), bg));
                 r.styled_field(p.num_threads, cell(palette::threads(p.num_threads), bg));
-                r.styled_field(Pct(cpu), cell(Some(palette::cpu(cpu)), bg));
-                r.styled_field(Pct(peak), cell(Some(palette::cpu(peak)), bg));
-                r.styled_field(Mem(mem), cell(Some(palette::rss(mem)), bg));
+                r.styled_field(
+                    Pct(metrics.cpu_pct),
+                    cell(Some(palette::cpu(metrics.cpu_pct)), bg),
+                );
+                r.styled_field(
+                    Pct(metrics.cpu_peak),
+                    cell(Some(palette::cpu(metrics.cpu_peak)), bg),
+                );
+                if app.gpu_process_available() {
+                    write_gpu_fields(r, metrics.gpu, app.gpu_process_sample_available(), bg);
+                }
+                r.styled_field(
+                    Mem(metrics.mem_bytes),
+                    cell(Some(palette::rss(metrics.mem_bytes)), bg),
+                );
                 // Command gate: content hash (a changed cmdline reuses a freed store slot, so
                 // the handle isn't a stable content identity) + tree prefix + collapse suffix +
                 // the flags that drive its per-span colors.
@@ -309,6 +433,23 @@ fn render_body<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema, body_
             });
         }
     });
+}
+
+fn write_gpu_fields<W: Write>(
+    r: &mut Row<'_, '_, W>,
+    gpu: Option<crate::procs::GpuMetrics>,
+    sample_available: bool,
+    bg: Option<Rgb>,
+) {
+    if !sample_available {
+        r.field("");
+        r.field("");
+        return;
+    }
+    let gpu_pct = gpu.map(|gpu| gpu.pct);
+    let gpu_mem = gpu.map(|gpu| gpu.mem_bytes);
+    r.styled_field(MaybePct(gpu_pct), cell(metric_cpu_color(gpu_pct), bg));
+    r.styled_field(MaybeMem(gpu_mem), cell(metric_mem_color(gpu_mem), bg));
 }
 
 /// A per-cell style: a semantic foreground over the row's (selection) background, built
@@ -518,6 +659,46 @@ impl fmt::Display for Mem {
     }
 }
 
+fn metric_cpu_color(metric: Option<GpuMetric<u32>>) -> Option<Rgb> {
+    match metric {
+        Some(GpuMetric::Value(value)) => Some(palette::cpu(value)),
+        _ => None,
+    }
+}
+
+fn metric_mem_color(metric: Option<GpuMetric<u64>>) -> Option<Rgb> {
+    match metric {
+        Some(GpuMetric::Value(value)) => Some(palette::rss(value)),
+        _ => None,
+    }
+}
+
+#[derive(Hash)]
+struct MaybePct(Option<GpuMetric<u32>>);
+
+impl fmt::Display for MaybePct {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(GpuMetric::Value(value)) => Pct(value).fmt(f),
+            Some(GpuMetric::Unknown) => f.write_str("??"),
+            None => f.write_str("--"),
+        }
+    }
+}
+
+#[derive(Hash)]
+struct MaybeMem(Option<GpuMetric<u64>>);
+
+impl fmt::Display for MaybeMem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(GpuMetric::Value(value)) => Mem(value).fmt(f),
+            Some(GpuMetric::Unknown) => f.write_str("??"),
+            None => f.write_str("--"),
+        }
+    }
+}
+
 fn format_uptime(secs: u64) -> String {
     let days = secs / 86400;
     let hours = (secs % 86400) / 3600;
@@ -558,5 +739,30 @@ mod tests {
         assert_eq!(format_uptime(90), "1m");
         assert_eq!(format_uptime(3661), "1h 1m");
         assert_eq!(format_uptime(90061), "1d 1h 1m");
+    }
+
+    #[test]
+    fn compact_device_ranges() {
+        assert_eq!(format_ranges(&[]), "");
+        assert_eq!(format_ranges(&[1, 3, 4, 5, 8]), "1,3-5,8");
+    }
+
+    #[test]
+    fn geometry_changes_only_when_gpu_is_present() {
+        assert_eq!(header_lines(false), 3);
+        assert_eq!(chrome_lines(false), 5);
+        assert_eq!(header_lines(true), 4);
+        assert_eq!(chrome_lines(true), 6);
+        let cpu = column_specs(false);
+        let gpu = column_specs(true);
+        assert_eq!(cpu.len(), 9);
+        assert_eq!(gpu.len(), 11);
+        assert_eq!(gpu[7].title, "GPU%");
+        assert_eq!(gpu[8].title, "VRAM");
+    }
+
+    #[test]
+    fn multi_gpu_bar_uses_total_device_capacity() {
+        assert_eq!(normalized_cells(15_000, 20_000, 40), 30);
     }
 }

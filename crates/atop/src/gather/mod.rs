@@ -15,14 +15,13 @@
 //! - [`ring`] — the fixed-capacity wraparound ring both CPU samplers build on.
 //! - [`sysstat`] — the per-cycle system-wide sampler (CPU/mem/load).
 //! - [`config`] — env-overridable tuning knobs + the slot-size/ring constants.
-//! - [`fxhash`] — the fast PID hasher shared by the backends and the BPF source.
 
 #[cfg(feature = "bpf")]
 mod bpf;
 mod config;
 mod cpu;
-mod fxhash;
 mod gatherer;
+mod nvml;
 mod parse;
 mod procfs;
 mod ring;

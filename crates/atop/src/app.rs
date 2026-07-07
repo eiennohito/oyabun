@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::gather::Gatherer;
-use crate::procs::{NONE, ProcessEntry, Procs, SystemStats};
+use crate::procs::{GpuMetrics, NONE, ProcessEntry, Procs, SystemStats};
 use crate::sys::{self, ProcDir};
 
 pub struct DisplayRow {
@@ -82,6 +82,30 @@ impl App {
     /// cycle — invisible to a snapshot-only tool. Always 0 in `/proc` mode.
     pub fn short_lived(&self) -> u32 {
         self.gatherer.short_lived()
+    }
+
+    pub fn gpu_available(&self) -> bool {
+        self.gatherer.gpu_available()
+    }
+
+    pub fn gpu_process_available(&self) -> bool {
+        self.gatherer.gpu_process_available()
+    }
+
+    pub fn gpu_process_sample_available(&self) -> bool {
+        self.gatherer.gpu_process_sample_available()
+    }
+
+    pub fn gpu_for_pid(&self, pid: u32) -> Option<GpuMetrics> {
+        self.gatherer.gpu_for_pid(pid)
+    }
+
+    pub fn subtree_gpu_for_pid(&self, pid: u32) -> Option<GpuMetrics> {
+        self.gatherer.subtree_gpu_for_pid(pid)
+    }
+
+    pub fn empty_gpus(&self) -> Option<&[u32]> {
+        self.gatherer.empty_gpus()
     }
 
     pub fn selected(&self) -> usize {

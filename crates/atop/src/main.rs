@@ -1,4 +1,5 @@
 mod app;
+mod fxhash;
 mod gather;
 mod palette;
 mod procs;
@@ -57,7 +58,9 @@ fn restore_terminal() -> io::Result<()> {
 /// alias. The UI cannot service input *during* a gather (sub-ms normally), which is well inside
 /// the latency budget.
 fn run(mut display: Display<io::Stdout>, mut app: App) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = ui::columns();
+    let gpu = app.gpu_available();
+    let process_gpu = app.gpu_process_available();
+    let schema = ui::columns(process_gpu);
     let mut dirty = true;
     // First buffer was primed in `main`; the next gather is one interval out.
     let mut next_gather = Instant::now() + REFRESH_INTERVAL;
@@ -70,7 +73,7 @@ fn run(mut display: Display<io::Stdout>, mut app: App) -> Result<(), Box<dyn std
         }
 
         let (width, height) = crossterm::terminal::size()?;
-        let visible_height = height.saturating_sub(ui::CHROME_LINES) as usize;
+        let visible_height = height.saturating_sub(ui::chrome_lines(gpu)) as usize;
         if app.adjust_scroll(visible_height) {
             dirty = true;
         }

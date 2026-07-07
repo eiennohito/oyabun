@@ -20,6 +20,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/prctl.h>
@@ -50,6 +51,34 @@ static const int CAPS[] = { CAP_NET_ADMIN, CAP_SYS_PTRACE, CAP_PERFMON, CAP_BPF 
 static void die(const char *msg) {
     fprintf(stderr, "caprun: %s: %s\n", msg, strerror(errno));
     _exit(1);
+}
+
+static void scrub_env(void) {
+    static const char *const names[] = {
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "LD_DEBUG",
+        "LD_DEBUG_OUTPUT",
+        "LD_ORIGIN_PATH",
+        "LD_PROFILE",
+        "LD_SHOW_AUXV",
+        "GCONV_PATH",
+        "GETCONF_DIR",
+        "HOSTALIASES",
+        "LOCALDOMAIN",
+        "LOCPATH",
+        "MALLOC_TRACE",
+        "NLSPATH",
+        "RESOLV_HOST_CONF",
+        "RES_OPTIONS",
+        "TMPDIR",
+        "TZDIR",
+    };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        unsetenv(names[i]);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -101,7 +130,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* 5. Exec the real command. */
+    /* 5. Ambient-cap exec does not trigger the dynamic linker's secure mode. Scrub the
+          environment entries that would otherwise steer loader/NSS/locale behavior. */
+    scrub_env();
+
+    /* 6. Exec the real command. */
     execvp(argv[1], argv + 1);
     fprintf(stderr, "caprun: exec %s: %s\n", argv[1], strerror(errno));
     return 1;

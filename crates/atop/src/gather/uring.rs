@@ -36,9 +36,9 @@ use io_uring::{IoUring, opcode, squeue, types};
 use thoop::MmapRegion;
 
 use super::config::STAT_SLOT;
-use super::fxhash::PidMap;
 use super::parse;
 use super::syscall::read_transient;
+use crate::fxhash::PidMap;
 use crate::procs::Procs;
 use crate::sys::{self, ProcPath};
 

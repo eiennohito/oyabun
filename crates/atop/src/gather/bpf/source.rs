@@ -14,7 +14,7 @@ use thoop::{Arena, TypedBuf};
 use zerocopy::FromBytes;
 
 use super::types::{EVENT_FORK, EVENT_FREE, ProcEvent, TaskInfo};
-use crate::gather::fxhash::FxBuildHasher;
+use crate::fxhash::FxBuildHasher;
 use crate::procs::{ProcessEntry, Procs};
 
 /// The committed BPF object — sources in `bpf/`, rebuilt via `just bpf`. Embedded so a normal

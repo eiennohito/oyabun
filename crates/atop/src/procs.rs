@@ -10,6 +10,8 @@
 
 use thoop::{Arena, StringRef, TypedBuf};
 
+use crate::fxhash::PidMap;
+
 /// Sentinel index meaning "none" for tree links and roots.
 pub const NONE: u32 = u32::MAX;
 
@@ -63,6 +65,12 @@ pub struct SystemStats {
     pub tasks_stopped: u32,
     pub tasks_zombie: u32,
     pub tasks_idle: u32,
+    /// NVIDIA devices fixed at startup. Zero means the GPU UI is disabled.
+    pub gpu_count: u32,
+    /// Sum of per-device SM utilization, in basis points (may exceed 10000).
+    pub gpu_util_bp: Option<u32>,
+    /// Used and total framebuffer memory, summed across devices.
+    pub vram: Option<VramStats>,
 }
 
 impl SystemStats {
@@ -73,6 +81,121 @@ impl SystemStats {
         self.tasks_stopped = c.stopped;
         self.tasks_zombie = c.zombie;
         self.tasks_idle = c.idle;
+    }
+}
+
+#[derive(Clone, Copy, Default, Hash)]
+pub struct VramStats {
+    pub used: u64,
+    pub total: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum GpuMetric<T> {
+    Value(T),
+    Unknown,
+}
+
+impl<T: Default> Default for GpuMetric<T> {
+    fn default() -> Self {
+        Self::Value(T::default())
+    }
+}
+
+impl GpuMetric<u32> {
+    #[must_use]
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::Value(a), Self::Value(b)) => Self::Value(a.saturating_add(b)),
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl GpuMetric<u64> {
+    #[must_use]
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::Value(a), Self::Value(b)) => Self::Value(a.saturating_add(b)),
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
+pub struct GpuMetrics {
+    pub pct: GpuMetric<u32>,
+    pub mem_bytes: GpuMetric<u64>,
+}
+
+impl GpuMetrics {
+    #[must_use]
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            pct: self.pct.saturating_add(rhs.pct),
+            mem_bytes: self.mem_bytes.saturating_add(rhs.mem_bytes),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Hash)]
+pub struct RowMetrics {
+    pub cpu_pct: u32,
+    pub cpu_peak: u32,
+    pub mem_bytes: u64,
+    pub gpu: Option<GpuMetrics>,
+}
+
+/// Sparse process GPU telemetry. Missing PID means "no GPU context"; present values may still
+/// carry per-metric unknowns for process/device-specific NVML failures.
+#[derive(Default)]
+pub struct GpuProcessStats {
+    available: bool,
+    live: PidMap<GpuMetrics>,
+    subtree: PidMap<GpuMetrics>,
+}
+
+impl GpuProcessStats {
+    pub fn clear_available(&mut self) {
+        self.available = true;
+        self.live.clear();
+        self.subtree.clear();
+    }
+
+    pub fn clear_unavailable(&mut self) {
+        self.available = false;
+        self.live.clear();
+        self.subtree.clear();
+    }
+
+    #[must_use]
+    pub fn available(&self) -> bool {
+        self.available
+    }
+
+    pub fn add_live(&mut self, pid: u32, metrics: GpuMetrics) {
+        self.live
+            .entry(pid)
+            .and_modify(|m| *m = m.saturating_add(metrics))
+            .or_insert(metrics);
+    }
+
+    #[must_use]
+    pub fn live(&self, pid: u32) -> Option<GpuMetrics> {
+        self.live.get(&pid).copied()
+    }
+
+    pub fn clear_subtree(&mut self) {
+        self.subtree.clear();
+    }
+
+    pub fn set_subtree(&mut self, pid: u32, metrics: GpuMetrics) {
+        self.subtree.insert(pid, metrics);
+    }
+
+    #[must_use]
+    pub fn subtree(&self, pid: u32) -> Option<GpuMetrics> {
+        self.subtree.get(&pid).copied()
     }
 }
 
@@ -233,6 +356,30 @@ impl ProcessEntry {
     /// Copy `comm` in from a parsed `stat` slice, truncating to [`COMM_CAP`].
     pub fn set_comm(&mut self, comm: &[u8]) {
         self.comm.set(comm);
+    }
+
+    #[must_use]
+    pub fn effective_metrics(
+        &self,
+        collapsed: bool,
+        live_gpu: Option<GpuMetrics>,
+        subtree_gpu: Option<GpuMetrics>,
+    ) -> RowMetrics {
+        if collapsed && self.subtree_size > 0 {
+            RowMetrics {
+                cpu_pct: self.subtree_cpu,
+                cpu_peak: self.cpu_peak,
+                mem_bytes: self.subtree_mem,
+                gpu: subtree_gpu,
+            }
+        } else {
+            RowMetrics {
+                cpu_pct: self.cpu_pct,
+                cpu_peak: self.cpu_peak,
+                mem_bytes: self.mem_bytes,
+                gpu: live_gpu,
+            }
+        }
     }
 
     /// A slot is a tombstone (read failed / PID vanished) iff `pid == 0`. Linux never

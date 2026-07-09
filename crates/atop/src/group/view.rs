@@ -3,11 +3,21 @@ use crate::procs::{NONE, ProcessEntry};
 
 pub(crate) struct TreeView<'a> {
     procs: &'a [ProcessEntry],
+    preorder: &'a [u32],
+    preorder_pos: &'a [usize],
 }
 
 impl<'a> TreeView<'a> {
-    pub(crate) fn new(procs: &'a [ProcessEntry]) -> Self {
-        Self { procs }
+    pub(crate) fn new(
+        procs: &'a [ProcessEntry],
+        preorder: &'a [u32],
+        preorder_pos: &'a [usize],
+    ) -> Self {
+        Self {
+            procs,
+            preorder,
+            preorder_pos,
+        }
     }
 
     #[must_use]
@@ -21,21 +31,30 @@ impl<'a> TreeView<'a> {
             next: self.procs[pid_idx].first_child,
         }
     }
+
+    #[must_use]
+    pub(crate) fn procs(&self) -> &'a [ProcessEntry] {
+        self.procs
+    }
+
+    #[must_use]
+    pub(crate) fn preorder(&self) -> &'a [u32] {
+        self.preorder
+    }
+
+    #[must_use]
+    pub(crate) fn preorder_pos(&self, pid_idx: usize) -> usize {
+        self.preorder_pos[pid_idx]
+    }
 }
 
 pub(crate) struct GroupMetaView<'a> {
-    procs: &'a [ProcessEntry],
     meta: &'a dyn GroupMetaSource,
 }
 
 impl<'a> GroupMetaView<'a> {
-    pub(crate) fn new(procs: &'a [ProcessEntry], meta: &'a dyn GroupMetaSource) -> Self {
-        Self { procs, meta }
-    }
-
-    #[must_use]
-    pub(crate) fn proc(&self, pid_idx: usize) -> &'a ProcessEntry {
-        &self.procs[pid_idx]
+    pub(crate) fn new(meta: &'a dyn GroupMetaSource) -> Self {
+        Self { meta }
     }
 
     #[must_use]
@@ -43,8 +62,14 @@ impl<'a> GroupMetaView<'a> {
         self.meta.cmdline(e)
     }
 
-    pub(crate) fn descendants(&self, pid_idx: usize) -> DescendantIter<'a> {
-        DescendantIter::new(self.procs, self.procs[pid_idx].first_child)
+    #[must_use]
+    pub(crate) fn cgroup(&self, e: &ProcessEntry) -> &[u8] {
+        self.meta.cgroup(e)
+    }
+
+    #[must_use]
+    pub(crate) fn flatpak_info(&self, e: &ProcessEntry) -> &[u8] {
+        self.meta.flatpak_info(e)
     }
 }
 
@@ -54,7 +79,7 @@ pub(crate) struct ChildIter<'a> {
 }
 
 impl<'a> Iterator for ChildIter<'a> {
-    type Item = &'a ProcessEntry;
+    type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next == NONE {
@@ -63,43 +88,6 @@ impl<'a> Iterator for ChildIter<'a> {
         let idx = self.next as usize;
         let p = &self.procs[idx];
         self.next = p.next_sibling;
-        Some(p)
-    }
-}
-
-pub(crate) struct DescendantIter<'a> {
-    procs: &'a [ProcessEntry],
-    stack: Vec<u32>,
-}
-
-impl<'a> DescendantIter<'a> {
-    fn new(procs: &'a [ProcessEntry], first_child: u32) -> Self {
-        let mut iter = Self {
-            procs,
-            stack: Vec::new(),
-        };
-        iter.push_siblings(first_child);
-        iter
-    }
-
-    fn push_siblings(&mut self, head: u32) {
-        let base = self.stack.len();
-        let mut c = head;
-        while c != NONE {
-            self.stack.push(c);
-            c = self.procs[c as usize].next_sibling;
-        }
-        self.stack[base..].reverse();
-    }
-}
-
-impl<'a> Iterator for DescendantIter<'a> {
-    type Item = &'a ProcessEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let idx = self.stack.pop()? as usize;
-        let p = &self.procs[idx];
-        self.push_siblings(p.first_child);
-        Some(p)
+        Some(idx)
     }
 }

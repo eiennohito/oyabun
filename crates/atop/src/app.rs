@@ -175,10 +175,9 @@ impl App {
             // one gather interval may inherit collapse state, which is acceptable for display
             // state and does not affect signal safety.
             collapse.retain(|pid, _| procs.binary_search_by(|p| p.pid.cmp(pid)).is_ok());
-            for p in procs {
-                if gatherer.group_fact(p).is_some() {
-                    collapse.entry(p.pid).or_insert(CollapseState::Auto);
-                }
+            collapse.retain(|_, state| *state != CollapseState::Auto);
+            for &pid in gatherer.auto_group_roots() {
+                collapse.entry(pid).or_insert(CollapseState::Auto);
             }
 
             rows.clear();
@@ -291,23 +290,11 @@ impl App {
             return;
         }
         match self.collapse.get(&pid).copied() {
-            Some(CollapseState::Manual | CollapseState::Auto) => {
-                if self
-                    .gatherer
-                    .procs()
-                    .as_slice()
-                    .binary_search_by(|p| p.pid.cmp(&pid))
-                    .ok()
-                    .and_then(|idx| {
-                        self.gatherer
-                            .group_fact(&self.gatherer.procs().as_slice()[idx])
-                    })
-                    .is_some()
-                {
-                    self.collapse.insert(pid, CollapseState::AutoSuppressed);
-                } else {
-                    self.collapse.remove(&pid);
-                }
+            Some(CollapseState::Auto) => {
+                self.collapse.insert(pid, CollapseState::AutoSuppressed);
+            }
+            Some(CollapseState::Manual) => {
+                self.collapse.remove(&pid);
             }
             _ => {
                 self.collapse.insert(pid, CollapseState::Manual);
@@ -342,7 +329,7 @@ impl App {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CollapseState {
     Manual,
     Auto,

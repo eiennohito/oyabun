@@ -110,8 +110,20 @@ pub struct SystemStats {
 pub struct CycleEvent {
     pub wall_ns: u64,
     pub sys: SystemStats,
-    pub procs: Vec<RawProc>,
-    pub cmdlines: Vec<(u32, Vec<u8>)>,
+    pub procs: Vec<ProcSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcMetadata {
+    pub cmdline: Option<Vec<u8>>,
+    pub cgroup: Option<Vec<u8>>,
+    pub flatpak: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcSnapshot {
+    pub raw: RawProc,
+    pub metadata: ProcMetadata,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

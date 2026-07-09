@@ -117,10 +117,13 @@ Everything the source writes, nothing the common tail derives:
 |---|---|---|
 | wall_ns | u64 | monotonic nanoseconds (synthetic or captured) |
 | sys | SystemStats | derived system stats (not raw counters — see design constraints) |
-| procs | Vec\<RawProc\> | one per live process this cycle |
-| cmdlines | Vec\<(u32, Vec\<u8\>)\> | pid → resolved cmdline bytes |
+| procs | Vec\<ProcSnapshot\> | one raw process plus its optional metadata per live PID |
 
-`RawProc` — the source-output subset of `ProcessEntry`:
+`ProcSnapshot` contains `RawProc` plus a `ProcMetadata` record for optional cmdline, cgroup, and
+Flatpak bytes. Keeping metadata with its process makes orphaned or duplicate sidecars
+unrepresentable and lets verbose serialization run in one linear pass.
+
+`RawProc` is the source-output subset of `ProcessEntry`:
 ```
 pid, ppid, uid, state, priority, nice, num_threads, ticks, mem_bytes,
 start_time, comm, is_kthread

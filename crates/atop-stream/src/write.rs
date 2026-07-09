@@ -9,11 +9,20 @@ pub(crate) fn verbose_stream(stream: &Stream) -> String {
             out.push('\n');
         }
         cycle.sys.write_header(&mut out, cycle.wall_ns);
-        for proc in &cycle.procs {
+        for snapshot in &cycle.procs {
+            let proc = &snapshot.raw;
             proc.write_full(&mut out);
-            if let Some((_, cmdline)) = cycle.cmdlines.iter().find(|(pid, _)| *pid == proc.pid) {
+            if let Some(cmdline) = &snapshot.metadata.cmdline {
                 out.push_str(" cmd=");
                 write_value(&mut out, cmdline);
+            }
+            if let Some(cgroup) = &snapshot.metadata.cgroup {
+                out.push_str(" cgroup=");
+                write_value(&mut out, cgroup);
+            }
+            if let Some(flatpak) = &snapshot.metadata.flatpak {
+                out.push_str(" flatpak=");
+                write_value(&mut out, flatpak);
             }
             out.push('\n');
         }

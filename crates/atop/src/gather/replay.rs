@@ -1,8 +1,8 @@
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-use atop_stream::RawProc;
 pub(crate) use atop_stream::Stream;
+use atop_stream::{ProcMetadata, RawProc};
 use etch::{Display, Rgb};
 
 use super::super::ui;
@@ -57,7 +57,7 @@ pub(crate) struct ReplaySource {
     stream: Stream,
     next: usize,
     base: Instant,
-    cmdlines: PidMap<Vec<u8>>,
+    metadata: PidMap<ProcMetadata>,
     sys: SystemStats,
 }
 
@@ -67,7 +67,7 @@ impl ReplaySource {
             stream,
             next: 0,
             base: Instant::now(),
-            cmdlines: PidMap::default(),
+            metadata: PidMap::default(),
             sys: default_sys(),
         }
     }
@@ -86,17 +86,18 @@ impl Source for ReplaySource {
             .unwrap_or_else(|| panic!("replay exhausted at cycle {}", self.next));
         self.next += 1;
 
-        self.cmdlines.clear();
-        for (pid, cmdline) in &event.cmdlines {
-            self.cmdlines.insert(*pid, cmdline.clone());
+        self.metadata.clear();
+        for snapshot in &event.procs {
+            self.metadata
+                .insert(snapshot.raw.pid, snapshot.metadata.clone());
         }
         self.sys = convert_sys(event.sys);
 
         procs.clear();
         procs.reserve(event.procs.len());
-        for raw in &event.procs {
+        for snapshot in &event.procs {
             let mut e = ProcessEntry::TOMBSTONE;
-            raw.write_into(&mut e);
+            snapshot.raw.write_into(&mut e);
             procs.push(e);
         }
         procs.sort_by_pid();
@@ -111,7 +112,11 @@ impl Source for ReplaySource {
 
 impl ProcReader for ReplaySource {
     fn cmdline_uid(&mut self, pid: u32) -> CmdlineRead<'_> {
-        let Some(bytes) = self.cmdlines.get(&pid) else {
+        let Some(bytes) = self
+            .metadata
+            .get(&pid)
+            .and_then(|metadata| metadata.cmdline.as_deref())
+        else {
             return CmdlineRead::UNKNOWN;
         };
         CmdlineRead {
@@ -119,6 +124,20 @@ impl ProcReader for ReplaySource {
             bytes,
             non_ascii: bytes.iter().any(|&b| b >= 0x80),
         }
+    }
+
+    fn cgroup(&mut self, pid: u32) -> &[u8] {
+        self.metadata
+            .get(&pid)
+            .and_then(|metadata| metadata.cgroup.as_deref())
+            .unwrap_or(&[])
+    }
+
+    fn flatpak_info(&mut self, pid: u32) -> &[u8] {
+        self.metadata
+            .get(&pid)
+            .and_then(|metadata| metadata.flatpak.as_deref())
+            .unwrap_or(&[])
     }
 
     // The replay DSL does not carry capability/deleted-file inputs yet, so these remain
@@ -572,25 +591,37 @@ mod tests {
         )
     }
 
+    fn cgroup_group_stream() -> atop_stream::Stream {
+        stream(
+            r#"
+            cycle 0
+              200 start=200 comm=daemon cmd=/usr/bin/daemon cgroup="0::/system.slice/example.service\n"
+              201 ppid=200 start=201 comm=worker cmd=/usr/bin/worker cgroup="0::/system.slice/example.service\n"
+
+            cycle +1s
+            "#,
+        )
+    }
+
     #[test]
-    fn replay_chromium_group_starts_collapsed() {
+    fn replay_process_controlled_group_does_not_auto_collapse() {
         let mut r = Replayer::from_stream(chromium_group_stream());
         r.cycle();
-        assert_eq!(r.display_pids(), vec![10]);
-        assert!(r.row_collapsed(10));
+        assert_eq!(r.display_pids(), vec![10, 11, 12, 13, 14, 15]);
+        assert!(!r.row_collapsed(10));
     }
 
     #[test]
     fn replay_user_expansion_suppresses_auto_recollapse_while_pid_visible() {
-        let mut r = Replayer::from_stream(chromium_group_stream());
+        let mut r = Replayer::from_stream(cgroup_group_stream());
         r.cycle();
-        r.select_pid(10);
+        r.select_pid(200);
         r.toggle_collapse();
-        assert_eq!(r.display_pids(), vec![10, 11, 12, 13, 14, 15]);
+        assert_eq!(r.display_pids(), vec![200, 201]);
 
         r.cycle();
-        assert_eq!(r.display_pids(), vec![10, 11, 12, 13, 14, 15]);
-        assert!(!r.row_collapsed(10));
+        assert_eq!(r.display_pids(), vec![200, 201]);
+        assert!(!r.row_collapsed(200));
     }
 
     #[test]
@@ -598,52 +629,113 @@ mod tests {
         let stream = stream(
             r#"
             cycle 0
-              10 start=100 comm=chrome cmd=/opt/app/chrome
-              11 ppid=10 start=101 comm=chrome cmd=/opt/app/chrome
-              12 ppid=10 start=102 comm=chrome cmd="/opt/app/chrome --type=renderer"
-              13 ppid=10 start=103 comm=chrome cmd="/opt/app/chrome --type=gpu-process"
-              14 ppid=10 start=104 comm=chrome cmd="/opt/app/chrome --type=utility"
-              15 ppid=10 start=105 comm=chrome cmd="/opt/app/chrome --type=zygote"
+              200 start=100 comm=daemon cgroup="0::/system.slice/example.service\n"
+              201 ppid=200 start=101 comm=worker cgroup="0::/system.slice/example.service\n"
 
             cycle +1s
-              - 10
-              - 11
-              - 12
-              - 13
-              - 14
-              - 15
+              - 200
+              - 201
 
             cycle +1s
-              + 10 start=200 comm=chrome cmd=/opt/app/chrome
-              + 11 ppid=10 start=201 comm=chrome cmd=/opt/app/chrome
-              + 12 ppid=10 start=202 comm=chrome cmd="/opt/app/chrome --type=renderer"
-              + 13 ppid=10 start=203 comm=chrome cmd="/opt/app/chrome --type=gpu-process"
-              + 14 ppid=10 start=204 comm=chrome cmd="/opt/app/chrome --type=utility"
-              + 15 ppid=10 start=205 comm=chrome cmd="/opt/app/chrome --type=zygote"
+              + 200 start=200 comm=daemon cgroup="0::/system.slice/example.service\n"
+              + 201 ppid=200 start=201 comm=worker cgroup="0::/system.slice/example.service\n"
             "#,
         );
         let mut r = Replayer::from_stream(stream);
         r.cycle();
-        r.select_pid(10);
+        r.select_pid(200);
         r.toggle_collapse();
-        assert_eq!(r.display_pids(), vec![10, 11, 12, 13, 14, 15]);
+        assert_eq!(r.display_pids(), vec![200, 201]);
 
         r.cycle();
         assert!(r.display_pids().is_empty());
 
         r.cycle();
-        assert_eq!(r.display_pids(), vec![10]);
-        assert!(r.row_collapsed(10));
+        assert_eq!(r.display_pids(), vec![200]);
+        assert!(r.row_collapsed(200));
     }
 
     #[test]
     fn replay_collapsed_group_root_uses_group_label() {
         let mut r = Replayer::from_stream(chromium_group_stream());
         r.cycle();
+        r.select_pid(10);
+        r.toggle_collapse();
 
         let screen = r.render(80, 16);
         assert!(screen.text().contains("/opt/app/chrome"));
         assert!(!screen.text().contains("--type=renderer"));
+    }
+
+    #[test]
+    fn replay_collapsed_cgroup_group_label_renders() {
+        let stream = stream(
+            r#"
+            cycle 0
+              200 start=200 comm=daemon cmd=/usr/bin/daemon cgroup="0::/system.slice/example.service\n"
+              201 ppid=200 start=201 comm=worker cmd=/usr/bin/worker cgroup="0::/system.slice/example.service\n"
+
+            cycle +1s
+            "#,
+        );
+        let mut r = Replayer::from_stream(stream);
+        r.cycle();
+
+        assert_eq!(r.display_pids(), vec![200]);
+        assert!(r.row_collapsed(200));
+        let screen = r.render(80, 16);
+        assert!(screen.text().contains("example.service"));
+        assert!(!screen.text().contains("/usr/bin/worker"));
+    }
+
+    #[test]
+    fn replay_expanded_cgroup_tree_remains_structural() {
+        let stream = stream(
+            r#"
+            cycle 0
+              210 start=210 comm=daemon cmd=/usr/bin/daemon cgroup="0::/system.slice/example.service\n"
+              211 ppid=210 start=211 comm=worker cmd=/usr/bin/worker cgroup="0::/system.slice/example.service\n"
+
+            cycle +1s
+            "#,
+        );
+        let mut r = Replayer::from_stream(stream);
+        r.cycle();
+        r.select_pid(210);
+        r.toggle_collapse();
+
+        assert_eq!(r.display_pids(), vec![210, 211]);
+        assert!(!r.row_collapsed(210));
+        let screen = r.render(80, 16);
+        assert!(screen.text().contains("/usr/bin/daemon"));
+        assert!(screen.text().contains("/usr/bin/worker"));
+    }
+
+    #[test]
+    fn replay_trusted_descendant_collapses_under_untrusted_parent() {
+        let stream = stream(
+            r#"
+            cycle 0
+              300 start=300 comm=chrome cmd=/opt/chrome cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-chrome-300.scope\n"
+              301 ppid=300 start=301 comm=chrome cmd="/opt/chrome --type=zygote" cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-chrome@abc.service\n"
+              302 ppid=300 start=302 comm=chrome cmd="/opt/chrome --type=renderer" cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-chrome@abc.service\n"
+              303 ppid=300 start=303 comm=chrome cmd="/opt/chrome --type=gpu-process" cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-chrome@abc.service\n"
+              304 ppid=300 start=304 comm=chrome cmd="/opt/chrome --type=utility" cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-chrome@abc.service\n"
+              305 ppid=301 start=305 comm=chrome cmd="/opt/chrome --type=renderer" cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-chrome@abc.service\n"
+              306 ppid=301 start=306 comm=chrome cmd="/opt/chrome --type=renderer" cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-chrome@abc.service\n"
+
+            cycle +1s
+            "#,
+        );
+        let mut r = Replayer::from_stream(stream);
+        r.cycle();
+        assert_eq!(r.display_pids(), vec![300, 301, 302, 303, 304]);
+        assert!(r.row_collapsed(301));
+
+        r.select_pid(301);
+        r.toggle_collapse();
+        assert_eq!(r.display_pids(), vec![300, 301, 305, 306, 302, 303, 304]);
+        assert!(!r.row_collapsed(301));
     }
 
     #[test]

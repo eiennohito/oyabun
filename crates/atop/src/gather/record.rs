@@ -1,11 +1,16 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write as _};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use atop_stream::{CycleEvent, ProcState, RawProc, Stream, SystemStats as StreamSystemStats};
+use atop_stream::{
+    CycleEvent, ProcMetadata, ProcSnapshot, ProcState, RawProc, Stream,
+    SystemStats as StreamSystemStats,
+};
 
 use super::table::ProcTable;
+use crate::group::GroupMetaSource;
 use crate::procs::{ProcessEntry, SystemStats};
 
 pub(crate) struct Recorder {
@@ -16,10 +21,7 @@ pub(crate) struct Recorder {
 impl Recorder {
     pub(crate) fn from_env() -> Option<Self> {
         let path = std::env::var_os("ATOP_RECORD").map(PathBuf::from)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+        let file = open_recording(&path)
             .unwrap_or_else(|err| panic!("open ATOP_RECORD path {}: {err}", path.display()));
         Some(Self {
             file: BufWriter::new(file),
@@ -43,14 +45,19 @@ impl Recorder {
             wall_ns,
             sys: convert_sys(*sys),
             procs: Vec::with_capacity(procs.len()),
-            cmdlines: Vec::new(),
         };
         for proc in procs {
-            cycle.procs.push(convert_proc(proc));
             let cmdline = table.cmdline(proc);
-            if !cmdline.is_empty() {
-                cycle.cmdlines.push((proc.pid, cmdline.to_vec()));
-            }
+            let cgroup = table.cgroup(proc);
+            let flatpak = table.flatpak_info(proc);
+            cycle.procs.push(ProcSnapshot {
+                raw: convert_proc(proc),
+                metadata: ProcMetadata {
+                    cmdline: (!cmdline.is_empty()).then(|| cmdline.to_vec()),
+                    cgroup: (!cgroup.is_empty()).then(|| cgroup.to_vec()),
+                    flatpak: (!flatpak.is_empty()).then(|| flatpak.to_vec()),
+                },
+            });
         }
 
         let stream = Stream {
@@ -61,6 +68,25 @@ impl Recorder {
             .expect("write ATOP_RECORD stream");
         self.file.flush().expect("flush ATOP_RECORD stream");
     }
+}
+
+fn open_recording(path: &std::path::Path) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "ATOP_RECORD path must be a regular file",
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 fn convert_sys(sys: SystemStats) -> StreamSystemStats {
@@ -98,5 +124,25 @@ fn convert_proc(proc: &ProcessEntry) -> RawProc {
         start_time: proc.start_time,
         comm: proc.comm().to_vec(),
         is_kthread: proc.is_kthread,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_recording;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn recording_file_is_private_even_when_it_already_exists() {
+        let path = std::env::temp_dir().join(format!("atop-record-perms-{}", std::process::id()));
+        std::fs::write(&path, b"").expect("create test recording");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("make test recording insecure");
+
+        let file = open_recording(&path).expect("open recording");
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+        drop(file);
+        std::fs::remove_file(path).expect("remove test recording");
     }
 }

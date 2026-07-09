@@ -363,6 +363,12 @@ impl Gatherer {
         self.groups.fact(e.pid, e.start_time)
     }
 
+    /// Trusted, rank-canonicalized group roots that may start collapsed this cycle.
+    #[must_use]
+    pub fn auto_group_roots(&self) -> &[u32] {
+        self.groups.auto_roots()
+    }
+
     /// Run one gather cycle, filling [`procs`](Self::procs) + [`sys`](Self::sys) in place. The
     /// caller renders the same buffer afterward; the two never overlap, so this needs no
     /// publish, no swap, and no GC lease — slots are freed eagerly and retired arena regions

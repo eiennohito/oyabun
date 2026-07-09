@@ -27,11 +27,31 @@ impl GroupLabel {
 pub(crate) struct GroupFact {
     rule_id: &'static str,
     label: GroupLabel,
+    rank: u8,
+    evidence: GroupEvidence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupEvidence {
+    /// Membership and the grouping boundary come from the kernel's cgroup hierarchy.
+    KernelCgroup,
+    /// The identity depends on process-controlled names, argv, or root-filesystem content.
+    ProcessControlled,
 }
 
 impl GroupFact {
-    pub(crate) fn new(rule_id: &'static str, label: GroupLabel) -> Self {
-        Self { rule_id, label }
+    pub(crate) fn new(
+        rule_id: &'static str,
+        label: GroupLabel,
+        rank: u8,
+        evidence: GroupEvidence,
+    ) -> Self {
+        Self {
+            rule_id,
+            label,
+            rank,
+            evidence,
+        }
     }
 
     #[cfg(test)]
@@ -44,26 +64,14 @@ impl GroupFact {
     pub(crate) fn label(&self) -> &GroupLabel {
         &self.label
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct GroupCandidate {
-    pid_idx: usize,
-    rule_id: &'static str,
-}
-
-impl GroupCandidate {
-    pub(crate) fn new(pid_idx: usize, rule_id: &'static str) -> Self {
-        Self { pid_idx, rule_id }
+    #[must_use]
+    pub(crate) fn rank(&self) -> u8 {
+        self.rank
     }
 
     #[must_use]
-    pub(crate) fn pid_idx(&self) -> usize {
-        self.pid_idx
-    }
-
-    #[must_use]
-    pub(crate) fn rule_id(&self) -> &'static str {
-        self.rule_id
+    pub(crate) fn auto_collapse(&self) -> bool {
+        self.evidence == GroupEvidence::KernelCgroup
     }
 }

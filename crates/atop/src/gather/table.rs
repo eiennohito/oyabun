@@ -52,6 +52,13 @@ const MAPS_MAX: usize = 1 << 20;
 /// The generational `Cmd` string store (cmdlines), keyed off the gatherer's `u64`
 /// generation. Slots persist across cycles; an unchanged cmdline keeps its slot.
 type CmdStore = StrStore<CMD_SLOT, Cmd>;
+const CGROUP_SLOT: usize = 1024;
+const FLATPAK_SLOT: usize = 1024;
+type CgroupStore = StrStore<CGROUP_SLOT, CgroupBytes>;
+type FlatpakStore = StrStore<FLATPAK_SLOT, FlatpakBytes>;
+
+struct CgroupBytes;
+struct FlatpakBytes;
 
 /// Largish initial slot count for the `Cmd` store, so it rarely grows after warmup
 /// (growth relocates the chunk and retires the old region — fine, but a cold path).
@@ -79,6 +86,20 @@ impl GroupMetaSource for ProcTable {
     fn cmdline(&self, e: &ProcessEntry) -> &[u8] {
         self.cmdline(e)
     }
+
+    fn cgroup(&self, e: &ProcessEntry) -> &[u8] {
+        let Some(slot) = self.index.get(e.pid) else {
+            return &[];
+        };
+        self.cgroup_store.get(self.meta.get(slot.meta).cgroup)
+    }
+
+    fn flatpak_info(&self, e: &ProcessEntry) -> &[u8] {
+        let Some(slot) = self.index.get(e.pid) else {
+            return &[];
+        };
+        self.flatpak_store.get(self.meta.get(slot.meta).flatpak)
+    }
 }
 
 /// Slow-changing per-PID metadata (uid + cmdline handle) on huge pages in a
@@ -98,6 +119,10 @@ struct PidMeta {
     /// Effective-capability privilege level (from `/proc/<pid>/status`), refreshed on the
     /// coarse cadence like uid/cmdline.
     caps: CapLevel,
+    /// Raw `/proc/<pid>/cgroup` content, refreshed on the cold metadata cadence.
+    cgroup: StringRef<CgroupBytes>,
+    /// Raw `/proc/<pid>/root/.flatpak-info` content for likely Flatpak/sandbox processes.
+    flatpak: StringRef<FlatpakBytes>,
     /// `/proc/<pid>/exe` was marked `" (deleted)"` — the running binary is gone from disk.
     /// Absorbing per incarnation: once observed, latched here for the process's lifetime.
     exe_deleted: bool,
@@ -112,6 +137,8 @@ impl PidMeta {
         cmd: StringRef::EMPTY,
         cmd_non_ascii: false,
         caps: CapLevel::None,
+        cgroup: StringRef::EMPTY,
+        flatpak: StringRef::EMPTY,
         exe_deleted: false,
         uses_deleted_lib: false,
     };
@@ -173,6 +200,8 @@ pub(crate) struct ProcTable {
     /// Generational cmdline storage, persistent across cycles: an unchanged cmdline keeps its
     /// slot (no per-cycle re-copy); a changed/dead one is freed at once (no reader lease).
     cmd_store: CmdStore,
+    cgroup_store: CgroupStore,
+    flatpak_store: FlatpakStore,
     /// Last real CPU-sample instant (the window origin); `None` until the first sample.
     last: Option<Instant>,
     clk_tck: u64,
@@ -199,6 +228,8 @@ impl ProcTable {
             cpu: GenStore::new(arena, CPURING_MIN_SLOTS),
             meta: GenStore::new(arena, PIDMETA_MIN_SLOTS),
             cmd_store: CmdStore::new(arena, CMD_STORE_MIN_SLOTS),
+            cgroup_store: CgroupStore::new(arena, CMD_STORE_MIN_SLOTS),
+            flatpak_store: FlatpakStore::new(arena, CMD_STORE_MIN_SLOTS),
             last: None,
             clk_tck,
             refresh_n,
@@ -214,6 +245,8 @@ impl ProcTable {
         self.cpu.wire(arena);
         self.meta.wire(arena);
         self.cmd_store.wire(arena);
+        self.cgroup_store.wire(arena);
+        self.flatpak_store.wire(arena);
     }
 
     /// The shared PID index — read by the `/proc` source's skip-cycle leader gate to tell a
@@ -290,7 +323,7 @@ impl ProcTable {
             // CPU ring (hot): mutated in place; its &mut never spans the cmd/meta ops below.
             let cpu_ref = self.sample_cpu(&mut e, prior, reused, jiff);
 
-            // Metadata (cold): uid + cmdline on the cadence.
+            // Metadata (cold): uid + cmdline + cgroup provenance on the cadence.
             let stagger =
                 refresh_n <= 1 || cur_gen.wrapping_add(u64::from(pid)) % u64::from(refresh_n) == 0;
             let refresh = prior.is_none() || reused || settling || stagger;
@@ -308,11 +341,30 @@ impl ProcTable {
                 Some(s) => s.meta,
                 None => self.meta.insert(Gen::ALIVE, PidMeta::EMPTY),
             };
+            if reused {
+                let old = *self.meta.get(meta_ref);
+                self.cgroup_store.free(old.cgroup);
+                self.flatpak_store.free(old.flatpak);
+            }
             // Explicit field borrows: `fresh` borrows `self.reader`, refresh_meta touches only
             // `self.meta`/`self.cmd_store` — disjoint, so the cmdline bytes intern straight from
             // the reader's buffer with no intermediate copy.
             let mut pm =
                 Self::refresh_meta(&mut self.meta, &mut self.cmd_store, meta_ref, reused, fresh);
+            if refresh {
+                if !e.is_kthread {
+                    let cgroup = reader.cgroup(pid);
+                    refresh_bytes(&mut self.cgroup_store, &mut pm.cgroup, cgroup);
+                    let cmdline = self.cmd_store.get(pm.cmd);
+                    if likely_flatpak(e.comm(), cmdline, self.cgroup_store.get(pm.cgroup)) {
+                        let flatpak = reader.flatpak_info(pid);
+                        refresh_bytes(&mut self.flatpak_store, &mut pm.flatpak, flatpak);
+                    } else {
+                        self.flatpak_store.free(pm.flatpak);
+                        pm.flatpak = StringRef::EMPTY;
+                    }
+                }
+            }
 
             // Deleted-binary detection (userspace only — kthreads have neither exe nor maps).
             // A PID-reuse resets the flags with the rest of the incarnation (`PidMeta::EMPTY`
@@ -401,14 +453,21 @@ impl ProcTable {
             cpu,
             meta,
             cmd_store,
+            cgroup_store,
+            flatpak_store,
             ..
         } = self;
         index.retain(|_, slot| {
             if slot.seen_gen == cur_gen {
                 true
             } else {
-                let cmd = meta.get(slot.meta).cmd;
+                let pm = meta.get(slot.meta);
+                let cmd = pm.cmd;
+                let cgroup = pm.cgroup;
+                let flatpak = pm.flatpak;
                 cmd_store.free(cmd);
+                cgroup_store.free(cgroup);
+                flatpak_store.free(flatpak);
                 meta.free(slot.meta);
                 cpu.free(slot.cpu);
                 false
@@ -581,6 +640,8 @@ impl CmdlineRead<'static> {
 /// reader call.
 pub(crate) trait ProcReader {
     fn cmdline_uid(&mut self, pid: u32) -> CmdlineRead<'_>;
+    fn cgroup(&mut self, pid: u32) -> &[u8];
+    fn flatpak_info(&mut self, pid: u32) -> &[u8];
     fn cap_eff(&mut self, pid: u32) -> u64;
     fn exe_deleted(&mut self, pid: u32) -> bool;
     fn lib_deleted(&mut self, pid: u32) -> bool;
@@ -640,6 +701,14 @@ impl RealProcReader {
 }
 
 impl ProcReader for RealProcReader {
+    fn cgroup(&mut self, pid: u32) -> &[u8] {
+        self.read_all(pid, b"cgroup")
+    }
+
+    fn flatpak_info(&mut self, pid: u32) -> &[u8] {
+        self.read_all(pid, b"root/.flatpak-info")
+    }
+
     /// The process's effective-capability mask from `/proc/<pid>/status` (`CapEff:` line, hex).
     /// 0 if unreadable. Scanned, not positionally parsed — the line's order in `status` is not
     /// contractual.
@@ -731,6 +800,32 @@ fn cap_level(full_mask: u64, eff: u64) -> CapLevel {
         m if m == full_mask => CapLevel::Full,
         _ => CapLevel::Partial,
     }
+}
+
+fn refresh_bytes<const N: usize, S>(
+    store: &mut StrStore<N, S>,
+    slot: &mut StringRef<S>,
+    bytes: &[u8],
+) {
+    let bytes = &bytes[..bytes.len().min(N)];
+    if bytes.is_empty() {
+        store.free(*slot);
+        *slot = StringRef::EMPTY;
+    } else if slot.is_empty() || store.get(*slot) != bytes {
+        store.free(*slot);
+        *slot = store.intern(Gen::ALIVE, bytes);
+    }
+}
+
+fn likely_flatpak(comm: &[u8], cmdline: &[u8], cgroup: &[u8]) -> bool {
+    comm == b"bwrap"
+        || contains_ascii(cgroup, b"flatpak")
+        || contains_ascii(cmdline, b"flatpak")
+        || contains_ascii(cmdline, b"bwrap")
+}
+
+fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Parse an ASCII hex integer, skipping leading whitespace and stopping at the first non-hex

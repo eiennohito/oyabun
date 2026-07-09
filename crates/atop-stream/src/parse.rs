@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::{CycleEvent, ParseError, ProcState, RawProc, Stream, SystemStats, default_sys};
+use crate::{
+    CycleEvent, ParseError, ProcMetadata, ProcSnapshot, ProcState, RawProc, Stream, SystemStats,
+    default_sys,
+};
 
 pub(crate) fn parse(input: &str) -> Result<Stream, ParseError> {
     Parser::new(input).parse()
@@ -8,7 +11,7 @@ pub(crate) fn parse(input: &str) -> Result<Stream, ParseError> {
 
 struct Parser<'a> {
     input: &'a str,
-    state: BTreeMap<u32, ProcSnapshot>,
+    state: BTreeMap<u32, ResolvedProc>,
     sys: SystemStats,
     wall_ns: u64,
     saw_cycle: bool,
@@ -80,10 +83,7 @@ impl<'a> Parser<'a> {
         }
         let first = !self.saw_cycle;
         self.saw_cycle = true;
-        Ok(PendingCycle {
-            first,
-            cmdline_updates: BTreeMap::new(),
-        })
+        Ok(PendingCycle { first })
     }
 
     fn apply_proc_event(
@@ -111,7 +111,6 @@ impl<'a> Parser<'a> {
                 ));
             }
             self.state.remove(&pid);
-            pending.cmdline_updates.remove(&pid);
             return Ok(());
         }
 
@@ -120,9 +119,9 @@ impl<'a> Parser<'a> {
             return Err(ParseError::new(line_no, format!("unknown pid {pid}")));
         }
         let mut proc = if is_birth {
-            ProcSnapshot {
+            ResolvedProc {
                 raw: RawProc::defaults(pid),
-                cmdline: None,
+                metadata: ProcMetadata::default(),
             }
         } else {
             self.state
@@ -139,40 +138,33 @@ impl<'a> Parser<'a> {
             let (key, value) = split_field(token, line_no)?;
             proc.apply_field(key, value, line_no)?;
         }
-        if let Some(cmdline) = &proc.cmdline {
-            pending.cmdline_updates.insert(pid, cmdline.clone());
-        }
         self.state.insert(pid, proc);
         Ok(())
     }
 
-    fn finish_cycle(&self, pending: PendingCycle) -> CycleEvent {
+    fn finish_cycle(&self, _pending: PendingCycle) -> CycleEvent {
         let mut procs = Vec::with_capacity(self.state.len());
-        let mut cmdlines = Vec::new();
-        for (pid, state) in &self.state {
-            procs.push(state.raw.clone());
-            // CycleEvent is a fully resolved snapshot. Replay clears its per-cycle cmdline
-            // map before loading each event, so unchanged cmdlines must be forward-filled.
-            if let Some(cmdline) = pending.cmdline_updates.get(pid).or(state.cmdline.as_ref()) {
-                cmdlines.push((*pid, cmdline.clone()));
-            }
+        for state in self.state.values() {
+            procs.push(ProcSnapshot {
+                raw: state.raw.clone(),
+                metadata: state.metadata.clone(),
+            });
         }
         CycleEvent {
             wall_ns: self.wall_ns,
             sys: self.sys,
             procs,
-            cmdlines,
         }
     }
 }
 
 #[derive(Clone)]
-struct ProcSnapshot {
+struct ResolvedProc {
     raw: RawProc,
-    cmdline: Option<Vec<u8>>,
+    metadata: ProcMetadata,
 }
 
-impl ProcSnapshot {
+impl ResolvedProc {
     fn apply_field(&mut self, key: &str, value: &str, line_no: usize) -> Result<(), ParseError> {
         match key {
             "ppid" => self.raw.ppid = parse_u32(value, line_no)?,
@@ -195,7 +187,9 @@ impl ProcSnapshot {
             "mem" | "mem_bytes" => self.raw.mem_bytes = parse_bytes(value, line_no)?,
             "start" | "start_time" => self.raw.start_time = parse_u64(value, line_no)?,
             "comm" => self.raw.comm = value.as_bytes().to_vec(),
-            "cmd" | "cmdline" => self.cmdline = Some(value.as_bytes().to_vec()),
+            "cmd" | "cmdline" => self.metadata.cmdline = Some(value.as_bytes().to_vec()),
+            "cgroup" => self.metadata.cgroup = Some(value.as_bytes().to_vec()),
+            "flatpak" => self.metadata.flatpak = Some(value.as_bytes().to_vec()),
             "kthread" | "is_kthread" => self.raw.is_kthread = parse_bool(value, line_no)?,
             _ => {
                 return Err(ParseError::new(
@@ -240,7 +234,6 @@ impl SystemStats {
 
 struct PendingCycle {
     first: bool,
-    cmdline_updates: BTreeMap<u32, Vec<u8>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -458,8 +451,8 @@ mod tests {
         assert_eq!(stream.cycles.len(), 3);
         assert_eq!(stream.cycles[1].wall_ns, 1_000_000_000);
         assert_eq!(stream.cycles[2].wall_ns, 1_500_000_000);
-        assert_eq!(stream.cycles[1].procs[1].ticks, 50);
-        assert_eq!(stream.cycles[1].procs[2].pid, 43);
+        assert_eq!(stream.cycles[1].procs[1].raw.ticks, 50);
+        assert_eq!(stream.cycles[1].procs[2].raw.pid, 43);
         assert_eq!(stream.cycles[2].procs.len(), 2);
     }
 

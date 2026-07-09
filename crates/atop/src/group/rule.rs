@@ -1,7 +1,14 @@
-use super::{GroupCandidate, GroupFact, GroupMetaView, TreeView};
+use super::{GroupFact, GroupMetaView, TreeView};
 
 pub(crate) trait GroupRule {
-    fn id(&self) -> &'static str;
-    fn nominate(&self, tree: &TreeView<'_>, pid_idx: usize, out: &mut Vec<GroupCandidate>);
-    fn resolve(&self, meta: &GroupMetaView<'_>, candidate: &GroupCandidate) -> Option<GroupFact>;
+    /// Build rule-specific indexes once per cycle. Implementations must be O(processes).
+    fn prepare(&mut self, tree: &TreeView<'_>, meta: &GroupMetaView<'_>);
+
+    /// Detect one process from prepared indexes without walking its subtree.
+    fn detect(
+        &self,
+        tree: &TreeView<'_>,
+        meta: &GroupMetaView<'_>,
+        pid_idx: usize,
+    ) -> Option<GroupFact>;
 }

@@ -18,6 +18,7 @@ use super::replay::ReplaySource;
 use super::source::{Source, SourceCtx};
 use super::sysstat::SystemSampler;
 use super::table::{ProcReader, ProcTable, RealProcReader, cmdline_refresh_n};
+use crate::group::{GroupClassifier, GroupFact};
 use crate::procs::{GpuMetrics, GpuProcessStats, NONE, ProcessEntry, Procs, SystemStats};
 use crate::sys::{ProcDir, clk_tck};
 use crate::tree;
@@ -129,6 +130,8 @@ pub struct Gatherer {
     source: ObservationSource,
     /// Unified per-PID table (CPU history + uid/cmdline + the shared PID index).
     table: ProcTable,
+    /// Semantic process grouping sidecar, keyed by PID and guarded by `start_time`.
+    groups: GroupClassifier,
     /// Real `/proc/<pid>` metadata reader used by live sources. Replay provides its own reader.
     reader: RealProcReader,
     sys_sampler: SystemSampler,
@@ -250,6 +253,7 @@ impl Gatherer {
             procs,
             source,
             table,
+            groups: GroupClassifier::new(),
             reader: RealProcReader::new(),
             sys_sampler: SystemSampler::new(),
             nvml,
@@ -353,6 +357,12 @@ impl Gatherer {
         self.table.cmdline(e)
     }
 
+    /// Semantic group fact for this exact process incarnation, if classification resolved.
+    #[must_use]
+    pub fn group_fact(&self, e: &ProcessEntry) -> Option<&GroupFact> {
+        self.groups.fact(e.pid, e.start_time)
+    }
+
     /// Run one gather cycle, filling [`procs`](Self::procs) + [`sys`](Self::sys) in place. The
     /// caller renders the same buffer afterward; the two never overlap, so this needs no
     /// publish, no swap, and no GC lease — slots are freed eagerly and retired arena regions
@@ -398,6 +408,8 @@ impl Gatherer {
             &mut self.tree_order,
         );
         tree::aggregate(self.procs.as_mut_slice(), &self.tree_order, &mut self.gpu);
+        self.groups
+            .update(self.procs.as_slice(), &self.table, building_gen);
 
         self.sys.set_task_counts(self.procs.count_tasks());
 

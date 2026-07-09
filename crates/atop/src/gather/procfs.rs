@@ -219,9 +219,8 @@ impl ProcSource {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
+    use crate::fxhash::PidMap;
     use crate::procs::ProcessEntry;
     use crate::sys::ProcDir;
     use thoop::Arena;
@@ -292,7 +291,7 @@ mod tests {
             b.as_slice().len()
         );
 
-        let by_pid: HashMap<u32, ProcessEntry> = b.as_slice().iter().map(|p| (p.pid, *p)).collect();
+        let by_pid: PidMap<ProcessEntry> = b.as_slice().iter().map(|p| (p.pid, *p)).collect();
 
         let mut common = 0;
         let mut name_matches = 0;

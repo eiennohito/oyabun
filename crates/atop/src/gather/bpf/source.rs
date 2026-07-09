@@ -2,7 +2,7 @@
 //! The design rationale (emit-on-change, fork/free pairing, resync) lives in the module
 //! overview in `mod.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::time::Instant;
@@ -15,7 +15,7 @@ use zerocopy::FromBytes;
 
 use super::super::source::{CycleResult, Source, SourceCtx};
 use super::types::{EVENT_FORK, EVENT_FREE, ProcEvent, TaskInfo};
-use crate::fxhash::FxBuildHasher;
+use crate::fxhash::{FxBuildHasher, FxMap};
 use crate::procs::{ProcessEntry, Procs};
 
 /// The committed BPF object — sources in `bpf/`, rebuilt via `just bpf`. Embedded so a normal
@@ -51,7 +51,7 @@ type PidSet = HashSet<u32, FxBuildHasher>;
 /// The maintained full live set: PID → its last-known source fields. Heap-resident with the
 /// fast PID hasher, like [`PidSet`] — the same arena-residency follow-up the doc notes for the
 /// `/proc` backend's fd pools applies here. Rebuilt order-free each cycle from the delta.
-type PidTaskMap = HashMap<u32, TaskInfo, FxBuildHasher>;
+type PidTaskMap = FxMap<u32, TaskInfo>;
 
 /// The loaded BPF programs + maps and the per-cycle scratch. Holds `ebpf` alive for the process
 /// lifetime so the fork/exit links stay attached.

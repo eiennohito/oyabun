@@ -371,12 +371,7 @@ fn render_body<W: Write>(
             );
             advance_guides(&mut guides, depth, has_next);
 
-            let cmdline = app.cmdline(p);
-            let (text, is_name) = if cmdline.is_empty() {
-                (p.comm(), true)
-            } else {
-                (cmdline, false)
-            };
+            let text = row_text(app, p, row.collapsed);
             let suffix_n = if row.collapsed && p.subtree_size > 0 {
                 p.subtree_size
             } else {
@@ -391,9 +386,7 @@ fn render_body<W: Write>(
                 prefix: prefix.as_str(),
                 prefix_cols,
                 text,
-                is_name,
                 is_kthread: p.is_kthread,
-                non_ascii: p.non_ascii,
                 suffix_n,
                 basename_fg: basename_color(p.exe_deleted, p.uses_deleted_lib),
             };
@@ -429,7 +422,6 @@ fn render_body<W: Write>(
                     (
                         cmd.prefix,
                         cmd.text,
-                        cmd.is_name,
                         cmd.is_kthread,
                         cmd.suffix_n,
                         cmd.basename_fg,
@@ -480,33 +472,62 @@ fn basename_color(exe_deleted: bool, uses_deleted_lib: bool) -> Rgb {
 struct CommandCell<'a> {
     prefix: &'a str,
     prefix_cols: usize,
-    text: &'a [u8],
-    /// The cmdline was empty/inaccessible, so `text` is the `comm` name, not a command line.
-    is_name: bool,
+    text: RowText<'a>,
     is_kthread: bool,
-    non_ascii: bool,
     suffix_n: u32,
     basename_fg: Rgb,
+}
+
+#[derive(Clone, Copy, Hash)]
+enum RowText<'a> {
+    Comm { bytes: &'a [u8], non_ascii: bool },
+    Cmdline { bytes: &'a [u8], non_ascii: bool },
+    GroupLabel { bytes: &'a [u8], non_ascii: bool },
+}
+
+fn row_text<'a>(app: &'a App, p: &'a crate::procs::ProcessEntry, collapsed: bool) -> RowText<'a> {
+    if collapsed && let Some(label) = app.group_fact(p).map(crate::group::GroupFact::label) {
+        return RowText::GroupLabel {
+            bytes: label.bytes(),
+            non_ascii: label.non_ascii(),
+        };
+    }
+    let cmdline = app.cmdline(p);
+    if cmdline.is_empty() {
+        RowText::Comm {
+            bytes: p.comm(),
+            non_ascii: p.non_ascii,
+        }
+    } else {
+        RowText::Cmdline {
+            bytes: cmdline,
+            non_ascii: p.non_ascii,
+        }
+    }
 }
 
 fn write_command(c: &mut Cell, cmd: &CommandCell) {
     c.set_fg(palette::TREE);
     c.glyph(cmd.prefix, cmd.prefix_cols);
 
-    if cmd.is_kthread {
-        // Kernel thread (no cmdline): synthesize the familiar `[name]` bracket convention
-        // (the kernel stores the name unbracketed), dim.
-        c.set_fg(palette::KTHREAD);
-        c.ascii(b"[");
-        push_text(c, cmd.text, cmd.non_ascii);
-        c.ascii(b"]");
-    } else if cmd.is_name {
-        // Userspace with an empty/inaccessible cmdline: show `comm` plainly — no brackets, it
-        // is a real process — colored as a basename.
-        c.set_fg(cmd.basename_fg);
-        push_text(c, cmd.text, cmd.non_ascii);
-    } else {
-        write_cmdline(c, cmd.text, cmd.non_ascii, cmd.basename_fg);
+    match cmd.text {
+        RowText::Comm { bytes, non_ascii } if cmd.is_kthread => {
+            // Kernel thread (no cmdline): synthesize the familiar `[name]` bracket convention
+            // (the kernel stores the name unbracketed), dim.
+            c.set_fg(palette::KTHREAD);
+            c.ascii(b"[");
+            push_text(c, bytes, non_ascii);
+            c.ascii(b"]");
+        }
+        RowText::Comm { bytes, non_ascii } => {
+            // Userspace with an empty/inaccessible cmdline: show `comm` plainly — no brackets,
+            // it is a real process — colored as a basename.
+            c.set_fg(cmd.basename_fg);
+            push_text(c, bytes, non_ascii);
+        }
+        RowText::Cmdline { bytes, non_ascii } | RowText::GroupLabel { bytes, non_ascii } => {
+            write_cmdline(c, bytes, non_ascii, cmd.basename_fg);
+        }
     }
 
     if cmd.suffix_n > 0 {

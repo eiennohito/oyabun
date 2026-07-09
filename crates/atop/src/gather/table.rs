@@ -14,6 +14,7 @@ use thoop::{Arena, Gen, GenStore, Ref, StrStore, StringRef, ThpMap};
 use super::config::{CMD_SLOT, env_u32};
 use super::cpu::{ACTIVE_SAMPLES, CpuRing, MIN_SAMPLE, elapsed_jiffies};
 use super::parse;
+use crate::group::GroupMetaSource;
 use crate::procs::{CapLevel, Cmd, ProcessEntry, Procs};
 use crate::sys::{self, ProcPath};
 
@@ -72,6 +73,12 @@ pub(crate) fn cmdline_refresh_n() -> u32 {
     env_u32("ATOP_CMDLINE_REFRESH_N")
         .unwrap_or(CMDLINE_REFRESH_N)
         .max(1)
+}
+
+impl GroupMetaSource for ProcTable {
+    fn cmdline(&self, e: &ProcessEntry) -> &[u8] {
+        self.cmdline(e)
+    }
 }
 
 /// Slow-changing per-PID metadata (uid + cmdline handle) on huge pages in a

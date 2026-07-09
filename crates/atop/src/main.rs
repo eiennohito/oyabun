@@ -1,6 +1,7 @@
 mod app;
 mod fxhash;
 mod gather;
+mod group;
 mod palette;
 mod procs;
 mod sys;

@@ -4,9 +4,9 @@
 //! display list; render reads everything back through `&self`. The borrow checker proves the
 //! gather (`&mut`) and the render (`&`) never overlap, so there is no snapshot exchange.
 
-use std::collections::{HashMap, HashSet};
-
+use crate::fxhash::{FxMap, PidMap};
 use crate::gather::Gatherer;
+use crate::group::GroupFact;
 use crate::procs::{GpuMetrics, NONE, ProcessEntry, Procs, SystemStats};
 use crate::sys::{self, ProcDir};
 
@@ -25,8 +25,8 @@ pub struct App {
     /// Keeping it on the heap also means a rebuild's `push` can never relocate the arena and
     /// dangle the `&[ProcessEntry]` it reads from.
     rows: Vec<DisplayRow>,
-    collapsed: HashSet<u32>,
-    uid_names: HashMap<u32, Box<str>>,
+    collapse: PidMap<CollapseState>,
+    uid_names: FxMap<u32, Box<str>>,
     selected: usize,
     scroll: usize,
     /// Reused DFS stack for flattening the tree into `rows`.
@@ -34,11 +34,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(page_size: u64, proc_dir: ProcDir, uid_names: HashMap<u32, Box<str>>) -> Self {
+    pub fn new(page_size: u64, proc_dir: ProcDir, uid_names: FxMap<u32, Box<str>>) -> Self {
         Self {
             gatherer: Gatherer::new(page_size, proc_dir),
             rows: Vec::new(),
-            collapsed: HashSet::new(),
+            collapse: PidMap::default(),
             uid_names,
             selected: 0,
             scroll: 0,
@@ -47,11 +47,11 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_gatherer(gatherer: Gatherer, uid_names: HashMap<u32, Box<str>>) -> Self {
+    pub(crate) fn from_gatherer(gatherer: Gatherer, uid_names: FxMap<u32, Box<str>>) -> Self {
         Self {
             gatherer,
             rows: Vec::new(),
-            collapsed: HashSet::new(),
+            collapse: PidMap::default(),
             uid_names,
             selected: 0,
             scroll: 0,
@@ -138,6 +138,10 @@ impl App {
         self.gatherer.cmdline(e)
     }
 
+    pub fn group_fact(&self, e: &ProcessEntry) -> Option<&GroupFact> {
+        self.gatherer.group_fact(e)
+    }
+
     fn entry(&self, proc_idx: usize) -> &ProcessEntry {
         &self.gatherer.procs().as_slice()[proc_idx]
     }
@@ -161,11 +165,22 @@ impl App {
                 gatherer,
                 rows,
                 row_scratch,
-                collapsed,
+                collapse,
                 selected,
                 ..
             } = self;
             let procs = gatherer.procs().as_slice();
+            // Collapse is transient UI state keyed by PID. The model is intentionally simple:
+            // if a PID is absent from a gathered frame, its UI state is gone. PID reuse within
+            // one gather interval may inherit collapse state, which is acceptable for display
+            // state and does not affect signal safety.
+            collapse.retain(|pid, _| procs.binary_search_by(|p| p.pid.cmp(pid)).is_ok());
+            for p in procs {
+                if gatherer.group_fact(p).is_some() {
+                    collapse.entry(p.pid).or_insert(CollapseState::Auto);
+                }
+            }
+
             rows.clear();
             row_scratch.clear();
             push_children(procs, gatherer.first_root(), row_scratch);
@@ -175,7 +190,7 @@ impl App {
             while let Some(iu) = row_scratch.pop() {
                 let p = &procs[iu as usize];
                 let (pid, depth, first_child) = (p.pid, p.depth, p.first_child);
-                let is_collapsed = collapsed.contains(&pid);
+                let is_collapsed = collapse.get(&pid).is_some_and(|state| state.is_collapsed());
                 if keep_pid == Some(pid) {
                     found = Some(rows.len());
                 }
@@ -275,8 +290,28 @@ impl App {
         if !has_children {
             return;
         }
-        if !self.collapsed.remove(&pid) {
-            self.collapsed.insert(pid);
+        match self.collapse.get(&pid).copied() {
+            Some(CollapseState::Manual | CollapseState::Auto) => {
+                if self
+                    .gatherer
+                    .procs()
+                    .as_slice()
+                    .binary_search_by(|p| p.pid.cmp(&pid))
+                    .ok()
+                    .and_then(|idx| {
+                        self.gatherer
+                            .group_fact(&self.gatherer.procs().as_slice()[idx])
+                    })
+                    .is_some()
+                {
+                    self.collapse.insert(pid, CollapseState::AutoSuppressed);
+                } else {
+                    self.collapse.remove(&pid);
+                }
+            }
+            _ => {
+                self.collapse.insert(pid, CollapseState::Manual);
+            }
         }
         let keep = self.selected_pid();
         self.rebuild_rows(keep);
@@ -286,7 +321,8 @@ impl App {
         let Some((pid, has_children)) = self.selected_has_children() else {
             return;
         };
-        if has_children && self.collapsed.insert(pid) {
+        if has_children {
+            self.collapse.insert(pid, CollapseState::Manual);
             let keep = self.selected_pid();
             self.rebuild_rows(keep);
         }
@@ -303,6 +339,19 @@ impl App {
         // Only signals if (pid, start_time) still identify this exact process — a reused PID is
         // never hit.
         sys::kill_verified(e.pid, e.start_time, libc::SIGTERM)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CollapseState {
+    Manual,
+    Auto,
+    AutoSuppressed,
+}
+
+impl CollapseState {
+    fn is_collapsed(self) -> bool {
+        matches!(self, Self::Manual | Self::Auto)
     }
 }
 

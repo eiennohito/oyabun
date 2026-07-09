@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
@@ -10,6 +9,7 @@ use super::super::ui;
 use super::source::{CycleResult, Source, SourceCtx};
 use super::table::{CmdlineRead, ProcReader};
 use crate::app::App;
+use crate::fxhash::{FxMap, PidMap};
 use crate::gather::Gatherer;
 use crate::procs::{ProcessEntry, Procs, SystemStats};
 
@@ -57,7 +57,7 @@ pub(crate) struct ReplaySource {
     stream: Stream,
     next: usize,
     base: Instant,
-    cmdlines: HashMap<u32, Vec<u8>>,
+    cmdlines: PidMap<Vec<u8>>,
     sys: SystemStats,
 }
 
@@ -67,7 +67,7 @@ impl ReplaySource {
             stream,
             next: 0,
             base: Instant::now(),
-            cmdlines: HashMap::new(),
+            cmdlines: PidMap::default(),
             sys: default_sys(),
         }
     }
@@ -161,7 +161,7 @@ impl Replayer {
     }
 
     fn from_gatherer(gatherer: Gatherer) -> Self {
-        let mut uid_names = HashMap::new();
+        let mut uid_names = FxMap::default();
         uid_names.insert(0, Box::<str>::from("root"));
         uid_names.insert(1000, Box::<str>::from("user"));
         Self {
@@ -236,6 +236,16 @@ impl Replayer {
             .iter()
             .map(|row| self.app.procs().as_slice()[row.proc_idx].pid)
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row_collapsed(&self, pid: u32) -> bool {
+        self.app
+            .rows()
+            .iter()
+            .find(|row| self.app.procs().as_slice()[row.proc_idx].pid == pid)
+            .map(|row| row.collapsed)
+            .unwrap_or_else(|| panic!("pid {pid} not displayed"))
     }
 
     #[cfg(test)]
@@ -484,6 +494,12 @@ mod tests {
               42 cmd=delta-ignored
 
             cycle +1s
+              - 10
+              - 11
+              - 12
+              - 13
+              - 14
+              - 15
 
             cycle +1s
               42 cmd=epsilon
@@ -538,6 +554,96 @@ mod tests {
         assert!(text.contains("[+2]"), "{text}");
         assert!(text.contains("60.00%"), "{text}");
         assert!(text.contains("6.0M"), "{text}");
+    }
+
+    fn chromium_group_stream() -> atop_stream::Stream {
+        stream(
+            r#"
+            cycle 0
+              10 start=100 comm=chrome cmd=/opt/app/chrome
+              11 ppid=10 start=101 comm=chrome cmd=/opt/app/chrome
+              12 ppid=10 start=102 comm=chrome cmd="/opt/app/chrome --type=renderer"
+              13 ppid=10 start=103 comm=chrome cmd="/opt/app/chrome --type=gpu-process"
+              14 ppid=10 start=104 comm=chrome cmd="/opt/app/chrome --type=utility"
+              15 ppid=10 start=105 comm=chrome cmd="/opt/app/chrome --type=zygote"
+
+            cycle +1s
+            "#,
+        )
+    }
+
+    #[test]
+    fn replay_chromium_group_starts_collapsed() {
+        let mut r = Replayer::from_stream(chromium_group_stream());
+        r.cycle();
+        assert_eq!(r.display_pids(), vec![10]);
+        assert!(r.row_collapsed(10));
+    }
+
+    #[test]
+    fn replay_user_expansion_suppresses_auto_recollapse_while_pid_visible() {
+        let mut r = Replayer::from_stream(chromium_group_stream());
+        r.cycle();
+        r.select_pid(10);
+        r.toggle_collapse();
+        assert_eq!(r.display_pids(), vec![10, 11, 12, 13, 14, 15]);
+
+        r.cycle();
+        assert_eq!(r.display_pids(), vec![10, 11, 12, 13, 14, 15]);
+        assert!(!r.row_collapsed(10));
+    }
+
+    #[test]
+    fn replay_absent_pid_clears_auto_suppression() {
+        let stream = stream(
+            r#"
+            cycle 0
+              10 start=100 comm=chrome cmd=/opt/app/chrome
+              11 ppid=10 start=101 comm=chrome cmd=/opt/app/chrome
+              12 ppid=10 start=102 comm=chrome cmd="/opt/app/chrome --type=renderer"
+              13 ppid=10 start=103 comm=chrome cmd="/opt/app/chrome --type=gpu-process"
+              14 ppid=10 start=104 comm=chrome cmd="/opt/app/chrome --type=utility"
+              15 ppid=10 start=105 comm=chrome cmd="/opt/app/chrome --type=zygote"
+
+            cycle +1s
+              - 10
+              - 11
+              - 12
+              - 13
+              - 14
+              - 15
+
+            cycle +1s
+              + 10 start=200 comm=chrome cmd=/opt/app/chrome
+              + 11 ppid=10 start=201 comm=chrome cmd=/opt/app/chrome
+              + 12 ppid=10 start=202 comm=chrome cmd="/opt/app/chrome --type=renderer"
+              + 13 ppid=10 start=203 comm=chrome cmd="/opt/app/chrome --type=gpu-process"
+              + 14 ppid=10 start=204 comm=chrome cmd="/opt/app/chrome --type=utility"
+              + 15 ppid=10 start=205 comm=chrome cmd="/opt/app/chrome --type=zygote"
+            "#,
+        );
+        let mut r = Replayer::from_stream(stream);
+        r.cycle();
+        r.select_pid(10);
+        r.toggle_collapse();
+        assert_eq!(r.display_pids(), vec![10, 11, 12, 13, 14, 15]);
+
+        r.cycle();
+        assert!(r.display_pids().is_empty());
+
+        r.cycle();
+        assert_eq!(r.display_pids(), vec![10]);
+        assert!(r.row_collapsed(10));
+    }
+
+    #[test]
+    fn replay_collapsed_group_root_uses_group_label() {
+        let mut r = Replayer::from_stream(chromium_group_stream());
+        r.cycle();
+
+        let screen = r.render(80, 16);
+        assert!(screen.text().contains("/opt/app/chrome"));
+        assert!(!screen.text().contains("--type=renderer"));
     }
 
     #[test]

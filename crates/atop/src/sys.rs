@@ -1,9 +1,10 @@
 //! System interface: sysconf constants, zero-alloc `/proc` enumeration and file
 //! reads, and the uid→username map.
 
-use std::collections::HashMap;
 use std::io;
 use std::os::fd::RawFd;
+
+use crate::fxhash::FxMap;
 
 pub fn page_size() -> u64 {
     // SAFETY: sysconf with a valid name; always defined.
@@ -493,8 +494,8 @@ fn parse_pid_name(name: &[u8]) -> Option<u32> {
 }
 
 /// Parse `/etc/passwd` once at startup to build the uid→username map.
-pub fn read_uid_names() -> HashMap<u32, Box<str>> {
-    let mut map = HashMap::new();
+pub fn read_uid_names() -> FxMap<u32, Box<str>> {
+    let mut map = FxMap::default();
     let Ok(content) = std::fs::read_to_string("/etc/passwd") else {
         return map;
     };

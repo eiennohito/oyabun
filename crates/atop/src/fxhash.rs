@@ -46,6 +46,9 @@ impl BuildHasher for FxBuildHasher {
 
 /// PID-keyed map using the fast hasher above.
 pub(crate) type PidMap<V> = HashMap<u32, V, FxBuildHasher>;
+/// General map using the same deterministic fast hasher. Prefer this over the standard
+/// `HashMap` default hasher for internal, non-adversarial keys.
+pub(crate) type FxMap<K, V> = HashMap<K, V, FxBuildHasher>;
 
 #[cfg(test)]
 mod tests {

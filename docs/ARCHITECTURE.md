@@ -43,7 +43,7 @@ index-based and POD (`Copy`, no heap, no `Drop`), so a reset is O(1) and refill 
 after warmup. Tree links are indices into the buffer.
 
 A row carries the process identity (`pid`+`ppid`+`uid`, and the `start_time` that with `pid`
-names a unique incarnation — the basis for race-safe kill), the volatile stat fields (state,
+names a unique incarnation — see **PID reuse model** below), the volatile stat fields (state,
 priority, nice, thread count, raw ticks, resident bytes), the derived CPU% (a stable moving
 average plus a separate peak), the process name and cmdline, two cheap flags (a non-ASCII bit
 that gates the renderer's unicode path; a kernel-thread bit that means "never read cmdline"),
@@ -73,6 +73,40 @@ precondition).
 Every failure path (open, read, reopen, parse) must re-mark the slot dead, or it survives
 compaction as a *phantom row* — a real PID with empty fields. This is load-bearing for the
 birth probe (below), where most speculative reads are meant to fail.
+
+## PID reuse model
+
+Linux allocates PIDs near-monotonically from a per-namespace counter up to `pid_max` (4194304
+on 64-bit — both the kernel's own CPU-scaled init and systemd's sysctl override land there on
+any modern multi-core system; 32768 is only the kernel's floor for the scaling formula). On
+wrap the kernel scans forward from 1. A PID can only be reassigned after its task is **reaped**
+(`release_task`, not just exit) *and* the allocator wraps back to it — a minimum gap of
+`pid_max` allocations. At 4194304 and the 500 ms gather interval, same-cycle reuse requires ~8 M forks/s
+sustained — a fork bomb that would OOM-kill the system before it wraps.
+
+**Death detection is ≤1 cycle.** A held `/proc` fd returns ESRCH the cycle after the task
+dies; an unheld PID fails its transient open. All per-PID sidecar state (CPU ring, metadata,
+group classification, collapse/suppression) is generation-evicted the same cycle death is
+detected. Therefore any reuse arriving ≥2 cycles after death hits a **clean slate** — no stale
+state exists for it to collide with.
+
+This means per-PID sidecar state needs only **generation-based liveness** (the existing
+`seen_gen` / `last_seen_gen` pattern), not incarnation keying. The timing gap between death
+and reuse — vastly longer than 2 cycles under any non-pathological load — is the invariant that
+makes PID-keyed state safe without a discriminator.
+
+**`start_time` is reserved for signal safety.** `kill_verified` is the one path where a wrong
+target is dangerous regardless of probability: it re-reads `/proc/<pid>/stat` field 22 and
+compares to the selected row's `start_time`, refusing to signal on mismatch. The `pidfd` it
+opens pins the kernel `task_struct` (so even a same-microsecond reuse would ESRCH, not hit the
+new process); the `start_time` check is the formal proof on top of the physical one. Both are
+cheap; both stay.
+
+**Same-cycle reuse (the fork-bomb edge).** If it occurs, the held-fd ESRCH still fires (the fd
+is bound to the old inode), triggering a reopen that reads the new incarnation. The CPU ring's
+backward-counter guard catches most tick-discontinuities; metadata self-heals within the settle
+window. The worst case is one frame of wrong CPU% — bounded and self-correcting. No special
+guard is needed beyond what the normal eviction + reopen path already does.
 
 ## Storage substrate (`thoop`) and atop's single-thread policy
 
@@ -160,8 +194,9 @@ closes/cycle made that mutex an `osq_lock` spin. **No per-cycle close = no storm
 
 A held `/proc/<pid>/stat` fd is bound to the task's proc inode: re-reading at offset 0
 regenerates fresh content (a single-show seq_file re-traverses when `ki_pos < read_pos`
-— validated), and once the task dies the read returns `ESRCH`. So death/reuse needs no
-`start_time` comparison in the hot path: `ESRCH` ⇒ the incarnation is gone, reopen.
+— validated), and once the task dies the read returns `ESRCH`. Death/reuse needs no
+`start_time` comparison in the hot path (see **PID reuse model**): ESRCH ⇒ death detected
+this cycle ⇒ state evicted ⇒ any later reuse of this PID number starts clean.
 
 A `Backend` enum (`Uring | Syscall`), probed at startup (`ATOP_FORCE_SYSCALL` forces
 the latter); on any io_uring error mid-run the gatherer permanently downgrades to
@@ -565,9 +600,10 @@ user/sys/iowait split is preserved because every counter is differenced over the
   built without it today). `ThpMap` is the reusable primitive for that step.
 - **Selection-follows-PID** across refreshes is implemented; full follow-mode
   auto-scroll is not.
-- **Kill is race-safe**: `sys::kill_verified` pins the target with a `pidfd`, re-checks
-  `(pid, start_time)` against the selected row, then signals through the pidfd — a reused
-  PID is never hit. (`sudo` escalation for protected processes is still future.)
+- **Kill is race-safe**: `sys::kill_verified` pins the target with a `pidfd` and re-checks
+  `start_time` (see **PID reuse model**) — the pidfd makes it physically safe, the
+  `start_time` makes it formally correct. (`sudo` escalation for protected processes is
+  still future.)
 
 ## Not yet implemented (see GOALS.md)
 

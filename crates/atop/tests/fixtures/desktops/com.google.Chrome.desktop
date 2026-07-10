@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=Google Chrome
+Exec=/opt/google/chrome/chrome %U
+Categories=Network;WebBrowser;

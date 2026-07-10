@@ -71,6 +71,8 @@ crates/
   atop/     process-manager TUI: one thread, serialized gather→render loop
     gather/ source (/proc or BPF) fills rows; CPU%, tree; common tail
     gather/bpf/ privileged source: emit-on-change iter + fork/free (feature "bpf")
+    identity/ per-process group identity + trust (cgroup + structural)
+    application/ view-side grouping: fold, label, aggregate, PSS memory
   etch/     retained-mode, value-gated terminal renderer
   thoop/    THP storage primitives (MmapRegion, Arena, GenStore, TypedBuf, ThpMap, …)
 bpf/        BPF C sources + committed .o (clang/bpftool dev-only; `just bpf`)

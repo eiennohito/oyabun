@@ -4,16 +4,26 @@
 //! display list; render reads everything back through `&self`. The borrow checker proves the
 //! gather (`&mut`) and the render (`&`) never overlap, so there is no snapshot exchange.
 
+use crate::application::{
+    AppGroup, AppGroupKey, ApplicationGroups, DesktopResolver, FoldPreferences, MemorySampler,
+};
 use crate::fxhash::{FxMap, PidMap};
 use crate::gather::Gatherer;
-use crate::group::GroupFact;
 use crate::procs::{GpuMetrics, NONE, ProcessEntry, Procs, SystemStats};
 use crate::sys::{self, ProcDir};
 
+#[derive(Clone, Debug)]
+pub enum DisplayRowKind {
+    Process { proc_idx: usize },
+    Application { group_idx: usize },
+}
+
 pub struct DisplayRow {
-    pub proc_idx: usize,
+    pub kind: DisplayRowKind,
     pub depth: u16,
     pub collapsed: bool,
+    pub has_children: bool,
+    pub has_next: bool,
 }
 
 pub struct App {
@@ -26,6 +36,12 @@ pub struct App {
     /// dangle the `&[ProcessEntry]` it reads from.
     rows: Vec<DisplayRow>,
     collapse: PidMap<CollapseState>,
+    application_collapse: FxMap<AppGroupKey, AppCollapseState>,
+    /// Persisted, per-identity fold overrides — a folded application returns folded next run.
+    folds: FoldPreferences,
+    applications: ApplicationGroups,
+    desktop: DesktopResolver,
+    memory: MemorySampler,
     uid_names: FxMap<u32, Box<str>>,
     selected: usize,
     scroll: usize,
@@ -39,6 +55,11 @@ impl App {
             gatherer: Gatherer::new(page_size, proc_dir),
             rows: Vec::new(),
             collapse: PidMap::default(),
+            application_collapse: FxMap::default(),
+            folds: FoldPreferences::system(),
+            applications: ApplicationGroups::default(),
+            desktop: DesktopResolver::system(),
+            memory: MemorySampler::system(),
             uid_names,
             selected: 0,
             scroll: 0,
@@ -48,10 +69,34 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn from_gatherer(gatherer: Gatherer, uid_names: FxMap<u32, Box<str>>) -> Self {
+        Self::from_gatherer_with_desktop(
+            gatherer,
+            uid_names,
+            DesktopResolver::with_roots(
+                vec![std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/desktops"
+                ))],
+                FxMap::default(),
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_gatherer_with_desktop(
+        gatherer: Gatherer,
+        uid_names: FxMap<u32, Box<str>>,
+        desktop: DesktopResolver,
+    ) -> Self {
         Self {
             gatherer,
             rows: Vec::new(),
             collapse: PidMap::default(),
+            application_collapse: FxMap::default(),
+            folds: FoldPreferences::disabled(),
+            applications: ApplicationGroups::default(),
+            desktop,
+            memory: MemorySampler::system(),
             uid_names,
             selected: 0,
             scroll: 0,
@@ -59,11 +104,17 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_folds(&mut self, folds: FoldPreferences) {
+        self.folds = folds;
+    }
+
     /// Run one gather cycle, then rebuild the display list (selection follows its PID).
     pub fn gather(&mut self) {
-        let keep = self.selected_pid();
+        let keep = self.selected_key();
         self.gatherer.cycle();
-        self.rebuild_rows(keep);
+        self.rebuild_application_groups();
+        self.rebuild_rows(keep.as_ref());
     }
 
     // --- views for render ---
@@ -78,6 +129,30 @@ impl App {
 
     pub fn rows(&self) -> &[DisplayRow] {
         &self.rows
+    }
+
+    pub(crate) fn app_group(&self, group_idx: usize) -> &AppGroup {
+        &self.applications.groups()[group_idx]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row_pid(&self, row: &DisplayRow) -> u32 {
+        match row.kind {
+            DisplayRowKind::Process { proc_idx } => self.entry(proc_idx).pid,
+            DisplayRowKind::Application { group_idx } => {
+                self.entry(self.app_group(group_idx).representative).pid
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory_read_count(&self) -> usize {
+        self.memory.read_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn meta_epoch(&self) -> u64 {
+        self.gatherer.meta_epoch()
     }
 
     /// Live PIDs this cycle that overflowed the persistent-fd pool (0 in the common case).
@@ -138,18 +213,43 @@ impl App {
         self.gatherer.cmdline(e)
     }
 
-    pub fn group_fact(&self, e: &ProcessEntry) -> Option<&GroupFact> {
-        self.gatherer.group_fact(e)
-    }
-
     fn entry(&self, proc_idx: usize) -> &ProcessEntry {
         &self.gatherer.procs().as_slice()[proc_idx]
     }
 
-    fn selected_pid(&self) -> Option<u32> {
-        self.rows
-            .get(self.selected)
-            .map(|r| self.entry(r.proc_idx).pid)
+    fn selected_key(&self) -> Option<SelectionKey> {
+        match &self.rows.get(self.selected)?.kind {
+            DisplayRowKind::Process { proc_idx } => {
+                Some(SelectionKey::Process(self.entry(*proc_idx).pid))
+            }
+            DisplayRowKind::Application { group_idx } => Some(SelectionKey::Application(
+                self.app_group(*group_idx).key.clone(),
+            )),
+        }
+    }
+
+    fn rebuild_application_groups(&mut self) {
+        let App {
+            gatherer,
+            applications,
+            desktop,
+            memory,
+            ..
+        } = self;
+        let procs = gatherer.procs().as_slice();
+        let identities = (0..procs.len())
+            .filter_map(|idx| gatherer.identity(idx).map(|identity| (idx, identity)));
+        applications.rebuild(
+            procs,
+            identities,
+            desktop,
+            |pid| gatherer.gpu_for_pid(pid),
+            gatherer.meta_epoch(),
+        );
+        // Reset the per-cycle proportional-read budget and evict cached members of dead/reused
+        // PIDs. The resident-set gate then reads only what actually moved, when a group is
+        // visible and collapsed (`prepare_visible_rows`).
+        memory.begin_cycle(gatherer.generation(), procs);
     }
 
     /// Flatten the tree into display order, skipping collapsed subtrees. Restores selection
@@ -157,7 +257,7 @@ impl App {
     /// selected row stays at the same screen line — minimizing visible row movement from
     /// births/deaths outside the viewport. Reads the arena-backed process buffer; `rows` is a
     /// heap `Vec`, so its growth never relocates that buffer.
-    fn rebuild_rows(&mut self, keep_pid: Option<u32>) {
+    fn rebuild_rows(&mut self, keep: Option<&SelectionKey>) {
         let anchor_offset = self.selected.saturating_sub(self.scroll);
         let mut pid_survived = false;
         {
@@ -166,44 +266,63 @@ impl App {
                 rows,
                 row_scratch,
                 collapse,
+                application_collapse,
+                folds,
+                applications,
                 selected,
                 ..
             } = self;
             let procs = gatherer.procs().as_slice();
-            // Collapse is transient UI state keyed by PID. The model is intentionally simple:
-            // if a PID is absent from a gathered frame, its UI state is gone. PID reuse within
-            // one gather interval may inherit collapse state, which is acceptable for display
-            // state and does not affect signal safety.
+            // Native collapse is transient UI state keyed by PID: manual per-process folds plus
+            // the one built-in auto-fold of the kernel-thread forest. Semantic grouping is handled
+            // separately by application rows (`application_collapse`), not here. If a PID is absent
+            // from a gathered frame its UI state is gone; PID reuse within one gather interval may
+            // inherit collapse state, which is acceptable for display state and signal-safe.
             collapse.retain(|pid, _| procs.binary_search_by(|p| p.pid.cmp(pid)).is_ok());
             collapse.retain(|_, state| *state != CollapseState::Auto);
-            for &pid in gatherer.auto_group_roots() {
-                collapse.entry(pid).or_insert(CollapseState::Auto);
+            if let Some(kthreadd) = procs
+                .iter()
+                .find(|proc| proc.comm() == b"kthreadd" && proc.first_child != NONE)
+            {
+                collapse.entry(kthreadd.pid).or_insert(CollapseState::Auto);
+            }
+
+            // Prune collapse state for vanished groups, then seed any new group's default. Both
+            // walk the (handful of) live groups directly rather than materializing a key set, and
+            // clone a key only on the miss path — so a steady cycle (groups unchanged) allocates
+            // nothing here.
+            application_collapse
+                .retain(|key, _| applications.groups().iter().any(|group| &group.key == key));
+            // A group starts folded (the default) unless the user has a persisted expansion
+            // override for its stable identity — then it returns expanded next run.
+            for group in applications.groups() {
+                if !application_collapse.contains_key(&group.key) {
+                    let expanded = group
+                        .persist_key
+                        .as_deref()
+                        .is_some_and(|key| folds.is_expanded(key));
+                    let state = if expanded {
+                        AppCollapseState::Suppressed
+                    } else {
+                        AppCollapseState::Auto
+                    };
+                    application_collapse.insert(group.key.clone(), state);
+                }
             }
 
             rows.clear();
             row_scratch.clear();
             push_children(procs, gatherer.first_root(), row_scratch);
 
-            // Record the kept PID's new row index during the walk (no second scan).
-            let mut found = None;
+            let mut builder = RowBuilder::new(procs, applications, application_collapse, collapse);
             while let Some(iu) = row_scratch.pop() {
-                let p = &procs[iu as usize];
-                let (pid, depth, first_child) = (p.pid, p.depth, p.first_child);
-                let is_collapsed = collapse.get(&pid).is_some_and(|state| state.is_collapsed());
-                if keep_pid == Some(pid) {
-                    found = Some(rows.len());
-                }
-                rows.push(DisplayRow {
-                    proc_idx: iu as usize,
-                    depth,
-                    collapsed: is_collapsed,
-                });
-                if !is_collapsed {
-                    push_children(procs, first_child, row_scratch);
-                }
+                builder.project_native(iu as usize, procs[iu as usize].depth, rows);
             }
-
-            if let Some(idx) = found {
+            mark_next_siblings(rows);
+            if let Some(idx) = rows
+                .iter()
+                .position(|row| row_matches(row, keep, procs, applications))
+            {
                 *selected = idx;
                 pid_survived = true;
             }
@@ -274,44 +393,117 @@ impl App {
         self.scroll != before
     }
 
+    /// Perform bounded proportional-memory sampling after the viewport is known, so rendering
+    /// stays pure I/O. Only collapsed application rows in the viewport are candidates; the
+    /// sampler's resident-set gate and per-cycle budget keep the actual kernel reads bounded, so
+    /// this is cheap to call every render frame (a settled desktop reads nothing).
+    pub fn prepare_visible_rows(&mut self, visible_height: usize) {
+        let visible: Vec<usize> = self
+            .rows
+            .iter()
+            .skip(self.scroll)
+            .take(visible_height)
+            .filter_map(|row| match row.kind {
+                DisplayRowKind::Application { group_idx } if row.collapsed => Some(group_idx),
+                _ => None,
+            })
+            .collect();
+        if visible.is_empty() {
+            return;
+        }
+        let App {
+            gatherer,
+            applications,
+            memory,
+            ..
+        } = self;
+        let procs = gatherer.procs().as_slice();
+        let mem_total = gatherer.sys().mem_total;
+        memory.sample_visible(applications.groups_mut(), &visible, procs, mem_total);
+    }
+
     // --- actions ---
 
-    fn selected_has_children(&self) -> Option<(u32, bool)> {
+    fn selected_has_children(&self) -> Option<(SelectionKey, bool)> {
         let row = self.rows.get(self.selected)?;
-        let p = self.entry(row.proc_idx);
-        Some((p.pid, p.first_child != NONE))
+        let selected = match row.kind {
+            DisplayRowKind::Process { proc_idx } => SelectionKey::Process(self.entry(proc_idx).pid),
+            DisplayRowKind::Application { group_idx } => {
+                SelectionKey::Application(self.app_group(group_idx).key.clone())
+            }
+        };
+        Some((selected, row.has_children))
     }
 
     pub fn toggle_collapse(&mut self) {
-        let Some((pid, has_children)) = self.selected_has_children() else {
+        let Some((selected, has_children)) = self.selected_has_children() else {
             return;
         };
         if !has_children {
             return;
         }
-        match self.collapse.get(&pid).copied() {
-            Some(CollapseState::Auto) => {
-                self.collapse.insert(pid, CollapseState::AutoSuppressed);
+        match selected {
+            SelectionKey::Application(key) => {
+                let expanded = {
+                    let state = self
+                        .application_collapse
+                        .entry(key.clone())
+                        .or_insert(AppCollapseState::Auto);
+                    *state = match *state {
+                        AppCollapseState::Auto => AppCollapseState::Suppressed,
+                        AppCollapseState::Suppressed => AppCollapseState::Auto,
+                    };
+                    *state == AppCollapseState::Suppressed
+                };
+                self.persist_fold(&key, expanded);
             }
-            Some(CollapseState::Manual) => {
-                self.collapse.remove(&pid);
-            }
-            _ => {
-                self.collapse.insert(pid, CollapseState::Manual);
-            }
+            SelectionKey::Process(pid) => match self.collapse.get(&pid).copied() {
+                Some(CollapseState::Auto) => {
+                    self.collapse.insert(pid, CollapseState::AutoSuppressed);
+                }
+                Some(CollapseState::Manual) => {
+                    self.collapse.remove(&pid);
+                }
+                _ => {
+                    self.collapse.insert(pid, CollapseState::Manual);
+                }
+            },
         }
-        let keep = self.selected_pid();
-        self.rebuild_rows(keep);
+        let keep = self.selected_key();
+        self.rebuild_rows(keep.as_ref());
     }
 
     pub fn collapse_selected(&mut self) {
-        let Some((pid, has_children)) = self.selected_has_children() else {
+        let Some((selected, has_children)) = self.selected_has_children() else {
             return;
         };
         if has_children {
-            self.collapse.insert(pid, CollapseState::Manual);
-            let keep = self.selected_pid();
-            self.rebuild_rows(keep);
+            match selected {
+                SelectionKey::Process(pid) => {
+                    self.collapse.insert(pid, CollapseState::Manual);
+                }
+                SelectionKey::Application(key) => {
+                    self.application_collapse
+                        .insert(key.clone(), AppCollapseState::Auto);
+                    self.persist_fold(&key, false);
+                }
+            }
+            let keep = self.selected_key();
+            self.rebuild_rows(keep.as_ref());
+        }
+    }
+
+    /// Record the user's fold choice for a group whose identity is stable enough to persist. A
+    /// group with no persistable identity (container/pod/structural) is silently session-only.
+    fn persist_fold(&mut self, key: &AppGroupKey, expanded: bool) {
+        if let Some(persist_key) = self
+            .applications
+            .groups()
+            .iter()
+            .find(|group| &group.key == key)
+            .and_then(|group| group.persist_key.clone())
+        {
+            self.folds.set_expanded(&persist_key, expanded);
         }
     }
 
@@ -322,11 +514,29 @@ impl App {
         let Some(row) = self.rows.get(self.selected) else {
             return false;
         };
-        let e = self.entry(row.proc_idx);
+        let DisplayRowKind::Process { proc_idx } = row.kind else {
+            return false;
+        };
+        let e = self.entry(proc_idx);
         // Only signals if (pid, start_time) still identify this exact process — a reused PID is
         // never hit.
         sys::kill_verified(e.pid, e.start_time, libc::SIGTERM)
     }
+}
+
+/// A row identified independently of its position — a process by PID, or an application group by
+/// its key. Used both to follow the selection across a refresh and to name the row an action
+/// targets.
+#[derive(Clone)]
+enum SelectionKey {
+    Process(u32),
+    Application(AppGroupKey),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppCollapseState {
+    Auto,
+    Suppressed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -339,6 +549,171 @@ enum CollapseState {
 impl CollapseState {
     fn is_collapsed(self) -> bool {
         matches!(self, Self::Manual | Self::Auto)
+    }
+}
+
+/// The shared context for projecting the process tree into the flattened display list — the read
+/// views (processes, groups, both collapse maps) plus the per-group "already emitted" marks. The
+/// mutually recursive projection walks are methods on it so the context is named once, not
+/// threaded through every call; the output `rows` is passed per call so its `&mut` never outlives
+/// the walk.
+struct RowBuilder<'a> {
+    procs: &'a [ProcessEntry],
+    groups: &'a ApplicationGroups,
+    app_collapse: &'a FxMap<AppGroupKey, AppCollapseState>,
+    collapse: &'a PidMap<CollapseState>,
+    /// One flag per group: an application row is emitted once, at its representative.
+    inserted: Vec<bool>,
+}
+
+impl<'a> RowBuilder<'a> {
+    fn new(
+        procs: &'a [ProcessEntry],
+        groups: &'a ApplicationGroups,
+        app_collapse: &'a FxMap<AppGroupKey, AppCollapseState>,
+        collapse: &'a PidMap<CollapseState>,
+    ) -> Self {
+        Self {
+            procs,
+            groups,
+            app_collapse,
+            collapse,
+            inserted: vec![false; groups.groups().len()],
+        }
+    }
+
+    /// Project a native tree node (and its subtree) into `rows`. A member of an application group
+    /// emits the group's row once, at its representative, then descends into native children;
+    /// everything else emits a process row honouring its manual/auto collapse.
+    fn project_native(&mut self, proc_idx: usize, depth: u16, rows: &mut Vec<DisplayRow>) {
+        if let Some(group_idx) = self.groups.member_group(proc_idx) {
+            let group = &self.groups.groups()[group_idx];
+            if proc_idx == group.representative && !self.inserted[group_idx] {
+                self.inserted[group_idx] = true;
+                let collapsed = self
+                    .app_collapse
+                    .get(&group.key)
+                    .is_none_or(|state| *state == AppCollapseState::Auto);
+                rows.push(DisplayRow {
+                    kind: DisplayRowKind::Application { group_idx },
+                    depth,
+                    collapsed,
+                    has_children: true,
+                    has_next: false,
+                });
+                if !collapsed {
+                    self.append_member_forest(group_idx, depth.saturating_add(1), rows);
+                }
+            }
+            let mut child = self.procs[proc_idx].first_child;
+            while child != NONE {
+                self.project_native(child as usize, depth, rows);
+                child = self.procs[child as usize].next_sibling;
+            }
+            return;
+        }
+
+        let proc = &self.procs[proc_idx];
+        let collapsed = self
+            .collapse
+            .get(&proc.pid)
+            .is_some_and(|state| state.is_collapsed());
+        rows.push(DisplayRow {
+            kind: DisplayRowKind::Process { proc_idx },
+            depth,
+            collapsed,
+            has_children: proc.first_child != NONE,
+            has_next: false,
+        });
+        if collapsed {
+            return;
+        }
+        let mut child = proc.first_child;
+        while child != NONE {
+            self.project_native(child as usize, depth.saturating_add(1), rows);
+            child = self.procs[child as usize].next_sibling;
+        }
+    }
+
+    /// Emit an expanded group's members, starting each subtree whose parent is outside the group
+    /// (a member whose parent is also in the group is reached by recursion instead).
+    fn append_member_forest(&self, group_idx: usize, depth: u16, rows: &mut Vec<DisplayRow>) {
+        let group = &self.groups.groups()[group_idx];
+        for &member in &group.members {
+            let parent_in_group = self.procs[member].parent_idx != NONE
+                && self
+                    .groups
+                    .member_group(self.procs[member].parent_idx as usize)
+                    == Some(group_idx);
+            if !parent_in_group {
+                self.append_member(member, group_idx, depth, rows);
+            }
+        }
+    }
+
+    fn append_member(
+        &self,
+        proc_idx: usize,
+        group_idx: usize,
+        depth: u16,
+        rows: &mut Vec<DisplayRow>,
+    ) {
+        let proc = &self.procs[proc_idx];
+        let mut member_children = Vec::new();
+        let mut child = proc.first_child;
+        while child != NONE {
+            if self.groups.member_group(child as usize) == Some(group_idx) {
+                member_children.push(child as usize);
+            }
+            child = self.procs[child as usize].next_sibling;
+        }
+        // A virtual application is already the outer automatic boundary. Inside its expanded
+        // member forest only an explicit manual collapse is meaningful; nested auto-groups would
+        // make expansion reveal another hidden layer.
+        let collapsed = self.collapse.get(&proc.pid) == Some(&CollapseState::Manual);
+        rows.push(DisplayRow {
+            kind: DisplayRowKind::Process { proc_idx },
+            depth,
+            collapsed,
+            has_children: !member_children.is_empty(),
+            has_next: false,
+        });
+        if !collapsed {
+            for child in member_children {
+                self.append_member(child, group_idx, depth.saturating_add(1), rows);
+            }
+        }
+    }
+}
+
+fn mark_next_siblings(rows: &mut [DisplayRow]) {
+    let mut open: Vec<Option<usize>> = Vec::new();
+    for idx in 0..rows.len() {
+        let depth = rows[idx].depth as usize;
+        if open.len() <= depth {
+            open.resize(depth + 1, None);
+        }
+        if let Some(previous) = open[depth].replace(idx) {
+            rows[previous].has_next = true;
+        }
+        open.truncate(depth + 1);
+    }
+}
+
+fn row_matches(
+    row: &DisplayRow,
+    keep: Option<&SelectionKey>,
+    procs: &[ProcessEntry],
+    groups: &ApplicationGroups,
+) -> bool {
+    match (&row.kind, keep) {
+        (DisplayRowKind::Process { proc_idx }, Some(SelectionKey::Process(pid))) => {
+            procs[*proc_idx].pid == *pid
+        }
+        (DisplayRowKind::Application { group_idx }, Some(SelectionKey::Application(key))) => {
+            groups.groups()[*group_idx].key == *key
+        }
+        _ => false,
     }
 }
 

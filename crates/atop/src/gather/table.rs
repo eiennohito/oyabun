@@ -14,7 +14,7 @@ use thoop::{Arena, Gen, GenStore, Ref, StrStore, StringRef, ThpMap};
 use super::config::{CMD_SLOT, env_u32};
 use super::cpu::{ACTIVE_SAMPLES, CpuRing, MIN_SAMPLE, elapsed_jiffies};
 use super::parse;
-use crate::group::GroupMetaSource;
+use crate::identity::ProcMeta;
 use crate::procs::{CapLevel, Cmd, ProcessEntry, Procs};
 use crate::sys::{self, ProcPath};
 
@@ -82,7 +82,7 @@ pub(crate) fn cmdline_refresh_n() -> u32 {
         .max(1)
 }
 
-impl GroupMetaSource for ProcTable {
+impl ProcMeta for ProcTable {
     fn cmdline(&self, e: &ProcessEntry) -> &[u8] {
         self.cmdline(e)
     }
@@ -214,6 +214,11 @@ pub(crate) struct ProcTable {
     /// open would otherwise clobber a good uid with `u32::MAX`. The `/proc` path leaves this
     /// `false`: there, uid has no source but this table's cmdline-fd `fstat`.
     source_provides_uid: bool,
+    /// Monotonic version of the identity-relevant per-PID inputs (cmdline / cgroup / flatpak
+    /// content, plus births / deaths / PID reuse). Advances only when one of those actually
+    /// changes — a stale re-read of unchanged bytes does not move it — so a settled cycle leaves
+    /// it fixed and the identity resolver can skip recomputation entirely.
+    meta_epoch: u64,
 }
 
 impl ProcTable {
@@ -235,7 +240,14 @@ impl ProcTable {
             refresh_n,
             cap_full_mask: sys::cap_full_mask(),
             source_provides_uid,
+            meta_epoch: 0,
         }
+    }
+
+    /// Monotonic version of the identity-relevant per-PID inputs — see [`Self::meta_epoch`]. The
+    /// identity resolver rebuilds only when this moves.
+    pub(crate) fn meta_epoch(&self) -> u64 {
+        self.meta_epoch
     }
 
     /// Bind the stores to the (now pinned, boxed) arena. Call once after construction, before
@@ -286,6 +298,7 @@ impl ProcTable {
     /// never held as a `&row` across a store op. The arena-resident stores (and now the index)
     /// self-heal their own bases on the next access; the only rule the caller keeps is not to
     /// span an allocation with a live reference into any arena chunk.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn update<R: ProcReader>(
         &mut self,
         procs: &mut Procs,
@@ -306,6 +319,9 @@ impl ProcTable {
         let cap_full_mask = self.cap_full_mask;
         // Per-cycle budget for the heavy deleted-library maps scan (see [`LIB_CHECKS_PER_CYCLE`]).
         let mut lib_budget = LIB_CHECKS_PER_CYCLE;
+        // Did any identity-relevant input move this cycle (birth / reuse / cmdline / cgroup /
+        // flatpak change)? Deaths are folded in by `evict`. Drives the metadata epoch.
+        let mut meta_changed = false;
 
         for i in 0..procs.as_slice().len() {
             let mut e = procs.row(i); // copy out — no live row ref spans a store op below
@@ -316,6 +332,8 @@ impl ProcTable {
             let prior_entry: Option<(usize, PidSlot)> = self.index.get_entry(pid);
             let prior: Option<PidSlot> = prior_entry.map(|(_, s)| s);
             let reused = prior.is_some_and(|s| s.start_time != e.start_time);
+            // A birth or a PID reuse is a fresh incarnation — its identity is new either way.
+            meta_changed |= prior.is_none() || reused;
             let settling = prior.is_some_and(|s| {
                 !reused && cur_gen.wrapping_sub(s.first_seen_gen) < u64::from(CMDLINE_SETTLE_GENS)
             });
@@ -349,20 +367,21 @@ impl ProcTable {
             // Explicit field borrows: `fresh` borrows `self.reader`, refresh_meta touches only
             // `self.meta`/`self.cmd_store` — disjoint, so the cmdline bytes intern straight from
             // the reader's buffer with no intermediate copy.
-            let mut pm =
+            let (mut pm, cmd_changed) =
                 Self::refresh_meta(&mut self.meta, &mut self.cmd_store, meta_ref, reused, fresh);
-            if refresh {
-                if !e.is_kthread {
-                    let cgroup = reader.cgroup(pid);
-                    refresh_bytes(&mut self.cgroup_store, &mut pm.cgroup, cgroup);
-                    let cmdline = self.cmd_store.get(pm.cmd);
-                    if likely_flatpak(e.comm(), cmdline, self.cgroup_store.get(pm.cgroup)) {
-                        let flatpak = reader.flatpak_info(pid);
+            meta_changed |= cmd_changed;
+            if refresh && !e.is_kthread {
+                let cgroup = reader.cgroup(pid);
+                meta_changed |= refresh_bytes(&mut self.cgroup_store, &mut pm.cgroup, cgroup);
+                let cmdline = self.cmd_store.get(pm.cmd);
+                if likely_flatpak(e.comm(), cmdline, self.cgroup_store.get(pm.cgroup)) {
+                    let flatpak = reader.flatpak_info(pid);
+                    meta_changed |=
                         refresh_bytes(&mut self.flatpak_store, &mut pm.flatpak, flatpak);
-                    } else {
-                        self.flatpak_store.free(pm.flatpak);
-                        pm.flatpak = StringRef::EMPTY;
-                    }
+                } else {
+                    meta_changed |= !pm.flatpak.is_empty();
+                    self.flatpak_store.free(pm.flatpak);
+                    pm.flatpak = StringRef::EMPTY;
                 }
             }
 
@@ -435,7 +454,12 @@ impl ProcTable {
             procs.set(i, e); // write back
         }
 
-        self.evict(cur_gen);
+        let evicted = self.evict(cur_gen);
+        // Any birth, death, reuse, or content change advances the epoch; a purely steady cycle
+        // leaves it fixed so the identity resolver reuses its cache.
+        if meta_changed || evicted {
+            self.meta_epoch = self.meta_epoch.wrapping_add(1);
+        }
 
         // The window origin advances only on a real sample (or the first call); a too-soon
         // cycle leaves it so elapsed keeps accumulating until it exceeds `MIN_SAMPLE`.
@@ -446,8 +470,8 @@ impl ProcTable {
 
     /// Drop PIDs not seen this cycle: free their hot + cold slots and their cmd slot. All
     /// immediate — the dead PID's row was compacted out before this pass, so nothing references
-    /// any of its slots.
-    fn evict(&mut self, cur_gen: u64) {
+    /// any of its slots. Returns whether any PID was dropped (a death moves the metadata epoch).
+    fn evict(&mut self, cur_gen: u64) -> bool {
         let Self {
             index,
             cpu,
@@ -457,6 +481,7 @@ impl ProcTable {
             flatpak_store,
             ..
         } = self;
+        let mut dropped = false;
         index.retain(|_, slot| {
             if slot.seen_gen == cur_gen {
                 true
@@ -470,9 +495,11 @@ impl ProcTable {
                 flatpak_store.free(flatpak);
                 meta.free(slot.meta);
                 cpu.free(slot.cpu);
+                dropped = true;
                 false
             }
         });
+        dropped
     }
 
     /// Fold this cycle's tick observation into the PID's hot CPU ring (creating it for a birth),
@@ -513,19 +540,23 @@ impl ProcTable {
     /// An associated fn over the two stores it touches (not `&mut self`) so the caller can pass
     /// `fresh` borrowing a *different* field — the [`ProcReader`]'s buffer — without a borrow
     /// conflict; the cmdline bytes intern straight from that buffer.
+    ///
+    /// Returns the record plus whether the cmdline *content* changed (an input to the metadata
+    /// epoch). Reuse is not reported here — the caller already accounts for it.
     fn refresh_meta(
         meta: &mut GenStore<PidMeta>,
         cmd_store: &mut CmdStore,
         meta_ref: Ref<PidMeta>,
         reused: bool,
         fresh: Option<CmdlineRead<'_>>,
-    ) -> PidMeta {
+    ) -> (PidMeta, bool) {
         let mut pm = if reused {
             cmd_store.free(meta.get(meta_ref).cmd);
             PidMeta::EMPTY
         } else {
             *meta.get(meta_ref)
         };
+        let mut cmd_changed = false;
         if let Some(CmdlineRead {
             uid,
             bytes,
@@ -534,6 +565,7 @@ impl ProcTable {
         {
             pm.uid = uid;
             if bytes.is_empty() {
+                cmd_changed = !pm.cmd.is_empty();
                 cmd_store.free(pm.cmd); // no-op if already empty
                 pm.cmd = StringRef::EMPTY;
                 pm.cmd_non_ascii = false;
@@ -542,11 +574,12 @@ impl ProcTable {
                 cmd_store.free(pm.cmd);
                 pm.cmd = cmd_store.intern(Gen::ALIVE, bytes);
                 pm.cmd_non_ascii = non_ascii;
+                cmd_changed = true;
             }
             // else: unchanged — keep the existing slot (the whole point of the store).
         }
         meta.assign(meta_ref, pm);
-        pm
+        (pm, cmd_changed)
     }
 
     /// Resolve a userspace PID's capability level and deleted-binary flags into `pm`, returning
@@ -802,18 +835,26 @@ fn cap_level(full_mask: u64, eff: u64) -> CapLevel {
     }
 }
 
+/// Intern `bytes` into `slot` only when the content actually differs (an unchanged value keeps
+/// its slot — no re-copy). Returns whether the stored content changed, which the caller folds
+/// into the metadata epoch.
 fn refresh_bytes<const N: usize, S>(
     store: &mut StrStore<N, S>,
     slot: &mut StringRef<S>,
     bytes: &[u8],
-) {
+) -> bool {
     let bytes = &bytes[..bytes.len().min(N)];
     if bytes.is_empty() {
+        let had_content = !slot.is_empty();
         store.free(*slot);
         *slot = StringRef::EMPTY;
+        had_content
     } else if slot.is_empty() || store.get(*slot) != bytes {
         store.free(*slot);
         *slot = store.intern(Gen::ALIVE, bytes);
+        true
+    } else {
+        false
     }
 }
 

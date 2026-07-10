@@ -15,20 +15,39 @@ pub(crate) struct FxHasher {
 const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
 impl FxHasher {
+    #[inline]
     fn add(&mut self, word: u64) {
         self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
     }
 }
 
 impl Hasher for FxHasher {
+    #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.add(u64::from(b));
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rem.len()].copy_from_slice(rem);
+            self.add(u64::from_le_bytes(last));
         }
     }
+    #[inline]
     fn write_u32(&mut self, i: u32) {
-        self.add(u64::from(i)); // the hot path: u32 PID keys
+        self.add(u64::from(i));
     }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline]
     fn finish(&self) -> u64 {
         self.hash
     }

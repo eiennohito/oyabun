@@ -86,9 +86,9 @@ sustained — a fork bomb that would OOM-kill the system before it wraps.
 
 **Death detection is ≤1 cycle.** A held `/proc` fd returns ESRCH the cycle after the task
 dies; an unheld PID fails its transient open. All per-PID sidecar state (CPU ring, metadata,
-group classification, collapse/suppression) is generation-evicted the same cycle death is
-detected. Therefore any reuse arriving ≥2 cycles after death hits a **clean slate** — no stale
-state exists for it to collide with.
+per-member application-memory samples, collapse/suppression) is generation-evicted the same cycle
+death is detected. Therefore any reuse arriving ≥2 cycles after death hits a **clean slate** — no
+stale state exists for it to collide with.
 
 This means per-PID sidecar state needs only **generation-based liveness** (the existing
 `seen_gen` / `last_seen_gen` pattern), not incarnation keying. The timing gap between death
@@ -434,8 +434,8 @@ One pre-order pass assigns `depth` and records order; its reverse accumulates
 (no recursion) — safe for pathologically deep trees.
 
 A second reverse-order pass (`tree::aggregate`) computes inclusive `subtree_cpu` and
-`subtree_mem` (self + all descendants) for collapsed-group display — same O(n) as the
-size accumulation, using the existing `order` vector.
+`subtree_mem` (self + all descendants) for manually collapsed process subtrees — same O(n)
+as the size accumulation, using the existing `order` vector.
 
 The structural tree is collapse-independent. The view flattens it to display rows
 (`app::rebuild_rows`), skipping collapsed subtrees, after each gather and whenever the
@@ -444,6 +444,55 @@ display list is a plain heap `Vec`, not an arena buffer: it is walked *sequentia
 render (the random walk it indexes into is the arena-backed row buffer), so it gains nothing
 from the huge-page TLB win — and a heap `Vec`'s growth can never relocate the arena and
 dangle the row slice the rebuild reads from.
+
+### Process grouping
+
+Grouping is split across the gather/view boundary, and the split is forced by one requirement:
+folding is persisted and user-configurable. A persisted fold cannot key on process identifiers
+(they change every launch), so it keys on a group's stable identity — but that persisted
+configuration *is* the grouping policy, and it is user-owned and applied at display time. So the
+gather layer answers only the config-free question — which processes share an identity, and how
+trustworthy that boundary is — and the view forms, folds, labels, and aggregates groups from it.
+This is deliberately *one* mechanism: a process resolves at most one identity, so it can never
+flip between competing group labels across cycles.
+
+Membership follows shared identity, not tree ancestry. On systemd desktops a launcher scope and
+its instantiated service land in sibling cgroup scopes; resolving both to the same application id
+makes them one group. Containers, pods, and system services cohere the same way, each from its
+own cgroup shape. A cgroup boundary is trusted (kernel-owned, stable across runs); a purely
+structural one — a shared-binary process fan, a runtime worker pool — is not, and is recognized
+only where no cgroup identity exists, so the trusted identity always wins with no arbitrary
+tiebreak. Identity resolution is change-gated, not per-cycle: a process's grouping is a pure
+function of its cgroup and argv and the surrounding tree shape, which move only on a birth, death,
+PID reuse, or argv/cgroup rewrite. The gather layer folds exactly those into a monotonic version
+stamp; while it holds steady the resolver and the view-side grouping both reuse their prior
+result, so a settled desktop does no grouping work — the governing goal is that work track change,
+not population. Reuse is exact (a stable input provably yields identical groups), so a startup
+transient still self-corrects on the next change without a settling window.
+
+A group is shown as one row: a resolved label (an application's desktop-entry name; otherwise a
+container, pod, unit, or command), aggregated CPU/memory/GPU (the root alone is often an idle
+launcher whose own numbers mislead), and the hidden-member count. Tiny groups and terminals are
+left unfolded — a two-process fold hides as much as it saves, and each shell is its own
+workspace. Expanding a group reconstructs its members as a forest while foreign processes that
+happen to be children of a member stay in the native tree. Selection and fold state follow the
+stable identity, not whichever process currently represents the row.
+
+Auto-fold reduces clutter by default; the user's expand/fold is remembered. Only a
+cross-run-stable identity (a desktop application, a systemd unit) persists its fold across
+restarts; ephemeral ones (container ids, pod uids, structural tokens) stay session-only, so an
+expansion of a non-persistable group is transient state that clears when the group disappears,
+while a persistable one returns as the user left it.
+
+Application memory is proportional set size summed across every member — resident-set addition
+double-counts the shared pages a browser's helpers map, so it is only the fallback used when a
+live member cannot be read. Because a per-member read walks the whole address space, it is
+change-gated, not recomputed: resident-set size is a free staleness proxy, so only members whose
+resident set moved (measured absolutely, against host memory) are re-read, highest-change first
+under a per-cycle budget, with a slow periodic refresh backstopping the shared-page drift the
+resident gate cannot see. Sampling is a view concern, done only for folded rows in the viewport.
+Cgroup memory is deliberately excluded: it measures charged cache and kernel resources, not
+resident footprint. See [Application memory accounting gotchas](application-memory-gotchas.md).
 
 ## Rendering (`etch`)
 

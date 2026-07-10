@@ -1,7 +1,8 @@
 mod app;
+mod application;
 mod fxhash;
 mod gather;
-mod group;
+mod identity;
 mod palette;
 mod procs;
 mod sys;
@@ -78,6 +79,7 @@ fn run(mut display: Display<io::Stdout>, mut app: App) -> Result<(), Box<dyn std
         if app.adjust_scroll(visible_height) {
             dirty = true;
         }
+        app.prepare_visible_rows(visible_height);
         if dirty {
             let mut frame = display.begin_frame(width, height);
             ui::render(&mut frame, &app, &schema);

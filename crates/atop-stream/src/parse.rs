@@ -322,7 +322,7 @@ fn parse_escape(
     }
 }
 
-fn split_field<'a>(token: &'a str, line_no: usize) -> Result<(&'a str, &'a str), ParseError> {
+fn split_field(token: &str, line_no: usize) -> Result<(&str, &str), ParseError> {
     token
         .split_once('=')
         .ok_or_else(|| ParseError::new(line_no, format!("expected key=value, got {token:?}")))
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn parses_inheritance_birth_death_and_relative_ticks() {
         let stream = Stream::parse(
-            r#"
+            r"
             # initial snapshot
             cycle 0 cores=4 mem=8G
               1 ppid=0 uid=0 S comm=init cmd=/sbin/init ticks=100 mem=12M
@@ -444,7 +444,7 @@ mod tests {
 
             cycle +500ms
               - 43
-            "#,
+            ",
         )
         .expect("parse");
 

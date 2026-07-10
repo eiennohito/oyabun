@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=Slack
+Exec=flatpak run com.slack.Slack
+Categories=Network;

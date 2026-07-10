@@ -18,9 +18,9 @@ use std::io::Write;
 
 use etch::{Cell, ColSpec, Frame, Rgb, Row, Schema, Style};
 
-use crate::app::App;
+use crate::app::{App, DisplayRowKind};
 use crate::palette;
-use crate::procs::{GpuMetric, NONE, SystemStats};
+use crate::procs::{GpuMetric, SystemStats};
 
 const CPU_HEADER_LINES: u16 = 3;
 
@@ -322,6 +322,7 @@ fn build_footer(
 // Process list body
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn render_body<W: Write>(
     frame: &mut Frame<W>,
     app: &App,
@@ -336,8 +337,7 @@ fn render_body<W: Write>(
     // Phase 1: advance guide state over rows above the viewport (no rendering).
     let mut guides: Vec<bool> = Vec::with_capacity(16);
     for row in rows.iter().take(scroll) {
-        let p = &procs[row.proc_idx];
-        advance_guides(&mut guides, row.depth as usize, p.next_sibling != NONE);
+        advance_guides(&mut guides, row.depth as usize, row.has_next);
     }
 
     let mut prefix = String::with_capacity(64);
@@ -348,34 +348,95 @@ fn render_body<W: Write>(
             .skip(scroll)
             .take(body_height as usize)
         {
-            let p = &procs[row.proc_idx];
             let depth = row.depth as usize;
-            let has_children = p.first_child != NONE;
-            let has_next = p.next_sibling != NONE;
             let selected = display_idx == app.selected();
-
-            let metrics = p.effective_metrics(
-                row.collapsed,
-                app.gpu_for_pid(p.pid),
-                app.subtree_gpu_for_pid(p.pid),
-            );
 
             prefix.clear();
             let prefix_cols = build_prefix(
                 &mut prefix,
                 depth,
-                has_children,
+                row.has_children,
                 row.collapsed,
-                has_next,
+                row.has_next,
                 &guides,
+                if matches!(row.kind, DisplayRowKind::Application { .. }) {
+                    PrefixKind::Application
+                } else {
+                    PrefixKind::Process
+                },
             );
-            advance_guides(&mut guides, depth, has_next);
+            advance_guides(&mut guides, depth, row.has_next);
 
-            let text = row_text(app, p, row.collapsed);
-            let suffix_n = if row.collapsed && p.subtree_size > 0 {
-                p.subtree_size
-            } else {
-                0
+            let RowView {
+                p,
+                uid,
+                threads,
+                metrics,
+                text,
+                suffix_n,
+                state,
+                nice,
+                key,
+                is_kthread,
+                basename_fg,
+            } = match row.kind {
+                DisplayRowKind::Process { proc_idx } => {
+                    let p = &procs[proc_idx];
+                    let metrics = p.effective_metrics(
+                        row.collapsed,
+                        app.gpu_for_pid(p.pid),
+                        app.subtree_gpu_for_pid(p.pid),
+                    );
+                    let suffix_n = if row.collapsed && p.subtree_size > 0 {
+                        p.subtree_size
+                    } else {
+                        0
+                    };
+                    RowView {
+                        p,
+                        uid: p.uid,
+                        threads: p.num_threads,
+                        metrics,
+                        text: row_text(app, p),
+                        suffix_n,
+                        state: p.display_state,
+                        nice: p.nice,
+                        key: u64::from(p.pid),
+                        is_kthread: p.is_kthread,
+                        basename_fg: basename_color(p.exe_deleted, p.uses_deleted_lib),
+                    }
+                }
+                DisplayRowKind::Application { group_idx } => {
+                    let group = app.app_group(group_idx);
+                    let p = &procs[group.representative];
+                    let metrics = crate::procs::RowMetrics {
+                        cpu_pct: group.cpu_pct,
+                        cpu_peak: group.cpu_peak,
+                        mem_bytes: group.mem_bytes,
+                        gpu: group.gpu,
+                    };
+                    let suffix_n = if row.collapsed {
+                        u32::try_from(group.members.len()).unwrap_or(u32::MAX)
+                    } else {
+                        0
+                    };
+                    RowView {
+                        p,
+                        uid: group.owner_uid,
+                        threads: group.threads,
+                        metrics,
+                        text: RowText::GroupLabel {
+                            bytes: group.label.as_bytes(),
+                            non_ascii: !group.label.is_ascii(),
+                        },
+                        suffix_n,
+                        state: p.display_state,
+                        nice: p.nice,
+                        key: application_row_key(&group.key),
+                        is_kthread: false,
+                        basename_fg: palette::BASENAME,
+                    }
+                }
             };
 
             // Selection is the only row-level color: a distinct background, applied to every
@@ -386,20 +447,17 @@ fn render_body<W: Write>(
                 prefix: prefix.as_str(),
                 prefix_cols,
                 text,
-                is_kthread: p.is_kthread,
+                is_kthread,
                 suffix_n,
-                basename_fg: basename_color(p.exe_deleted, p.uses_deleted_lib),
+                basename_fg,
             };
 
-            table.row(u64::from(p.pid), Style::NONE.with_bg(bg), |r| {
+            table.row(key, Style::NONE.with_bg(bg), |r| {
                 r.field(p.pid); // PID inherits the row style (no per-cell color)
-                r.styled_field(app.uid_name(p.uid), cell(Some(palette::caps(p.caps)), bg));
-                r.styled_field(
-                    p.display_state as char,
-                    cell(Some(palette::state(p.display_state)), bg),
-                );
-                r.styled_field(p.nice, cell(Some(palette::nice(p.nice)), bg));
-                r.styled_field(p.num_threads, cell(palette::threads(p.num_threads), bg));
+                r.styled_field(app.uid_name(uid), cell(Some(palette::caps(p.caps)), bg));
+                r.styled_field(state as char, cell(Some(palette::state(state)), bg));
+                r.styled_field(nice, cell(Some(palette::nice(nice)), bg));
+                r.styled_field(threads, cell(palette::threads(threads), bg));
                 r.styled_field(
                     Pct(metrics.cpu_pct),
                     cell(Some(palette::cpu(metrics.cpu_pct)), bg),
@@ -467,6 +525,27 @@ fn basename_color(exe_deleted: bool, uses_deleted_lib: bool) -> Rgb {
     }
 }
 
+/// One display row's render inputs, resolved from either a process or an application group into a
+/// single named shape. A struct (not a positional tuple) so the two construction arms name every
+/// field — several share a type (`u32` threads/suffix, the ids) and would silently transpose in a
+/// tuple.
+struct RowView<'a> {
+    /// The process backing this row: the process itself, or an application group's representative.
+    p: &'a crate::procs::ProcessEntry,
+    uid: u32,
+    threads: u32,
+    metrics: crate::procs::RowMetrics,
+    text: RowText<'a>,
+    /// Collapsed-row count badge: hidden-descendant count for a process, member count for a group.
+    suffix_n: u32,
+    state: u8,
+    nice: i8,
+    /// Stable per-row identity for the retained renderer's value gate.
+    key: u64,
+    is_kthread: bool,
+    basename_fg: Rgb,
+}
+
 /// Everything the Command cell needs to render itself, gathered once per row so the fill
 /// closure (and its gate) has a single value to close over.
 struct CommandCell<'a> {
@@ -485,13 +564,7 @@ enum RowText<'a> {
     GroupLabel { bytes: &'a [u8], non_ascii: bool },
 }
 
-fn row_text<'a>(app: &'a App, p: &'a crate::procs::ProcessEntry, collapsed: bool) -> RowText<'a> {
-    if collapsed && let Some(label) = app.group_fact(p).map(crate::group::GroupFact::label) {
-        return RowText::GroupLabel {
-            bytes: label.bytes(),
-            non_ascii: label.non_ascii(),
-        };
-    }
+fn row_text<'a>(app: &'a App, p: &'a crate::procs::ProcessEntry) -> RowText<'a> {
     let cmdline = app.cmdline(p);
     if cmdline.is_empty() {
         RowText::Comm {
@@ -600,7 +673,13 @@ fn build_prefix(
     collapsed: bool,
     has_next: bool,
     guides: &[bool],
+    kind: PrefixKind,
 ) -> usize {
+    if kind == PrefixKind::Application {
+        out.push(if collapsed { '◇' } else { '◆' });
+        out.push(' ');
+        return 2;
+    }
     let mut cols = 0usize;
     let collapse_shown = match depth {
         0 => false,
@@ -646,6 +725,19 @@ fn build_prefix(
         cols += 2;
     }
     cols
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefixKind {
+    Process,
+    Application,
+}
+
+fn application_row_key(key: &crate::application::AppGroupKey) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish() | (1_u64 << 63)
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +843,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn system_cpu_header_uses_process_cpu_scale() {
         assert_eq!(system_cpu_pct_on_process_scale(10_000, 1), 100.0);
         assert_eq!(system_cpu_pct_on_process_scale(10_000, 8), 800.0);

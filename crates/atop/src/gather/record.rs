@@ -10,7 +10,7 @@ use atop_stream::{
 };
 
 use super::table::ProcTable;
-use crate::group::GroupMetaSource;
+use crate::identity::ProcMeta;
 use crate::procs::{ProcessEntry, SystemStats};
 
 pub(crate) struct Recorder {

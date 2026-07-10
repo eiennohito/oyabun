@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=Zed
+Exec=/usr/bin/zed %U
+Categories=Development;IDE;

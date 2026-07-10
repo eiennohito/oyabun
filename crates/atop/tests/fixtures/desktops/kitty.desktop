@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=kitty
+Exec=/usr/bin/kitty
+Categories=System;TerminalEmulator;

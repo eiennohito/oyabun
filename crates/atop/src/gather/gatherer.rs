@@ -18,7 +18,7 @@ use super::replay::ReplaySource;
 use super::source::{Source, SourceCtx};
 use super::sysstat::SystemSampler;
 use super::table::{ProcReader, ProcTable, RealProcReader, cmdline_refresh_n};
-use crate::group::{GroupClassifier, GroupFact};
+use crate::identity::{IdentityResolver, ProcessIdentity};
 use crate::procs::{GpuMetrics, GpuProcessStats, NONE, ProcessEntry, Procs, SystemStats};
 use crate::sys::{ProcDir, clk_tck};
 use crate::tree;
@@ -130,8 +130,8 @@ pub struct Gatherer {
     source: ObservationSource,
     /// Unified per-PID table (CPU history + uid/cmdline + the shared PID index).
     table: ProcTable,
-    /// Semantic process grouping sidecar, keyed by PID and guarded by `start_time`.
-    groups: GroupClassifier,
+    /// Per-process grouping identity + trust, recomputed each cycle from cgroup/argv/tree shape.
+    identities: IdentityResolver,
     /// Real `/proc/<pid>` metadata reader used by live sources. Replay provides its own reader.
     reader: RealProcReader,
     sys_sampler: SystemSampler,
@@ -253,7 +253,7 @@ impl Gatherer {
             procs,
             source,
             table,
-            groups: GroupClassifier::new(),
+            identities: IdentityResolver::default(),
             reader: RealProcReader::new(),
             sys_sampler: SystemSampler::new(),
             nvml,
@@ -287,6 +287,21 @@ impl Gatherer {
     #[must_use]
     pub fn first_root(&self) -> u32 {
         self.first_root
+    }
+
+    /// The generation of the latest completed cycle. Advances by one each cycle, in lock-step
+    /// with per-PID sidecar liveness — the change-gated memory sampler keys its cache on it.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Version of the identity-relevant per-PID inputs — advances only on real change (birth,
+    /// death, PID reuse, or a cmdline/cgroup/flatpak rewrite). Both the identity resolver and the
+    /// view-side grouping gate their recomputation on it, so a settled desktop rebuilds neither.
+    #[must_use]
+    pub(crate) fn meta_epoch(&self) -> u64 {
+        self.table.meta_epoch()
     }
 
     /// Live PIDs that overflowed the persistent-fd pool this cycle (0 in the common case;
@@ -357,16 +372,11 @@ impl Gatherer {
         self.table.cmdline(e)
     }
 
-    /// Semantic group fact for this exact process incarnation, if classification resolved.
+    /// The grouping identity of the process at `proc_idx` this cycle, if it belongs to a group.
     #[must_use]
-    pub fn group_fact(&self, e: &ProcessEntry) -> Option<&GroupFact> {
-        self.groups.fact(e.pid, e.start_time)
-    }
-
-    /// Trusted, rank-canonicalized group roots that may start collapsed this cycle.
-    #[must_use]
-    pub fn auto_group_roots(&self) -> &[u32] {
-        self.groups.auto_roots()
+    pub(crate) fn identity(&self, proc_idx: usize) -> Option<&ProcessIdentity> {
+        let e = &self.procs.as_slice()[proc_idx];
+        self.identities.identity(e.pid, e.start_time)
     }
 
     /// Run one gather cycle, filling [`procs`](Self::procs) + [`sys`](Self::sys) in place. The
@@ -414,8 +424,12 @@ impl Gatherer {
             &mut self.tree_order,
         );
         tree::aggregate(self.procs.as_mut_slice(), &self.tree_order, &mut self.gpu);
-        self.groups
-            .update(self.procs.as_slice(), &self.table, building_gen);
+        self.identities.update(
+            self.procs.as_slice(),
+            &self.tree_order,
+            &self.table,
+            self.table.meta_epoch(),
+        );
 
         self.sys.set_task_counts(self.procs.count_tasks());
 

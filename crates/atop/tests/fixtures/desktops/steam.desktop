@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=Steam
+Exec=/usr/bin/steam %U
+Categories=Game;

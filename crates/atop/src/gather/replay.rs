@@ -225,7 +225,7 @@ impl Replayer {
             .app
             .rows()
             .iter()
-            .position(|row| self.app.procs().as_slice()[row.proc_idx].pid == pid)
+            .position(|row| self.app.row_pid(row) == pid)
             .unwrap_or_else(|| panic!("pid {pid} not displayed"));
         self.app.select_row(row);
     }
@@ -245,7 +245,7 @@ impl Replayer {
         self.app
             .rows()
             .get(self.app.selected())
-            .map(|row| self.app.procs().as_slice()[row.proc_idx].pid)
+            .map(|row| self.app.row_pid(row))
     }
 
     #[cfg(test)]
@@ -253,7 +253,7 @@ impl Replayer {
         self.app
             .rows()
             .iter()
-            .map(|row| self.app.procs().as_slice()[row.proc_idx].pid)
+            .map(|row| self.app.row_pid(row))
             .collect()
     }
 
@@ -262,9 +262,8 @@ impl Replayer {
         self.app
             .rows()
             .iter()
-            .find(|row| self.app.procs().as_slice()[row.proc_idx].pid == pid)
-            .map(|row| row.collapsed)
-            .unwrap_or_else(|| panic!("pid {pid} not displayed"))
+            .find(|row| self.app.row_pid(row) == pid)
+            .map_or_else(|| panic!("pid {pid} not displayed"), |row| row.collapsed)
     }
 
     #[cfg(test)]
@@ -386,6 +385,7 @@ fn vt100_cursor_rows(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::DisplayRowKind;
     use crate::palette;
     use crate::procs::NONE;
 
@@ -399,6 +399,248 @@ mod tests {
 
     fn stream(input: &str) -> atop_stream::Stream {
         atop_stream::Stream::parse(input).expect("parse replay stream")
+    }
+
+    #[test]
+    fn capture_fixture_projects_familiar_application_groups() {
+        let mut r =
+            Replayer::from_stream(stream(include_str!("../../tests/fixtures/app-groups.dsl")));
+        r.cycle();
+
+        let mut labels: Vec<_> = r
+            .app
+            .rows()
+            .iter()
+            .filter_map(|row| match row.kind {
+                DisplayRowKind::Application { group_idx } => {
+                    Some(r.app.app_group(group_idx).label.as_str())
+                }
+                DisplayRowKind::Process { .. } => None,
+            })
+            .collect();
+        labels.sort_unstable();
+        assert_eq!(
+            labels,
+            [
+                "Google Chrome",
+                "Slack",
+                "Steam",
+                "Visual Studio Code",
+                "Zed"
+            ]
+        );
+        assert_eq!(
+            r.app
+                .rows()
+                .iter()
+                .filter(|row| matches!(row.kind, DisplayRowKind::Application { .. }))
+                .count(),
+            5
+        );
+        for pid in [2278, 2305, 2308, 1730] {
+            assert!(
+                r.display_pids().contains(&pid),
+                "pid {pid} must remain native"
+            );
+        }
+        let collapsed_screen = r.render(100, 24);
+        let collapsed_text = collapsed_screen.text();
+        assert!(collapsed_text.contains('◇'));
+        let chrome_text = collapsed_text
+            .lines()
+            .find(|line| line.contains("Google Chrome"))
+            .unwrap();
+        assert!(chrome_text.contains("[+4]"), "{chrome_text}");
+
+        let chrome_row = r
+            .app
+            .rows()
+            .iter()
+            .position(|row| matches!(row.kind, DisplayRowKind::Application { group_idx } if r.app.app_group(group_idx).label == "Google Chrome"))
+            .unwrap();
+        r.app.select_row(chrome_row);
+        assert!(
+            !r.app.kill_selected(),
+            "synthetic application rows cannot be signalled"
+        );
+        r.app.toggle_collapse();
+        let chrome_members = [1684, 1690, 1718, 1721];
+        let concrete: Vec<_> = r
+            .app
+            .rows()
+            .iter()
+            .filter_map(|row| match row.kind {
+                DisplayRowKind::Process { proc_idx } => {
+                    Some(r.app.procs().as_slice()[proc_idx].pid)
+                }
+                DisplayRowKind::Application { .. } => None,
+            })
+            .collect();
+        for pid in chrome_members {
+            assert_eq!(
+                concrete.iter().filter(|&&shown| shown == pid).count(),
+                1,
+                "pid {pid}"
+            );
+        }
+
+        let screen = r.render(100, 24);
+        assert!(screen.text().contains('◆'));
+        assert!(screen.text().contains("Google Chrome"));
+    }
+
+    #[test]
+    fn fold_preference_persists_across_restart_by_identity() {
+        use crate::application::FoldPreferences;
+
+        let dir = std::env::temp_dir().join(format!("atop-foldpersist-{}", std::process::id()));
+        let path = dir.join("folds");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let zed_row = |r: &Replayer| {
+            r.app
+                .rows()
+                .iter()
+                .position(|row| matches!(row.kind, DisplayRowKind::Application { group_idx } if r.app.app_group(group_idx).label == "Zed"))
+                .expect("Zed application row")
+        };
+
+        // Session 1: Zed folds by default; expanding it writes an override keyed by its identity.
+        let mut r =
+            Replayer::from_stream(stream(include_str!("../../tests/fixtures/app-groups.dsl")));
+        r.app.set_folds(FoldPreferences::at(path.clone()));
+        r.cycle();
+        assert!(r.app.rows()[zed_row(&r)].collapsed, "Zed folds by default");
+        let row = zed_row(&r);
+        r.app.select_row(row);
+        r.app.toggle_collapse();
+        assert!(!r.app.rows()[zed_row(&r)].collapsed);
+
+        // Session 2: a fresh run loads the override and Zed starts expanded by identity.
+        let mut r2 =
+            Replayer::from_stream(stream(include_str!("../../tests/fixtures/app-groups.dsl")));
+        r2.app.set_folds(FoldPreferences::at(path.clone()));
+        r2.cycle();
+        assert!(
+            !r2.app.rows()[zed_row(&r2)].collapsed,
+            "fold preference persisted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn steady_cycle_does_not_move_the_metadata_epoch() {
+        // Two identical cycles — the second carries the first's processes forward with no births,
+        // deaths, or content changes — so the metadata epoch must hold steady, letting the
+        // identity resolver and application grouping both skip recomputation.
+        let stream = stream(
+            r#"
+            cycle 0
+              10 uid=1000 start=10 comm=foo cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo@a.service\n"
+              11 uid=1000 start=11 comm=foo cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo@a.service\n"
+              12 uid=1000 start=12 comm=foo cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo@a.service\n"
+
+            cycle +1s
+            "#,
+        );
+        let mut r = Replayer::from_stream(stream);
+        r.cycle();
+        let epoch = r.app.meta_epoch();
+        r.cycle();
+        assert_eq!(
+            r.app.meta_epoch(),
+            epoch,
+            "a steady cycle must not move the epoch"
+        );
+    }
+
+    #[test]
+    fn application_representative_and_expansion_follow_identity() {
+        // Members split across `app-foo@a` and `app-foo@b` share the app id `foo`, so they are one
+        // group whose row survives the specific representative process exiting.
+        let stream = stream(
+            r#"
+            cycle 0
+              10 uid=1000 start=10 comm=foo cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo@a.service\n"
+              11 uid=1000 start=11 comm=foo cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo@a.service\n"
+              12 uid=1000 start=12 comm=foo cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo@a.service\n"
+
+            cycle +1s
+              - 10
+              + 13 uid=1000 start=13 comm=foo cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo@b.service\n"
+            "#,
+        );
+        let mut r = Replayer::from_stream(stream);
+        r.cycle();
+        let row = r
+            .app
+            .rows()
+            .iter()
+            .position(|row| matches!(row.kind, DisplayRowKind::Application { .. }))
+            .unwrap();
+        r.app.select_row(row);
+        r.app.toggle_collapse();
+
+        r.cycle();
+        let selected = &r.app.rows()[r.app.selected()];
+        assert!(matches!(selected.kind, DisplayRowKind::Application { .. }));
+        assert!(
+            !selected.collapsed,
+            "expansion suppression follows the app identity across cycles"
+        );
+        assert_eq!(
+            r.app.row_pid(selected),
+            11,
+            "representative was replaced deterministically after 10 exited"
+        );
+    }
+
+    #[test]
+    fn application_memory_sampling_is_visible_and_gated() {
+        let mut r =
+            Replayer::from_stream(stream(include_str!("../../tests/fixtures/app-groups.dsl")));
+        r.cycle();
+        // No proportional reads until a folded application row is actually in the viewport.
+        assert_eq!(r.app.memory_read_count(), 0);
+
+        // Chrome is the folded group carrying a resident member in the fixture, so it is the one
+        // that yields a proportional read once visible.
+        let chrome = r
+            .app
+            .rows()
+            .iter()
+            .position(|row| matches!(row.kind, DisplayRowKind::Application { group_idx } if r.app.app_group(group_idx).label == "Google Chrome"))
+            .unwrap();
+        r.app.select_row(chrome);
+        r.app.adjust_scroll(1);
+        r.app.prepare_visible_rows(1);
+        let after_first = r.app.memory_read_count();
+        assert!(after_first > 0, "a visible folded row samples its members");
+
+        // Same generation, same viewport: the resident-set gate reads nothing further.
+        r.app.prepare_visible_rows(1);
+        assert_eq!(r.app.memory_read_count(), after_first);
+    }
+
+    #[test]
+    fn kthreadd_is_collapsed_by_default_and_can_be_expanded() {
+        let mut r = Replayer::from_stream(stream(
+            r"
+            cycle 0
+              2 uid=0 start=2 kthread=true comm=kthreadd
+              3 ppid=2 uid=0 start=3 kthread=true comm=kworker/0:0
+              4 ppid=2 uid=0 start=4 kthread=true comm=ksoftirqd/0
+            ",
+        ));
+        r.cycle();
+        assert_eq!(r.display_pids(), vec![2]);
+        assert!(r.row_collapsed(2));
+
+        r.select_pid(2);
+        r.toggle_collapse();
+        assert_eq!(r.display_pids(), vec![2, 3, 4]);
+        assert!(!r.row_collapsed(2));
     }
 
     fn cpu_ramp_stream() -> atop_stream::Stream {
@@ -597,6 +839,7 @@ mod tests {
             cycle 0
               200 start=200 comm=daemon cmd=/usr/bin/daemon cgroup="0::/system.slice/example.service\n"
               201 ppid=200 start=201 comm=worker cmd=/usr/bin/worker cgroup="0::/system.slice/example.service\n"
+              202 ppid=200 start=202 comm=worker cmd=/usr/bin/worker cgroup="0::/system.slice/example.service\n"
 
             cycle +1s
             "#,
@@ -604,81 +847,91 @@ mod tests {
     }
 
     #[test]
-    fn replay_process_controlled_group_does_not_auto_collapse() {
+    fn replay_structural_chromium_group_auto_folds_with_label() {
+        // A Chromium/Electron process fan has no cgroup boundary — it is a structural,
+        // session-only group. On a personal workstation it still folds by default, into one row
+        // labelled by the root command, with the helper subtree hidden.
         let mut r = Replayer::from_stream(chromium_group_stream());
         r.cycle();
-        assert_eq!(r.display_pids(), vec![10, 11, 12, 13, 14, 15]);
+        assert_eq!(r.display_pids(), vec![10]);
+        assert!(r.row_collapsed(10));
+        let screen = r.render(120, 16);
+        assert!(screen.text().contains("/opt/app/chrome"));
+        assert!(
+            !screen.text().contains("--type=renderer"),
+            "members hidden while folded"
+        );
+    }
+
+    #[test]
+    fn replay_structural_chromium_group_expands_to_member_forest() {
+        let mut r = Replayer::from_stream(chromium_group_stream());
+        r.cycle();
+        r.select_pid(10);
+        r.toggle_collapse();
+        // The group row plus its reconstructed member forest (root then helpers).
+        assert_eq!(r.display_pids(), vec![10, 10, 11, 12, 13, 14, 15]);
         assert!(!r.row_collapsed(10));
     }
 
     #[test]
-    fn replay_user_expansion_suppresses_auto_recollapse_while_pid_visible() {
+    fn replay_user_expansion_suppresses_auto_recollapse_while_group_lives() {
         let mut r = Replayer::from_stream(cgroup_group_stream());
         r.cycle();
         r.select_pid(200);
         r.toggle_collapse();
-        assert_eq!(r.display_pids(), vec![200, 201]);
+        assert_eq!(r.display_pids(), vec![200, 200, 201, 202]);
 
         r.cycle();
-        assert_eq!(r.display_pids(), vec![200, 201]);
-        assert!(!r.row_collapsed(200));
+        assert_eq!(r.display_pids(), vec![200, 200, 201, 202]);
+        assert!(
+            !r.row_collapsed(200),
+            "expansion follows the identity across cycles"
+        );
     }
 
     #[test]
-    fn replay_absent_pid_clears_auto_suppression() {
+    fn replay_ephemeral_group_expansion_clears_on_disappearance() {
+        // A container id is ephemeral, so its fold is session-only: an expansion is transient
+        // state, cleared when the group disappears (unlike a persistable desktop/systemd identity).
         let stream = stream(
             r#"
             cycle 0
-              200 start=100 comm=daemon cgroup="0::/system.slice/example.service\n"
-              201 ppid=200 start=101 comm=worker cgroup="0::/system.slice/example.service\n"
+              200 start=100 comm=daemon cgroup="0::/system.slice/docker-abcdef1234567890.scope\n"
+              201 ppid=200 start=101 comm=worker cgroup="0::/system.slice/docker-abcdef1234567890.scope\n"
+              202 ppid=200 start=102 comm=worker cgroup="0::/system.slice/docker-abcdef1234567890.scope\n"
 
             cycle +1s
               - 200
               - 201
+              - 202
 
             cycle +1s
-              + 200 start=200 comm=daemon cgroup="0::/system.slice/example.service\n"
-              + 201 ppid=200 start=201 comm=worker cgroup="0::/system.slice/example.service\n"
+              + 200 start=200 comm=daemon cgroup="0::/system.slice/docker-abcdef1234567890.scope\n"
+              + 201 ppid=200 start=201 comm=worker cgroup="0::/system.slice/docker-abcdef1234567890.scope\n"
+              + 202 ppid=200 start=202 comm=worker cgroup="0::/system.slice/docker-abcdef1234567890.scope\n"
             "#,
         );
         let mut r = Replayer::from_stream(stream);
         r.cycle();
         r.select_pid(200);
         r.toggle_collapse();
-        assert_eq!(r.display_pids(), vec![200, 201]);
+        assert_eq!(r.display_pids(), vec![200, 200, 201, 202]);
 
         r.cycle();
         assert!(r.display_pids().is_empty());
 
         r.cycle();
         assert_eq!(r.display_pids(), vec![200]);
-        assert!(r.row_collapsed(200));
-    }
-
-    #[test]
-    fn replay_collapsed_group_root_uses_group_label() {
-        let mut r = Replayer::from_stream(chromium_group_stream());
-        r.cycle();
-        r.select_pid(10);
-        r.toggle_collapse();
-
-        let screen = r.render(80, 16);
-        assert!(screen.text().contains("/opt/app/chrome"));
-        assert!(!screen.text().contains("--type=renderer"));
+        assert!(
+            r.row_collapsed(200),
+            "transient state cleared when the group disappeared"
+        );
     }
 
     #[test]
     fn replay_collapsed_cgroup_group_label_renders() {
-        let stream = stream(
-            r#"
-            cycle 0
-              200 start=200 comm=daemon cmd=/usr/bin/daemon cgroup="0::/system.slice/example.service\n"
-              201 ppid=200 start=201 comm=worker cmd=/usr/bin/worker cgroup="0::/system.slice/example.service\n"
-
-            cycle +1s
-            "#,
-        );
-        let mut r = Replayer::from_stream(stream);
+        let mut r = Replayer::from_stream(cgroup_group_stream());
         r.cycle();
 
         assert_eq!(r.display_pids(), vec![200]);
@@ -689,23 +942,14 @@ mod tests {
     }
 
     #[test]
-    fn replay_expanded_cgroup_tree_remains_structural() {
-        let stream = stream(
-            r#"
-            cycle 0
-              210 start=210 comm=daemon cmd=/usr/bin/daemon cgroup="0::/system.slice/example.service\n"
-              211 ppid=210 start=211 comm=worker cmd=/usr/bin/worker cgroup="0::/system.slice/example.service\n"
-
-            cycle +1s
-            "#,
-        );
-        let mut r = Replayer::from_stream(stream);
+    fn replay_expanded_cgroup_group_reconstructs_members() {
+        let mut r = Replayer::from_stream(cgroup_group_stream());
         r.cycle();
-        r.select_pid(210);
+        r.select_pid(200);
         r.toggle_collapse();
 
-        assert_eq!(r.display_pids(), vec![210, 211]);
-        assert!(!r.row_collapsed(210));
+        assert_eq!(r.display_pids(), vec![200, 200, 201, 202]);
+        assert!(!r.row_collapsed(200));
         let screen = r.render(80, 16);
         assert!(screen.text().contains("/usr/bin/daemon"));
         assert!(screen.text().contains("/usr/bin/worker"));
@@ -729,13 +973,16 @@ mod tests {
         );
         let mut r = Replayer::from_stream(stream);
         r.cycle();
-        assert_eq!(r.display_pids(), vec![300, 301, 302, 303, 304]);
-        assert!(r.row_collapsed(301));
+        assert_eq!(r.display_pids(), vec![300]);
+        assert!(r.row_collapsed(300));
 
-        r.select_pid(301);
+        r.select_pid(300);
         r.toggle_collapse();
-        assert_eq!(r.display_pids(), vec![300, 301, 305, 306, 302, 303, 304]);
-        assert!(!r.row_collapsed(301));
+        assert_eq!(
+            r.display_pids(),
+            vec![300, 300, 301, 305, 306, 302, 303, 304]
+        );
+        assert!(!r.row_collapsed(300));
     }
 
     #[test]
@@ -813,5 +1060,45 @@ mod tests {
 
         r.move_down();
         assert_eq!(r.selected_pid(), Some(42));
+    }
+
+    /// Ad-hoc perf probe over a real capture. Times `App::gather` (the full per-cycle grouping
+    /// rebuild) and a cold full render, on real desktop cgroup data.
+    /// `ATOP_CAPTURE=/path/to.dsl cargo test --release -p atop capture_grouping_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing; needs ATOP_CAPTURE"]
+    #[allow(clippy::cast_precision_loss)]
+    fn capture_grouping_cost() {
+        use std::time::Instant;
+        let path = std::env::var("ATOP_CAPTURE").expect("set ATOP_CAPTURE to a .dsl capture");
+        let text = std::fs::read_to_string(&path).expect("read capture");
+        let stream = atop_stream::Stream::parse(&text).expect("parse capture");
+        let ncycles = stream.cycles.len();
+        let nprocs = stream.cycles.first().map_or(0, |c| c.procs.len());
+        let mut r = Replayer::from_stream(stream);
+
+        let warm = 5.min(ncycles.saturating_sub(1));
+        let (mut gather_us, mut render_us) = (Vec::new(), Vec::new());
+        for i in 0..ncycles {
+            let t = Instant::now();
+            r.cycle();
+            let g = t.elapsed().as_secs_f64() * 1e6;
+            let t = Instant::now();
+            let _ = r.render_text(200, 60);
+            let rd = t.elapsed().as_secs_f64() * 1e6;
+            if i >= warm {
+                gather_us.push(g);
+                render_us.push(rd);
+            }
+        }
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let mx = |v: &[f64]| v.iter().copied().fold(0.0_f64, f64::max);
+        eprintln!(
+            "cycles={ncycles} procs={nprocs} | App::gather avg={:.0}us max={:.0}us | cold_render(200x60) avg={:.0}us | gather duty@500ms={:.2}% core",
+            avg(&gather_us),
+            mx(&gather_us),
+            avg(&render_us),
+            avg(&gather_us) / 1e6 / 0.5 * 100.0
+        );
     }
 }

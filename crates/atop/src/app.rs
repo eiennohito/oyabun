@@ -47,6 +47,9 @@ pub struct App {
     scroll: usize,
     /// Reused DFS stack for flattening the tree into `rows`.
     row_scratch: Vec<u32>,
+    /// Reused list of visible collapsed application group indices, refilled each frame for the
+    /// memory sampler — avoids a per-frame allocation on the render hot path.
+    visible_scratch: Vec<usize>,
 }
 
 impl App {
@@ -64,6 +67,7 @@ impl App {
             selected: 0,
             scroll: 0,
             row_scratch: Vec::new(),
+            visible_scratch: Vec::new(),
         }
     }
 
@@ -101,6 +105,7 @@ impl App {
             selected: 0,
             scroll: 0,
             row_scratch: Vec::new(),
+            visible_scratch: Vec::new(),
         }
     }
 
@@ -394,32 +399,35 @@ impl App {
     }
 
     /// Perform bounded proportional-memory sampling after the viewport is known, so rendering
-    /// stays pure I/O. Only collapsed application rows in the viewport are candidates; the
-    /// sampler's resident-set gate and per-cycle budget keep the actual kernel reads bounded, so
-    /// this is cheap to call every render frame (a settled desktop reads nothing).
+    /// stays pure I/O. Only collapsed application rows in the viewport are candidates; the sampler
+    /// estimates each member's proportional set size from a cached split and the free resident
+    /// reading, walking the address space only to bootstrap a member or on a staggered backstop
+    /// under a per-cycle budget, so this is cheap to call every render frame (a settled desktop
+    /// walks nothing).
     pub fn prepare_visible_rows(&mut self, visible_height: usize) {
-        let visible: Vec<usize> = self
-            .rows
-            .iter()
-            .skip(self.scroll)
-            .take(visible_height)
-            .filter_map(|row| match row.kind {
-                DisplayRowKind::Application { group_idx } if row.collapsed => Some(group_idx),
-                _ => None,
-            })
-            .collect();
-        if visible.is_empty() {
-            return;
+        let mut visible = std::mem::take(&mut self.visible_scratch);
+        visible.clear();
+        visible.extend(
+            self.rows
+                .iter()
+                .skip(self.scroll)
+                .take(visible_height)
+                .filter_map(|row| match row.kind {
+                    DisplayRowKind::Application { group_idx } if row.collapsed => Some(group_idx),
+                    _ => None,
+                }),
+        );
+        if !visible.is_empty() {
+            let App {
+                gatherer,
+                applications,
+                memory,
+                ..
+            } = self;
+            let procs = gatherer.procs().as_slice();
+            memory.sample_visible(applications.groups_mut(), &visible, procs);
         }
-        let App {
-            gatherer,
-            applications,
-            memory,
-            ..
-        } = self;
-        let procs = gatherer.procs().as_slice();
-        let mem_total = gatherer.sys().mem_total;
-        memory.sample_visible(applications.groups_mut(), &visible, procs, mem_total);
+        self.visible_scratch = visible;
     }
 
     // --- actions ---

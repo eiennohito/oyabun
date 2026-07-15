@@ -50,12 +50,21 @@ in the visible viewport, and stays outside rendering.
 
 Reading proportional data for every member of every visible folded group every cycle is the
 dominant interactive cost on a real desktop — a browser is exactly the large, many-mapping
-process this walk is most expensive on. Application memory changes slowly, so it is change-gated
-rather than recomputed: each member's proportional value is cached and reused until its resident
-set (already known every cycle for free) moves enough to matter, where "enough" is measured
-absolutely against host memory, not as a fraction of the process. Candidates are refreshed
-highest-change-first under a fixed per-cycle read budget, so newly folding a large application
-converges over a few cycles instead of spiking one, and a settled desktop reads essentially
-nothing. A slow periodic refresh backstops the one thing the resident-set gate cannot see: a
-member's proportional share shifting when a *shared* page is mapped or unmapped elsewhere, with
-no change to its own resident set.
+process this walk is most expensive on. The value is therefore estimated, not recomputed, and the
+enabling observation is that a member's shared-vs-private *split* changes far more slowly than its
+resident *size*. Resident growth is overwhelmingly private (heap), and resident size is read for
+free every cycle. So each member's split is walked once and cached; every cycle its proportional
+set size is re-derived by attributing the resident change since that walk to private pages and
+recombining with the cached shared share. This is exact for private growth — the common case — and
+inaccurate only while the *shared mapping set* itself has changed since the last walk.
+
+The expensive walk then runs only in two situations: to bootstrap a member with no cached split
+yet, and, on a slow staggered refresh, to re-establish the split and so catch shared-set drift —
+the one thing the free resident reading cannot reveal. The earlier "re-walk whenever the resident
+set moved enough" gate is gone, because a moving resident set is exactly what the estimate now
+absorbs for free; that gate was what made a busy application re-walk every cycle. Walks are bounded
+by a fixed per-cycle budget and prioritized largest-member-first, so newly folding a large
+application converges over a few cycles instead of spiking one, and a settled desktop walks
+essentially nothing. The staggered refresh is spread by PID rather than by a fixed age, so the
+members of a group folded together do not all come due on the same later cycle and walk as one
+herd.

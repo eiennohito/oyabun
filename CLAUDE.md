@@ -86,4 +86,7 @@ scripts/    setup-caps.sh, perf-toggle.sh, run-logged.sh
 **atop** — a Rust CLI/TUI process manager. See `docs/GOALS.md` for full goals and
 `docs/ARCHITECTURE.md` for the implemented design.
 Linux (io_uring + syscall fallback) and macOS (`sysctl`/`libproc`). Windows is not a goal.
-Core invariants: near-zero idle CPU, sub-ms input response, sub O(n) on process/core count when possible, safe sudo escalation.
+Core invariants: 
+- near-zero idle CPU, theoretical minimum, useless copies/allocation churn are forbidden
+- O(changes) on process/core count when possible
+- safe sudo escalation

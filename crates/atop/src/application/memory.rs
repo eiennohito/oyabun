@@ -4,49 +4,72 @@ use crate::application::AppGroup;
 use crate::fxhash::PidMap;
 use crate::procs::ProcessEntry;
 
-/// Proportional reads permitted per gather cycle. A newly-folded large application refreshes
-/// over a few cycles instead of one spike; a settled desktop reads approximately nothing.
+/// Address-space walks permitted per gather cycle. Only bootstrap (a member never walked) and
+/// the staggered backstop below produce walks now, so a settled desktop walks approximately
+/// nothing and a freshly-folded large application spreads its bootstrap walks over a few cycles.
 const READ_BUDGET: u32 = 16;
 
-/// Generations between forced refreshes of an otherwise-stable member. A member's proportional
-/// share drifts when a *shared* page is (un)mapped elsewhere — invisible to the resident-set
-/// gate — so a slow periodic re-read backstops it. At the gather interval this is on the order
-/// of tens of seconds, and the value moves slowly enough that the staleness is imperceptible.
-const BACKSTOP_GENS: u64 = 64;
+/// Staggered period, in generations, of the forced re-walk of an otherwise-stable member. The
+/// per-member estimate is exact for private (heap) growth — the common case — and drifts only
+/// when the *shared* mapping set changes (a library mapped or unmapped), which the free
+/// resident-set reading cannot reveal. This backstop is the sole steady-state source of walks, so
+/// it also bounds how long that shared-set drift can persist. Re-walks are **staggered by PID**
+/// (see [`MemorySampler::backstop_due`]): a whole application folded in one cycle would otherwise
+/// come due together and walk as a thundering herd every period. Spread out, at most
+/// ~`members / BACKSTOP_GENS` walk per cycle; per-member staleness is bounded to this many cycles.
+const BACKSTOP_GENS: u64 = 256;
 
-/// A resident-set move below this fraction of host memory is ignored as a refresh trigger:
-/// it cannot move a total shown in gigabytes. Significance is absolute (against host memory),
-/// not fractional against the process, so a large jump on a big process refreshes while a large
-/// *relative* jiggle on a tiny one does not.
-const SIGNIFICANCE_DIVISOR: u64 = 2048; // ~0.05% of host memory
-const MIN_SIGNIFICANCE: u64 = 1 << 20; // 1 MiB floor for tiny hosts
+/// The shared/private split of a member's resident set from one address-space walk, from which
+/// proportional set size is re-estimated each cycle against the free live resident reading.
+/// `Rss = private + shared_full` and `Pss = private + shared_pss`, so caching only the shared
+/// components lets the private part — and thus PSS — track resident growth without a re-walk.
+#[derive(Clone, Copy)]
+struct Split {
+    /// Resident bytes in shared mappings (`Shared_Clean + Shared_Dirty`) at the walk.
+    shared_full: u64,
+    /// The proportional share of those shared mappings (`Pss − private`) at the walk.
+    shared_pss: u64,
+}
 
-/// Per-member proportional-set-size cache. Keyed by PID and validated by `start_time`, so a
-/// reused PID never inherits a stale reading; entries whose process is not live this generation
-/// are evicted in [`MemorySampler::begin_cycle`].
+impl Split {
+    /// Estimate PSS at the current resident set: attribute all resident change since the walk to
+    /// private pages (exact for heap growth — the shared set is what the backstop re-walks), then
+    /// recombine with the cached shared proportional share. Clamped into `[0, rss_now]`.
+    fn estimate(self, rss_now: u64) -> u64 {
+        let private_now = rss_now.saturating_sub(self.shared_full);
+        private_now.saturating_add(self.shared_pss).min(rss_now)
+    }
+}
+
+/// Per-member cache. Keyed by PID and validated by `start_time`, so a reused PID never inherits a
+/// stale reading; entries whose process is not live this generation are evicted in
+/// [`MemorySampler::begin_cycle`].
 struct MemberSample {
     start_time: u64,
-    /// Last proportional read: `Some(pss)`, or `None` when the address space was unreadable.
-    pss: Option<u64>,
-    /// Resident set *at the moment of that read* — the staleness gate compares against this, not
-    /// the previous cycle, so slow accumulation still crosses the threshold and refreshes.
-    rss_at_read: u64,
-    /// Generation of the last read, for the slow-drift backstop.
+    /// The split from the last walk, or `None` when the address space was unreadable.
+    split: Option<Split>,
+    /// Generation of the last walk, for the staggered backstop.
     read_gen: u64,
 }
 
-/// Change-gated proportional-memory sampler for folded application rows.
+/// Estimate-based proportional-memory sampler for folded application rows.
 ///
-/// Correct application memory sums proportional set size across **every** member, and each read
-/// forces a kernel walk of the whole address space — the dominant interactive cost on a real
-/// desktop if done every cycle. The governing invariant is that application memory changes
-/// slowly, so it is change-gated rather than recomputed: a member whose resident set has not
-/// moved keeps its cached proportional value, candidates are prioritized by absolute
-/// resident-set change against host memory, a per-cycle budget bounds the reads, and a slow
-/// refresh backstops shared-page drift. See `docs/application-memory-gotchas.md`.
+/// Correct application memory sums proportional set size across **every** member, and reading a
+/// member's PSS forces a kernel walk of its whole address space — the dominant interactive cost
+/// on a real desktop if done every cycle. The governing invariant is that the *shape* of a
+/// member's footprint — its shared-vs-private split — changes far more slowly than its size. So
+/// PSS is estimated, not re-read: each member caches that split from one walk, then every cycle
+/// recombines it with the free live resident reading (resident growth is attributed to private
+/// pages, exact for heap growth). The expensive walk runs only to bootstrap a member's split and,
+/// on a staggered backstop, to catch a change in the shared mapping set — the one thing the
+/// resident reading cannot reveal — under a per-cycle budget. See
+/// `docs/application-memory-gotchas.md`.
 pub(crate) struct MemorySampler {
     proc_root: PathBuf,
     members: PidMap<MemberSample>,
+    /// Reused `(proc_idx, priority)` scratch for the per-cycle candidate ranking — cleared and
+    /// refilled each `sample_visible` so the sampler allocates nothing on a settled desktop.
+    candidates: Vec<(usize, u64)>,
     generation: u64,
     budget: u32,
     #[cfg(test)]
@@ -75,6 +98,7 @@ impl MemorySampler {
         Self {
             proc_root,
             members: PidMap::default(),
+            candidates: Vec::new(),
             generation: 0,
             budget: READ_BUDGET,
             #[cfg(test)]
@@ -102,28 +126,30 @@ impl MemorySampler {
         groups: &mut [AppGroup],
         visible: &[usize],
         procs: &[ProcessEntry],
-        mem_total: u64,
     ) {
-        let threshold = significance(mem_total);
-        let mut candidates: Vec<(usize, u64)> = Vec::new(); // (proc_idx, priority)
+        // Reuse the scratch buffer across calls (no per-frame allocation). Taking it out by value
+        // sidesteps the borrow conflict between `self.refresh_priority` (&self) and pushing.
+        let mut candidates = std::mem::take(&mut self.candidates);
+        candidates.clear();
         for &group_idx in visible {
             for &proc_idx in &groups[group_idx].members {
                 let proc = &procs[proc_idx];
-                if let Some(priority) = self.refresh_priority(proc, threshold) {
+                if let Some(priority) = self.refresh_priority(proc) {
                     candidates.push((proc_idx, priority));
                 }
             }
         }
-        // Highest absolute resident-set change first; a fresh fold of a large application spreads
-        // its reads across the next few cycles rather than spiking one.
+        // Largest members first, so a fresh fold of a big application spends the budget where it
+        // matters most and spreads the rest across the next few cycles.
         candidates.sort_unstable_by_key(|&(_, priority)| std::cmp::Reverse(priority));
-        for (proc_idx, _) in candidates {
+        for &(proc_idx, _) in &candidates {
             if self.budget == 0 {
                 break;
             }
             self.budget -= 1;
             self.read_member(&procs[proc_idx]);
         }
+        self.candidates = candidates;
 
         for &group_idx in visible {
             let total = self.group_total(&groups[group_idx], procs);
@@ -136,34 +162,41 @@ impl MemorySampler {
         self.reads.get()
     }
 
-    /// The refresh priority of a member, or `None` if its cached value is still fresh. A member
-    /// with no address space is never a candidate. Never-read members sort by their whole
-    /// resident set (they have no value yet); read members by how far their resident set has
-    /// moved since the last read, with the backstop forcing an eventual refresh.
-    fn refresh_priority(&self, proc: &ProcessEntry, threshold: u64) -> Option<u64> {
+    /// Whether a member needs an address-space walk this cycle, priced by resident set (largest
+    /// first) if so. A member with no address space never walks. One with a cached split walks
+    /// only when its staggered backstop is due — resident *size* changes are estimated, not
+    /// re-walked. A never-walked member (or a reused PID) walks once to bootstrap its split.
+    fn refresh_priority(&self, proc: &ProcessEntry) -> Option<u64> {
         if proc.mem_bytes == 0 {
             return None;
         }
         match self.members.get(&proc.pid) {
-            Some(sample) if sample.start_time == proc.start_time => {
-                let delta = proc.mem_bytes.abs_diff(sample.rss_at_read);
-                let backstop_due = self.generation.wrapping_sub(sample.read_gen) >= BACKSTOP_GENS;
-                (delta >= threshold || backstop_due).then_some(delta)
-            }
+            Some(sample) if sample.start_time == proc.start_time => self
+                .backstop_due(proc.pid, sample.read_gen)
+                .then_some(proc.mem_bytes),
             _ => Some(proc.mem_bytes),
         }
+    }
+
+    /// Whether a resident-stable member is due its staggered shared-page-drift backstop this
+    /// cycle. Keyed on `(generation + pid) % BACKSTOP_GENS` so each PID's re-read slot lands on
+    /// a different cycle — a group folded all at once no longer re-reads as one herd. The
+    /// `read_gen != generation` guard prevents a second read within the same cycle it was just
+    /// read (`sample_visible` may run several times per gather, once per input event).
+    fn backstop_due(&self, pid: u32, read_gen: u64) -> bool {
+        read_gen != self.generation
+            && self.generation.wrapping_add(u64::from(pid)) % BACKSTOP_GENS == 0
     }
 
     fn read_member(&mut self, proc: &ProcessEntry) {
         #[cfg(test)]
         self.reads.set(self.reads.get() + 1);
-        let pss = read_pss(&self.proc_root, proc.pid);
+        let split = read_split(&self.proc_root, proc.pid);
         self.members.insert(
             proc.pid,
             MemberSample {
                 start_time: proc.start_time,
-                pss,
-                rss_at_read: proc.mem_bytes,
+                split,
                 read_gen: self.generation,
             },
         );
@@ -187,15 +220,13 @@ impl MemorySampler {
         }
         match self.members.get(&proc.pid) {
             Some(sample) if sample.start_time == proc.start_time => {
-                sample.pss.map_or(Contribution::Missing, Contribution::Pss)
+                sample.split.map_or(Contribution::Missing, |split| {
+                    Contribution::Pss(split.estimate(proc.mem_bytes))
+                })
             }
             _ => Contribution::Missing,
         }
     }
-}
-
-fn significance(mem_total: u64) -> u64 {
-    (mem_total / SIGNIFICANCE_DIVISOR).max(MIN_SIGNIFICANCE)
 }
 
 fn rss_sum(group: &AppGroup, procs: &[ProcessEntry]) -> u64 {
@@ -205,17 +236,40 @@ fn rss_sum(group: &AppGroup, procs: &[ProcessEntry]) -> u64 {
         .fold(0u64, |sum, &idx| sum.saturating_add(procs[idx].mem_bytes))
 }
 
-fn read_pss(proc_root: &Path, pid: u32) -> Option<u64> {
+/// Walk a member's `smaps_rollup` into its shared/private split. `None` when the address space is
+/// unreadable (permission, or a racing exit) or the rollup lacks a `Pss:` line.
+fn read_split(proc_root: &Path, pid: u32) -> Option<Split> {
     let text =
         std::fs::read_to_string(proc_root.join(pid.to_string()).join("smaps_rollup")).ok()?;
-    let kib = text.lines().find_map(|line| {
-        line.strip_prefix("Pss:")?
-            .split_ascii_whitespace()
-            .next()?
-            .parse::<u64>()
-            .ok()
-    })?;
-    Some(kib.saturating_mul(1024))
+    let (mut pss, mut shared_full, mut private) = (None, 0u64, 0u64);
+    for line in text.lines() {
+        if let Some(v) = field_bytes(line, "Pss:") {
+            pss = Some(v);
+        } else if let Some(v) = field_bytes(line, "Shared_Clean:") {
+            shared_full = shared_full.saturating_add(v);
+        } else if let Some(v) = field_bytes(line, "Shared_Dirty:") {
+            shared_full = shared_full.saturating_add(v);
+        } else if let Some(v) = field_bytes(line, "Private_Clean:") {
+            private = private.saturating_add(v);
+        } else if let Some(v) = field_bytes(line, "Private_Dirty:") {
+            private = private.saturating_add(v);
+        }
+    }
+    Some(Split {
+        shared_full,
+        // Proportional share of the shared pages: Pss minus the fully-counted private pages.
+        shared_pss: pss?.saturating_sub(private),
+    })
+}
+
+/// Parse a `smaps_rollup` `"<label>   <n> kB"` line into bytes; `None` if it is not that label.
+fn field_bytes(line: &str, label: &str) -> Option<u64> {
+    line.strip_prefix(label)?
+        .split_ascii_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .map(|kib| kib.saturating_mul(1024))
 }
 
 #[cfg(test)]
@@ -223,8 +277,6 @@ mod tests {
     use super::*;
     use crate::application::AppGroupKey;
     use std::fs;
-
-    const HOST_MEM: u64 = 16 * 1024 * 1024 * 1024;
 
     struct Fixture {
         root: PathBuf,
@@ -235,7 +287,7 @@ mod tests {
 
     impl Fixture {
         /// `n` members, PIDs `1..=n`, each with `rss_mib` MiB resident and a `smaps_rollup`
-        /// reporting `pss_mib` MiB. Members are the whole group.
+        /// whose split reports `pss_mib` MiB proportional at that resident set. Whole group.
         fn new(name: &str, n: u32, rss_mib: u64, pss_mib: u64) -> Self {
             let root = std::env::temp_dir().join(format!("atop-mem-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
@@ -248,7 +300,7 @@ mod tests {
                 p.start_time = u64::from(pid);
                 p.mem_bytes = rss_mib * 1024 * 1024;
                 procs.push(p);
-                write_pss(&proc_root, pid, pss_mib);
+                write_rollup(&proc_root, pid, rss_mib, pss_mib);
             }
             let group = AppGroup {
                 key: AppGroupKey {
@@ -276,12 +328,8 @@ mod tests {
 
         fn cycle(&mut self, generation: u64) {
             self.sampler.begin_cycle(generation, &self.procs);
-            self.sampler.sample_visible(
-                std::slice::from_mut(&mut self.group),
-                &[0],
-                &self.procs,
-                HOST_MEM,
-            );
+            self.sampler
+                .sample_visible(std::slice::from_mut(&mut self.group), &[0], &self.procs);
         }
 
         fn total(&self) -> u64 {
@@ -295,12 +343,20 @@ mod tests {
         }
     }
 
-    fn write_pss(proc_root: &Path, pid: u32, pss_mib: u64) {
+    /// Write a coherent `smaps_rollup` modelling the whole footprint as shared pages
+    /// (`Shared_Clean = Rss`) with proportional share `pss_mib`. The estimate reproduces `pss_mib`
+    /// exactly at this resident set and attributes any later growth to private pages.
+    fn write_rollup(proc_root: &Path, pid: u32, rss_mib: u64, pss_mib: u64) {
         let dir = proc_root.join(pid.to_string());
         fs::create_dir_all(&dir).unwrap();
+        let rss = rss_mib * 1024;
+        let pss = pss_mib * 1024;
         fs::write(
             dir.join("smaps_rollup"),
-            format!("Rss: 999999 kB\nPss: {} kB\n", pss_mib * 1024),
+            format!(
+                "Rss: {rss} kB\nPss: {pss} kB\nShared_Clean: {rss} kB\n\
+                 Shared_Dirty: 0 kB\nPrivate_Clean: 0 kB\nPrivate_Dirty: 0 kB\n"
+            ),
         )
         .unwrap();
     }
@@ -325,27 +381,21 @@ mod tests {
     }
 
     #[test]
-    fn large_resident_jump_is_refreshed() {
+    fn large_resident_jump_is_estimated_without_rewalk() {
         let mut f = Fixture::new("jump", 3, 100, 40);
         f.cycle(1);
         assert_eq!(f.sampler.read_count(), 3);
-        // One member's resident set jumps well past the significance threshold and its
-        // proportional reading grows to match.
-        f.procs[1].mem_bytes = 100 * 1024 * 1024 + 500 * 1024 * 1024;
-        write_pss(&f.root.join("proc"), 2, 240);
+        // One member's resident set jumps +500 MiB (private allocation). No new rollup, no re-walk:
+        // the cached split scales, attributing the growth to private pages one-to-one.
+        f.procs[1].mem_bytes += 500 * 1024 * 1024;
         f.cycle(2);
-        assert_eq!(f.sampler.read_count(), 4, "only the jumped member re-reads");
-        assert_eq!(f.total(), (40 + 240 + 40) * 1024 * 1024);
-    }
-
-    #[test]
-    fn small_resident_move_below_significance_is_ignored() {
-        let mut f = Fixture::new("small", 3, 100, 40);
-        f.cycle(1);
-        // A move smaller than ~0.05% of host memory must not trigger a read.
-        f.procs[1].mem_bytes += MIN_SIGNIFICANCE / 2;
-        f.cycle(2);
-        assert_eq!(f.sampler.read_count(), 3);
+        assert_eq!(
+            f.sampler.read_count(),
+            3,
+            "resident growth is estimated from the cached split, not re-walked"
+        );
+        // member 1: (600 − 100) + 40 = 540 MiB; the two unchanged members stay at 40 MiB.
+        assert_eq!(f.total(), (40 + 540 + 40) * 1024 * 1024);
     }
 
     #[test]
@@ -364,21 +414,33 @@ mod tests {
     }
 
     #[test]
-    fn slow_refresh_backstops_shared_page_drift() {
+    fn staggered_backstop_catches_drift_without_herd() {
         let mut f = Fixture::new("backstop", 2, 100, 40);
         f.cycle(1);
         assert_eq!(f.sampler.read_count(), 2);
-        // Proportional share shifts with no resident-set change (a shared page mapped elsewhere).
-        write_pss(&f.root.join("proc"), 1, 55);
-        write_pss(&f.root.join("proc"), 2, 55);
-        // Before the backstop window the resident-stable members are not re-read.
-        for generation in 2..BACKSTOP_GENS {
+        // The shared mapping set shifts its proportional share with no resident-set change, so the
+        // estimate cannot see it — only the backstop re-walk can.
+        write_rollup(&f.root.join("proc"), 1, 100, 55);
+        write_rollup(&f.root.join("proc"), 2, 100, 55);
+        // Over one full stagger window each member re-walks exactly once, and no single cycle
+        // re-walks both — the re-walks are spread by PID rather than bursting as one herd.
+        let mut prev = f.sampler.read_count();
+        let mut max_per_cycle = 0;
+        for generation in 2..=BACKSTOP_GENS + 2 {
             f.cycle(generation);
+            let now = f.sampler.read_count();
+            max_per_cycle = max_per_cycle.max(now - prev);
+            prev = now;
         }
-        assert_eq!(f.sampler.read_count(), 2);
-        // Once the window elapses the backstop forces a refresh and the drift is caught.
-        f.cycle(BACKSTOP_GENS + 1);
-        assert_eq!(f.sampler.read_count(), 4);
+        assert_eq!(
+            f.sampler.read_count(),
+            4,
+            "each member re-read exactly once in the window"
+        );
+        assert_eq!(
+            max_per_cycle, 1,
+            "staggered: at most one drift re-read per cycle, no herd"
+        );
         assert_eq!(f.total(), 2 * 55 * 1024 * 1024);
     }
 
@@ -411,12 +473,12 @@ mod tests {
         // Same PID, new incarnation (different start_time) with a different footprint.
         f.procs[0].start_time = 999;
         f.procs[0].mem_bytes = 100 * 1024 * 1024;
-        write_pss(&f.root.join("proc"), 1, 70);
+        write_rollup(&f.root.join("proc"), 1, 100, 70);
         f.cycle(2);
         assert_eq!(
             f.sampler.read_count(),
             2,
-            "reused PID re-reads from scratch"
+            "reused PID re-walks from scratch"
         );
         assert_eq!(f.total(), 70 * 1024 * 1024);
     }

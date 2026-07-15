@@ -486,13 +486,25 @@ while a persistable one returns as the user left it.
 
 Application memory is proportional set size summed across every member — resident-set addition
 double-counts the shared pages a browser's helpers map, so it is only the fallback used when a
-live member cannot be read. Because a per-member read walks the whole address space, it is
-change-gated, not recomputed: resident-set size is a free staleness proxy, so only members whose
-resident set moved (measured absolutely, against host memory) are re-read, highest-change first
-under a per-cycle budget, with a slow periodic refresh backstopping the shared-page drift the
-resident gate cannot see. Sampling is a view concern, done only for folded rows in the viewport.
-Cgroup memory is deliberately excluded: it measures charged cache and kernel resources, not
-resident footprint. See [Application memory accounting gotchas](application-memory-gotchas.md).
+live member cannot be read. A per-member proportional read walks the whole address space, the
+dominant interactive cost if done every cycle, so it is **estimated, not recomputed**. The
+invariant that makes this sound is that a member's shared-vs-private *split* changes far more
+slowly than its resident *size*: resident growth is overwhelmingly private (heap), and resident
+size is read for free every cycle anyway. So each member's split is walked once and cached, then
+each cycle proportional set size is re-derived by attributing the resident change since that walk
+to private pages and recombining with the cached shared share — exact for private growth, and
+wrong only when the *shared mapping set* itself changes. The expensive walk therefore runs only to
+bootstrap a member and, on a slow refresh, to catch that shared-set drift; the earlier
+"re-walk whenever the resident set moved" gate is gone precisely because a moving resident set is
+what the estimate now handles for free. That backstop is **staggered by PID**, not a fixed age: a
+whole application is folded in one cycle, so an age-based backstop would make every member come due
+on the same later cycle and walk as a thundering herd — the dominant idle cost of an *untouched*
+group. Spreading each member onto its own cycle turns that burst into a negligible trickle while
+still bounding per-member staleness, under a per-cycle walk budget. Sampling is a view concern,
+done only for folded rows in the viewport, and this whole path is charged against the UI's share of
+the frame budget, not the gatherer's. Cgroup memory is deliberately excluded: it measures charged
+cache and kernel resources, not resident footprint. See
+[Application memory accounting gotchas](application-memory-gotchas.md).
 
 ## Rendering (`etch`)
 
@@ -613,6 +625,47 @@ recent `/proc/stat` snapshots at its two endpoints (the same multi-second window
 CPU), not a single interval. A bare `cur − prev` delta at this cadence resolves only a few tens
 of jiffies, so a transient burst dominates one sample then vanishes — the bar jumps. The
 user/sys/iowait split is preserved because every counter is differenced over the same endpoints.
+
+## GPU telemetry (NVML)
+
+Optional NVIDIA telemetry is a `dlsym`-loaded NVML with no build dependency (see the module doc);
+any probe failure just leaves atop CPU-only. It is the third of a rough gather : GPU : UI
+frame-time split, so its per-cycle work is gated on change the same way the two others are —
+otherwise it dominated the profile, because the naive shape re-ran every NVML call every cycle
+regardless of whether the GPU did anything.
+
+Two costs are separated by how fast the thing they read moves. **Client discovery + VRAM** (the
+process-list enumeration that names GPU clients and their framebuffer footprint, plus device VRAM
+totals) moves slowly, so it runs on a **coarse cadence** and the result is *held* between
+refreshes — a client whose GPU is idle still owns its VRAM, so holding it is correct, not stale.
+The **per-process utilization poll** busy-polls the GPU's own processor for fresh perfmon samples
+and is by far the expensive call, so it is constrained two ways. First it is **gated**: it runs
+only when the GPU is actually doing work. Second, even then it runs on its own **coarse cadence**,
+its result *held* between polls rather than re-polled every cycle — because the driver produces a
+new per-process sample only every fraction of a second and retains several seconds of them, so a
+poll spaced well inside that retention drains the whole backlog losslessly. The governing goal is
+*which* processes are (ab)using the GPU, not a precise instantaneous per-unit figure, so holding a
+reading for a second or two is imperceptible while cutting the busy-poll rate several-fold. The
+held reading is forced to a true zero the moment the device reads idle, so a process that stops is
+never shown lingering. The poll reads NVML's general per-process query, not its
+virtualization-oriented one: the two cost the same, but the general call is specified for
+concurrent processes while the older one assumes a single tenant — so the older call is kept only
+as a fallback where the newer symbol is absent.
+
+The gate is **device utilization, not client CPU activity** — a deliberate departure from the
+first instinct. A desktop GPU client (a browser, a compositor) is almost always CPU-busy even
+when it renders nothing, so a CPU gate would essentially never let the poll be skipped; and a
+long compute kernel runs the GPU flat-out while its host thread blocks at ~0% CPU, which a CPU
+gate would wrongly read as idle and zero. Device utilization is one cheap counter read that is
+needed for the system bar anyway and answers exactly the right question — *is the GPU doing
+anything* — for both cases. An unreadable device counts as active, so the poll is never gated on
+an unknown. Because the utilization API is timestamp-based (it returns everything since the last
+observed sample), skipped cycles — whether gated away as idle or merely between coarse polls —
+lose no data: the next poll drains the backlog since the last one.
+Utilization sums across devices for a client spanning more than one GPU; VRAM is per-device max
+(compute and graphics lists double-report one context) then summed across devices. Idle steady
+state therefore costs only the coarse client refresh; an active GPU pays the utilization poll only
+on its own coarse cadence, which is all the per-process breakdown needs.
 
 ## Dependencies
 

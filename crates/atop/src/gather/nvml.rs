@@ -8,7 +8,26 @@ use std::ffi::{c_char, c_uint, c_void};
 use std::mem;
 use std::ptr;
 
+use crate::fxhash::PidMap;
 use crate::procs::{GpuMetric, GpuMetrics, GpuProcessStats, SystemStats, VramStats};
+
+/// Coarse cadence, in cycles, for the GPU process-list + VRAM refresh. The client set and each
+/// client's framebuffer footprint change slowly, and enumerating them is the second-largest NVML
+/// cost, so re-reading every cycle is waste; ~8 cycles ≈ 4 s at the gather interval. A GPU
+/// process born between refreshes is invisible until the next one — a brief, acceptable delay.
+const CLIENT_REFRESH_CYCLES: u64 = 8;
+
+/// Cadence, in cycles, of the expensive per-process utilization poll. That call is a ~1 ms
+/// GSP busy-poll (it round-trips to the GPU's processor for fresh perfmon samples), so running
+/// it every cycle dominated the profile. Two measured driver constants make a coarser poll
+/// lossless: the driver produces a new per-process sample only every ~200 ms, and it retains
+/// several seconds of them, drained by `last_seen_timestamp`. So a ~2 s poll (4 cycles at the
+/// 500 ms gather interval) still reads the full backlog while cutting the busy-poll rate 4×.
+/// Utilization is *held* between polls (like VRAM); the goal is ranking GPU users, for which
+/// ~2 s staleness is imperceptible. A client-list rebuild resets held utilization, so a poll is
+/// forced on any cycle that rebuilds (see `sample`) regardless of this cadence — the two are
+/// independent by construction, not by a numeric relationship between the two periods.
+const PROCESS_UTIL_REFRESH_CYCLES: u64 = 4;
 
 type Return = c_uint;
 type Device = *mut c_void;
@@ -26,6 +45,7 @@ type UtilFn = unsafe extern "C" fn(Device, *mut Utilization) -> Return;
 type MemoryFn = unsafe extern "C" fn(Device, *mut Memory) -> Return;
 type ProcessUtilFn =
     unsafe extern "C" fn(Device, *mut ProcessUtilSample, *mut c_uint, u64) -> Return;
+type ProcessesUtilInfoFn = unsafe extern "C" fn(Device, *mut ProcessesUtilInfo) -> Return;
 type ProcessListV2Fn = unsafe extern "C" fn(Device, *mut c_uint, *mut ProcessInfoV2) -> Return;
 type ProcessListV1Fn = unsafe extern "C" fn(Device, *mut c_uint, *mut ProcessInfoV1) -> Return;
 type CloseFn = unsafe extern "C" fn(*mut c_void) -> libc::c_int;
@@ -56,6 +76,39 @@ struct ProcessUtilSample {
     dec_util: c_uint,
 }
 
+/// `nvmlProcessUtilizationInfo_v1_t` — one element of the Device-Queries plural utilization
+/// array. A superset of the GRID `ProcessUtilSample` (adds jpg/ofa engines); `repr(C)` trailing
+/// padding brings it to the 40 bytes NVML strides by.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcessUtilInfo {
+    timestamp: u64,
+    pid: c_uint,
+    sm_util: c_uint,
+    mem_util: c_uint,
+    enc_util: c_uint,
+    dec_util: c_uint,
+    jpg_util: c_uint,
+    ofa_util: c_uint,
+}
+
+/// `nvmlProcessesUtilizationInfo_v1_t` — the versioned container passed to
+/// `nvmlDeviceGetProcessesUtilizationInfo`: the caller sets `version`, the array capacity, and
+/// the backlog cursor; NVML fills the array and writes back the actual count.
+#[repr(C)]
+struct ProcessesUtilInfo {
+    version: c_uint,
+    process_samples_count: c_uint,
+    last_seen_timestamp: u64,
+    proc_util_array: *mut ProcessUtilInfo,
+}
+
+/// `NVML_STRUCT_VERSION(ProcessesUtilizationInfo, 1)` = struct size, with the version in the top
+/// byte. Derived from `size_of` so it stays correct across pointer widths.
+#[allow(clippy::cast_possible_truncation)] // struct size is a small compile-time constant (24)
+const PROCESSES_UTIL_INFO_V1: c_uint =
+    (mem::size_of::<ProcessesUtilInfo>() as c_uint) | (1u32 << 24);
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct ProcessInfoV1 {
@@ -78,13 +131,24 @@ enum ProcessListFn {
     V1(ProcessListV1Fn),
 }
 
+/// The per-process utilization entry point, resolved preferring the general Device-Queries API
+/// over the GRID one. Both cost the same ~1 ms GSP poll, but the Device-Queries call is
+/// multi-process-correct and reports extra engines, whereas the GRID call is documented as
+/// single-process-oriented; the GRID call is kept only as a fallback for drivers too old to
+/// export the newer symbol.
+#[derive(Clone, Copy)]
+enum ProcessUtil {
+    Info(ProcessesUtilInfoFn),
+    Samples(ProcessUtilFn),
+}
+
 struct NvmlApi {
     library: *mut c_void,
     close: CloseFn,
     shutdown: ShutdownFn,
     device_get_utilization: Option<UtilFn>,
     device_get_memory: Option<MemoryFn>,
-    process_get_utilization: Option<ProcessUtilFn>,
+    process_get_utilization: Option<ProcessUtil>,
     compute_processes: Option<ProcessListFn>,
     graphics_processes: Option<ProcessListFn>,
 }
@@ -137,10 +201,9 @@ impl NvmlApi {
                 // The original memory ABI is stable and avoids a version-tagged structure.
                 // SAFETY: optional symbol signature matches nvml.h.
                 device_get_memory: unsafe { symbol(library, c"nvmlDeviceGetMemoryInfo") },
-                // SAFETY: optional symbol signature matches nvml.h.
-                process_get_utilization: unsafe {
-                    symbol(library, c"nvmlDeviceGetProcessUtilization")
-                },
+                // Prefer the general Device-Queries API; fall back to the GRID one on old drivers.
+                // SAFETY: optional symbol signatures match nvml.h.
+                process_get_utilization: unsafe { load_process_util(library) },
                 // Prefer the current v3 entry point. Its public parameter remains
                 // `nvmlProcessInfo_t` (the v2 layout), then fall back through older ABIs.
                 compute_processes: unsafe {
@@ -234,6 +297,18 @@ unsafe fn symbol_any<T: Copy>(library: *mut c_void, names: &[&std::ffi::CStr]) -
     })
 }
 
+/// Resolve the per-process utilization entry point, preferring the Device-Queries plural API and
+/// falling back to the GRID one (see [`ProcessUtil`]).
+unsafe fn load_process_util(library: *mut c_void) -> Option<ProcessUtil> {
+    // SAFETY: names correspond to these exact public ABIs.
+    unsafe { symbol::<ProcessesUtilInfoFn>(library, c"nvmlDeviceGetProcessesUtilizationInfo") }
+        .map(ProcessUtil::Info)
+        .or_else(|| {
+            unsafe { symbol::<ProcessUtilFn>(library, c"nvmlDeviceGetProcessUtilization") }
+                .map(ProcessUtil::Samples)
+        })
+}
+
 unsafe fn load_process_list(
     library: *mut c_void,
     v3: &std::ffi::CStr,
@@ -260,17 +335,43 @@ struct PidMemory {
     available: bool,
 }
 
+/// Per-client GPU state held across cycles. Both fields are *held* between the coarse refreshes
+/// that produce them, because both read data that moves slower than the gather interval. `vram`
+/// is refreshed on the client-list cadence — a client whose GPU is idle still owns its
+/// framebuffer. `util_bp` is refreshed on the (finer) per-process utilization cadence and held
+/// between those polls; it is forced to a true zero whenever the device reads idle, since then
+/// there is genuinely nothing running to attribute.
+#[derive(Clone, Copy, Default)]
+struct ClientGpu {
+    vram: GpuMetric<u64>,
+    util_bp: GpuMetric<u32>,
+}
+
 /// Runtime NVML sampler. It is constructed only when initialization and fixed startup device
 /// discovery both succeed.
 pub(crate) struct NvmlSampler {
     api: NvmlApi,
     devices: Vec<DeviceState>,
+    /// Normalized per-device utilization samples, reused across polls (the aggregation input,
+    /// filled by whichever underlying API `ProcessUtil` resolved to).
     util_samples: Vec<ProcessUtilSample>,
+    /// Raw scratch for the Device-Queries plural array, reused across polls.
+    util_info: Vec<ProcessUtilInfo>,
     process_v2: Vec<ProcessInfoV2>,
     process_v1: Vec<ProcessInfoV1>,
     pid_memory: Vec<PidMemory>,
     empty_devices: Vec<u32>,
     empty_devices_available: bool,
+    /// Known GPU clients (from the last coarse process-list refresh) → held VRAM + this cycle's
+    /// utilization. Materialized into the sparse per-process view each cycle.
+    clients: PidMap<ClientGpu>,
+    /// Monotonic sample counter. Both cadences are pure functions of it (`cycle % PERIOD == 0`),
+    /// so there is nothing to keep in phase; starts at 0 so the first sample both refreshes and
+    /// polls.
+    cycle: u64,
+    /// A coarse refresh whose process-list query failed; retried next cycle regardless of the
+    /// cadence, so a transient NVML error costs at most one cycle rather than a full period.
+    refresh_pending: bool,
 }
 
 impl NvmlSampler {
@@ -286,11 +387,15 @@ impl NvmlSampler {
                 })
                 .collect(),
             util_samples: Vec::new(),
+            util_info: Vec::new(),
             process_v2: Vec::new(),
             process_v1: Vec::new(),
             pid_memory: Vec::new(),
             empty_devices: Vec::new(),
             empty_devices_available: false,
+            clients: PidMap::default(),
+            cycle: 0,
+            refresh_pending: false,
         })
     }
 
@@ -316,112 +421,181 @@ impl NvmlSampler {
         gpu: &mut GpuProcessStats,
     ) {
         sys.gpu_count = self.device_count();
-        self.sample_system(sys);
 
         if !self.process_available() {
+            // No per-process capability, hence no client set to gate on: sample device telemetry
+            // every cycle (as before) and leave the per-process view unavailable.
+            self.sample_device_util(sys);
+            self.sample_device_vram(sys);
             gpu.clear_unavailable();
             return;
         }
-        gpu.clear_available();
-        let util_ok = self.sample_process_utilization(procs, gpu);
-        let memory_ok = self.sample_process_memory(procs, gpu);
-        if !util_ok || !memory_ok {
-            gpu.clear_unavailable();
+
+        let cycle = self.cycle;
+        self.cycle = self.cycle.wrapping_add(1);
+
+        // Coarse cadence: rediscover the client set + per-client VRAM + device VRAM totals, all
+        // held between refreshes because they move slowly. A failed query arms `refresh_pending`
+        // so the next cycle retries instead of waiting a whole period. `rebuilt` records that the
+        // client set (and its held utilization) was just reset.
+        let rebuilt = if cycle.is_multiple_of(CLIENT_REFRESH_CYCLES) || self.refresh_pending {
+            if self.refresh_clients(sys) {
+                self.refresh_pending = false;
+                true
+            } else {
+                self.refresh_pending = true;
+                gpu.clear_unavailable();
+                return;
+            }
+        } else {
+            false
+        };
+
+        // Device utilization every cycle (a cheap counter read that also drives the system bar).
+        // `active` is the gate for the expensive per-process busy-poll: it is the *GPU-side*
+        // activity signal, not CPU, because a rendering-idle desktop client is still CPU-busy
+        // (CPU would never let us skip) while a long compute kernel runs GPU-busy at ~0% host CPU
+        // (CPU would wrongly zero it). An unreadable device counts as active (never gate on the
+        // unknown).
+        let active = self.sample_device_util(sys);
+
+        // Per-process utilization is held between polls (the poll is the ~1 ms GSP busy-poll). A
+        // rebuild just reset every client's held value to a default, so a poll is forced whenever
+        // `rebuilt` — that coupling, not a numeric relationship between the two periods, is what
+        // guarantees a rebuilt client is refilled the same cycle.
+        if !active {
+            // Idle device → a genuine zero, refreshed every cycle (device util is already read,
+            // so this costs nothing and never holds a stale nonzero after work stops).
+            for client in self.clients.values_mut() {
+                client.util_bp = GpuMetric::Value(0);
+            }
+        } else if cycle.is_multiple_of(PROCESS_UTIL_REFRESH_CYCLES) || rebuilt {
+            // Poll cycle → reset first so a client that went quiet since the last poll decays to
+            // zero, then drain the backlog since each device's `last_seen_timestamp`.
+            for client in self.clients.values_mut() {
+                client.util_bp = GpuMetric::Value(0);
+            }
+            if !self.sample_process_util() {
+                gpu.clear_unavailable();
+                return;
+            }
         }
+        // Active but between polls: hold the last polled utilization.
+
+        gpu.clear_available();
+        self.materialize(procs, gpu);
     }
 
-    fn sample_system(&self, sys: &mut SystemStats) {
-        let mut gpu_util_bp: Option<u32> = self.api.device_get_utilization.map(|_| 0);
-        let mut vram = self.api.device_get_memory.map(|_| VramStats::default());
-
+    /// Sum per-device SM utilization into the system bar and report whether any device is doing
+    /// work. A device that fails to read is treated as active (do not gate on an unknown) and
+    /// nulls the bar total, matching the prior all-or-nothing system semantics.
+    fn sample_device_util(&self, sys: &mut SystemStats) -> bool {
+        let Some(get) = self.api.device_get_utilization else {
+            sys.gpu_util_bp = None;
+            return true; // cannot measure GPU activity → never gate the per-process poll away
+        };
+        let mut total = Some(0u32);
+        let mut active = false;
         for device in &self.devices {
-            if let Some(get) = self.api.device_get_utilization {
-                let mut util = Utilization::default();
-                // SAFETY: handle was discovered at startup; output lives for the call.
-                if unsafe { get(device.handle, &raw mut util) } == SUCCESS {
-                    if let Some(total) = &mut gpu_util_bp {
-                        *total = total.saturating_add(util.gpu.saturating_mul(100));
-                    }
-                } else {
-                    gpu_util_bp = None;
+            let mut util = Utilization::default();
+            // SAFETY: handle was discovered at startup; output lives for the call.
+            if unsafe { get(device.handle, &raw mut util) } == SUCCESS {
+                if util.gpu > 0 {
+                    active = true;
                 }
-            }
-            if let Some(get) = self.api.device_get_memory {
-                let mut memory = Memory::default();
-                // SAFETY: handle was discovered at startup; output lives for the call.
-                if unsafe { get(device.handle, &raw mut memory) } == SUCCESS {
-                    if let Some(total) = &mut vram {
-                        total.total = total.total.saturating_add(memory.total);
-                        total.used = total.used.saturating_add(memory.used);
-                    }
-                } else {
-                    vram = None;
+                if let Some(t) = &mut total {
+                    *t = t.saturating_add(util.gpu.saturating_mul(100));
                 }
+            } else {
+                total = None;
+                active = true;
             }
         }
-        sys.gpu_util_bp = gpu_util_bp;
+        sys.gpu_util_bp = total;
+        active
+    }
+
+    /// Sum per-device framebuffer totals into the system VRAM bar. Held between coarse refreshes.
+    fn sample_device_vram(&self, sys: &mut SystemStats) {
+        let Some(get) = self.api.device_get_memory else {
+            sys.vram = None;
+            return;
+        };
+        let mut vram = Some(VramStats::default());
+        for device in &self.devices {
+            let mut memory = Memory::default();
+            // SAFETY: handle was discovered at startup; output lives for the call.
+            if unsafe { get(device.handle, &raw mut memory) } == SUCCESS {
+                if let Some(v) = &mut vram {
+                    v.total = v.total.saturating_add(memory.total);
+                    v.used = v.used.saturating_add(memory.used);
+                }
+            } else {
+                vram = None;
+            }
+        }
         sys.vram = vram;
     }
 
-    fn sample_process_utilization(
-        &mut self,
-        procs: &[crate::procs::ProcessEntry],
-        gpu: &mut GpuProcessStats,
-    ) -> bool {
+    /// The expensive per-process utilization busy-poll. Runs only when a device is active and only
+    /// on the coarse utilization cadence. Each call retrieves every sample since the device's
+    /// `last_seen_timestamp`, so skipped cycles lose no data — the next call drains the backlog.
+    /// The two underlying APIs (`ProcessUtil::Info`/`Samples`) both fill the normalized
+    /// `util_samples`, so the aggregation — latest sample per PID, summed across a client's GPUs —
+    /// is shared.
+    fn sample_process_util(&mut self) -> bool {
         let Some(get) = self.api.process_get_utilization else {
             return false;
         };
         let mut complete = true;
-
-        for device in &mut self.devices {
-            match query_process_util(
-                get,
-                device.handle,
-                device.last_seen_timestamp,
-                &mut self.util_samples,
-            ) {
-                Ok(()) => {
-                    self.util_samples
-                        .sort_unstable_by_key(|s| (s.pid, s.timestamp));
-                    let mut i = 0;
-                    while i < self.util_samples.len() {
-                        let pid = self.util_samples[i].pid;
-                        let mut latest = self.util_samples[i];
-                        i += 1;
-                        while i < self.util_samples.len() && self.util_samples[i].pid == pid {
-                            latest = self.util_samples[i];
-                            i += 1;
-                        }
-                        device.last_seen_timestamp =
-                            device.last_seen_timestamp.max(latest.timestamp);
-                        if let Ok(row) = procs.binary_search_by_key(&pid, |p| p.pid) {
-                            gpu.add_live(
-                                procs[row].pid,
-                                GpuMetrics {
-                                    pct: GpuMetric::Value(latest.sm_util.saturating_mul(100)),
-                                    mem_bytes: GpuMetric::Value(0),
-                                },
-                            );
-                        }
-                    }
+        for idx in 0..self.devices.len() {
+            let handle = self.devices[idx].handle;
+            let last = self.devices[idx].last_seen_timestamp;
+            let ok = match get {
+                ProcessUtil::Info(f) => {
+                    query_util_info(f, handle, last, &mut self.util_info, &mut self.util_samples)
                 }
-                Err(()) => complete = false,
+                ProcessUtil::Samples(f) => {
+                    query_process_util(f, handle, last, &mut self.util_samples).is_ok()
+                }
+            };
+            if !ok {
+                complete = false;
+                continue;
+            }
+            self.util_samples
+                .sort_unstable_by_key(|s| (s.pid, s.timestamp));
+            let mut i = 0;
+            while i < self.util_samples.len() {
+                let pid = self.util_samples[i].pid;
+                let mut latest = self.util_samples[i];
+                i += 1;
+                while i < self.util_samples.len() && self.util_samples[i].pid == pid {
+                    latest = self.util_samples[i];
+                    i += 1;
+                }
+                self.devices[idx].last_seen_timestamp =
+                    self.devices[idx].last_seen_timestamp.max(latest.timestamp);
+                if let Some(client) = self.clients.get_mut(&pid) {
+                    let add = GpuMetric::Value(latest.sm_util.saturating_mul(100));
+                    client.util_bp = client.util_bp.saturating_add(add);
+                }
             }
         }
         complete
     }
 
-    fn sample_process_memory(
-        &mut self,
-        procs: &[crate::procs::ProcessEntry],
-        gpu: &mut GpuProcessStats,
-    ) -> bool {
+    /// Coarse rediscovery of the GPU client set and each client's held VRAM, plus the device
+    /// VRAM totals. Rebuilds [`clients`](Self::clients) from the compute + graphics process lists.
+    fn refresh_clients(&mut self, sys: &mut SystemStats) -> bool {
+        self.sample_device_vram(sys);
+        self.clients.clear();
         self.empty_devices.clear();
-        self.empty_devices_available =
-            self.api.compute_processes.is_some() && self.api.graphics_processes.is_some();
+        self.empty_devices_available = true;
         let (Some(compute), Some(graphics)) =
             (self.api.compute_processes, self.api.graphics_processes)
         else {
+            self.empty_devices_available = false;
             return false;
         };
 
@@ -466,25 +640,32 @@ impl NvmlSampler {
                     available &= self.pid_memory[i].available;
                     i += 1;
                 }
-                if let Ok(row) = procs.binary_search_by_key(&pid, |p| p.pid) {
-                    gpu.add_live(
-                        procs[row].pid,
-                        GpuMetrics {
-                            pct: GpuMetric::Value(0),
-                            mem_bytes: if available {
-                                GpuMetric::Value(bytes)
-                            } else {
-                                GpuMetric::Unknown
-                            },
-                        },
-                    );
-                }
+                let add = if available {
+                    GpuMetric::Value(bytes)
+                } else {
+                    GpuMetric::Unknown
+                };
+                let client = self.clients.entry(pid).or_default();
+                client.vram = client.vram.saturating_add(add);
             }
         }
-        if !complete {
-            return false;
+        complete
+    }
+
+    /// Publish the held client state into the sparse per-process view, filtered to PIDs live in
+    /// the current buffer — a client that died between coarse refreshes simply does not appear.
+    fn materialize(&self, procs: &[crate::procs::ProcessEntry], gpu: &mut GpuProcessStats) {
+        for (&pid, client) in &self.clients {
+            if procs.binary_search_by_key(&pid, |p| p.pid).is_ok() {
+                gpu.add_live(
+                    pid,
+                    GpuMetrics {
+                        pct: client.util_bp,
+                        mem_bytes: client.vram,
+                    },
+                );
+            }
         }
-        true
     }
 }
 
@@ -502,6 +683,54 @@ fn query_process_util(
         },
         true,
     )
+}
+
+/// Device-Queries plural utilization: fill `buf` (the versioned container's backing array) with
+/// samples since `last_seen` via the shared [`query_sized`] retry loop, then normalize into `out`
+/// for the aggregation shared with the singular path.
+fn query_util_info(
+    get: ProcessesUtilInfoFn,
+    device: Device,
+    last_seen: u64,
+    buf: &mut Vec<ProcessUtilInfo>,
+    out: &mut Vec<ProcessUtilSample>,
+) -> bool {
+    // The versioned-container ABI threads the element count through a struct field rather than a
+    // separate out-param, so bridge it into the shared sized-array helper: seed the current
+    // capacity into the struct before the call, hand the actual/required count back after.
+    let ok = query_sized(
+        buf,
+        |ptr, count| {
+            let mut info = ProcessesUtilInfo {
+                version: PROCESSES_UTIL_INFO_V1,
+                // SAFETY: `count` is the helper's live capacity cell.
+                process_samples_count: unsafe { *count },
+                last_seen_timestamp: last_seen,
+                proc_util_array: ptr,
+            };
+            // SAFETY: `version` is NVML's struct-version macro and the array is null or holds that
+            // many elements, exactly as the ABI requires.
+            let status = unsafe { get(device, &raw mut info) };
+            // SAFETY: same live cell; report the actual/required count to the helper.
+            unsafe { *count = info.process_samples_count };
+            status
+        },
+        true,
+    )
+    .is_ok();
+    if !ok {
+        return false;
+    }
+    out.clear();
+    out.extend(buf.iter().map(|p| ProcessUtilSample {
+        pid: p.pid,
+        timestamp: p.timestamp,
+        sm_util: p.sm_util,
+        mem_util: p.mem_util,
+        enc_util: p.enc_util,
+        dec_util: p.dec_util,
+    }));
+    true
 }
 
 fn query_process_list(
@@ -554,8 +783,14 @@ fn query_process_list(
     true
 }
 
+/// Ceiling on a driver-reported element count. No real GPU has anywhere near this many processes
+/// or buffered utilization samples; the cap turns an implausible or garbage count from the vendor
+/// library into a graceful failure instead of a multi-gigabyte allocation attempt.
+const MAX_QUERY_ELEMS: usize = 1 << 20;
+
 /// NVML's variable-array convention: null first call reports required count with
-/// `INSUFFICIENT_SIZE`; an already large high-water buffer usually completes in one call.
+/// `INSUFFICIENT_SIZE`; an already large high-water buffer usually completes in one call. The
+/// reported count is bounded by [`MAX_QUERY_ELEMS`] before it is trusted for an allocation.
 fn query_sized<T: Copy + Default>(
     buf: &mut Vec<T>,
     mut call: impl FnMut(*mut T, *mut c_uint) -> Return,
@@ -578,11 +813,13 @@ fn query_sized<T: Copy + Default>(
             unsafe { buf.set_len(len) };
             return Ok(());
         }
-        if status != ERROR_INSUFFICIENT_SIZE || count as usize <= buf.capacity() {
+        let needed = count as usize;
+        if status != ERROR_INSUFFICIENT_SIZE || needed <= buf.capacity() || needed > MAX_QUERY_ELEMS
+        {
             buf.clear();
             return Err(());
         }
-        buf.reserve(count as usize - buf.len());
+        buf.reserve(needed - buf.len());
     }
 }
 
@@ -637,6 +874,16 @@ mod tests {
         0
     }
 
+    // Benign lifecycle fns for tests that don't assert drop order (the drop-order asserts in
+    // `fake_shutdown`/`fake_close` are shared global state and would race across parallel tests).
+    unsafe extern "C" fn noop_shutdown() -> Return {
+        SUCCESS
+    }
+
+    unsafe extern "C" fn noop_close(_: *mut c_void) -> libc::c_int {
+        0
+    }
+
     fn device_index(device: Device) -> usize {
         device as usize - 1
     }
@@ -683,6 +930,32 @@ mod tests {
             });
             count.write(1);
         }
+        SUCCESS
+    }
+
+    /// Device-Queries plural equivalent of `fake_process_util`: same pid, timestamps and SM
+    /// utilization, exercised through the versioned container + sized-array protocol.
+    unsafe extern "C" fn fake_processes_util_info(
+        device: Device,
+        info: *mut ProcessesUtilInfo,
+    ) -> Return {
+        // SAFETY: the sampler always passes a live container.
+        let info = unsafe { &mut *info };
+        if info.proc_util_array.is_null() || info.process_samples_count == 0 {
+            info.process_samples_count = 1;
+            return ERROR_INSUFFICIENT_SIZE;
+        }
+        let index = device_index(device);
+        // SAFETY: the preceding size query requested one element.
+        unsafe {
+            info.proc_util_array.write(ProcessUtilInfo {
+                pid: 10,
+                timestamp: [11, 22][index],
+                sm_util: [20, 30][index],
+                ..ProcessUtilInfo::default()
+            });
+        }
+        info.process_samples_count = 1;
         SUCCESS
     }
 
@@ -776,7 +1049,7 @@ mod tests {
             shutdown: fake_shutdown,
             device_get_utilization: Some(fake_util),
             device_get_memory: Some(fake_memory),
-            process_get_utilization: Some(fake_process_util),
+            process_get_utilization: Some(ProcessUtil::Samples(fake_process_util)),
             compute_processes: Some(ProcessListFn::V2(fake_compute)),
             graphics_processes: Some(ProcessListFn::V2(fake_graphics)),
         };
@@ -793,11 +1066,15 @@ mod tests {
                 },
             ],
             util_samples: Vec::new(),
+            util_info: Vec::new(),
             process_v2: Vec::new(),
             process_v1: Vec::new(),
             pid_memory: Vec::new(),
             empty_devices: Vec::new(),
             empty_devices_available: false,
+            clients: PidMap::default(),
+            cycle: 0,
+            refresh_pending: false,
         }
     }
 
@@ -809,6 +1086,14 @@ mod tests {
         assert_eq!(mem::size_of::<ProcessInfoV2>(), 24);
         assert_eq!(mem::size_of::<ProcessUtilSample>(), 32);
         assert_eq!(mem::offset_of!(ProcessUtilSample, timestamp), 8);
+        // Device-Queries plural utilization ABI.
+        assert_eq!(mem::size_of::<ProcessUtilInfo>(), 40);
+        assert_eq!(mem::offset_of!(ProcessUtilInfo, pid), 8);
+        assert_eq!(mem::offset_of!(ProcessUtilInfo, sm_util), 12);
+        assert_eq!(mem::size_of::<ProcessesUtilInfo>(), 24);
+        assert_eq!(mem::offset_of!(ProcessesUtilInfo, last_seen_timestamp), 8);
+        assert_eq!(mem::offset_of!(ProcessesUtilInfo, proc_util_array), 16);
+        assert_eq!(PROCESSES_UTIL_INFO_V1, 0x0100_0018); // struct size 24, version 1 in top byte
     }
 
     #[test]
@@ -895,7 +1180,8 @@ mod tests {
         {
             let mut sampler = fake_sampler();
             sampler.api.device_get_utilization = Some(fake_util_partial);
-            sampler.api.process_get_utilization = Some(fake_process_util_partial);
+            sampler.api.process_get_utilization =
+                Some(ProcessUtil::Samples(fake_process_util_partial));
             let mut sys = SystemStats::default();
             let mut proc = ProcessEntry::TOMBSTONE;
             proc.pid = 10;
@@ -917,5 +1203,192 @@ mod tests {
             assert_eq!(sampler.empty_devices(), Some([0, 1].as_slice()));
         }
         assert_eq!(DROP_ORDER.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn idle_device_skips_per_process_poll_and_holds_vram() {
+        static UTIL_CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn idle_device_util(_: Device, out: *mut Utilization) -> Return {
+            // SAFETY: sampler passes a live output object. gpu = 0 → device idle.
+            unsafe { out.write(Utilization::default()) };
+            SUCCESS
+        }
+        unsafe extern "C" fn counting_process_util(
+            device: Device,
+            out: *mut ProcessUtilSample,
+            count: *mut c_uint,
+            last: u64,
+        ) -> Return {
+            UTIL_CALLS.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: forwards the exact ABI arguments to the complete fake.
+            unsafe { fake_process_util(device, out, count, last) }
+        }
+
+        UTIL_CALLS.store(0, Ordering::SeqCst);
+        let mut sampler = fake_sampler();
+        sampler.api.shutdown = noop_shutdown;
+        sampler.api.close = noop_close;
+        sampler.api.device_get_utilization = Some(idle_device_util);
+        sampler.api.process_get_utilization = Some(ProcessUtil::Samples(counting_process_util));
+        let mut sys = SystemStats::default();
+        let mut p10 = ProcessEntry::TOMBSTONE;
+        p10.pid = 10;
+        let procs = [p10];
+        let mut gpu = GpuProcessStats::default();
+        sampler.sample(&mut sys, &procs, &mut gpu);
+
+        // Device reads idle, so the expensive per-process busy-poll never ran, yet the coarse
+        // process-list still discovered the client's held VRAM (100 + 200 across the two GPUs)
+        // and its utilization is a true zero.
+        assert_eq!(
+            UTIL_CALLS.load(Ordering::SeqCst),
+            0,
+            "an idle device must not trigger the per-process utilization poll"
+        );
+        assert_eq!(sys.gpu_util_bp, Some(0));
+        assert_eq!(
+            gpu.live(10),
+            Some(GpuMetrics {
+                pct: GpuMetric::Value(0),
+                mem_bytes: GpuMetric::Value(300),
+            })
+        );
+        assert_eq!(sys.vram.map(|v| (v.used, v.total)), Some((300, 2_000)));
+    }
+
+    #[test]
+    fn process_list_refreshes_on_a_coarse_cadence() {
+        static LIST_CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn counting_compute(
+            device: Device,
+            count: *mut c_uint,
+            out: *mut ProcessInfoV2,
+        ) -> Return {
+            LIST_CALLS.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: forwards the exact ABI arguments to the complete fake.
+            unsafe { fake_compute(device, count, out) }
+        }
+
+        LIST_CALLS.store(0, Ordering::SeqCst);
+        let mut sampler = fake_sampler();
+        sampler.api.shutdown = noop_shutdown;
+        sampler.api.close = noop_close;
+        sampler.api.compute_processes = Some(ProcessListFn::V2(counting_compute));
+        let mut sys = SystemStats::default();
+        let mut p10 = ProcessEntry::TOMBSTONE;
+        p10.pid = 10;
+        let procs = [p10];
+        let mut gpu = GpuProcessStats::default();
+
+        sampler.sample(&mut sys, &procs, &mut gpu);
+        let after_first = LIST_CALLS.load(Ordering::SeqCst);
+        assert!(
+            after_first > 0,
+            "the first sample must discover the client set"
+        );
+
+        // The next full cadence of cycles reuses the held client set — no re-enumeration.
+        for _ in 0..CLIENT_REFRESH_CYCLES - 1 {
+            sampler.sample(&mut sys, &procs, &mut gpu);
+        }
+        assert_eq!(
+            LIST_CALLS.load(Ordering::SeqCst),
+            after_first,
+            "the process list must be held between coarse refreshes"
+        );
+
+        // One more cycle crosses the cadence boundary and refreshes again.
+        sampler.sample(&mut sys, &procs, &mut gpu);
+        assert!(
+            LIST_CALLS.load(Ordering::SeqCst) > after_first,
+            "the coarse cadence must re-enumerate after CLIENT_REFRESH_CYCLES"
+        );
+    }
+
+    #[test]
+    fn process_util_polls_on_coarse_cadence_and_holds_between() {
+        static UTIL_POLLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn counting_util(
+            device: Device,
+            out: *mut ProcessUtilSample,
+            count: *mut c_uint,
+            last: u64,
+        ) -> Return {
+            // Count only the real fill, not the null size-probe, so one increment == one device poll.
+            if !out.is_null() {
+                UTIL_POLLS.fetch_add(1, Ordering::SeqCst);
+            }
+            // SAFETY: forwards the exact ABI arguments to the complete fake.
+            unsafe { fake_process_util(device, out, count, last) }
+        }
+
+        UTIL_POLLS.store(0, Ordering::SeqCst);
+        let mut sampler = fake_sampler();
+        sampler.api.shutdown = noop_shutdown;
+        sampler.api.close = noop_close;
+        sampler.api.process_get_utilization = Some(ProcessUtil::Samples(counting_util));
+        let mut sys = SystemStats::default();
+        let mut p10 = ProcessEntry::TOMBSTONE;
+        p10.pid = 10;
+        let procs = [p10];
+        let mut gpu = GpuProcessStats::default();
+
+        // First (active) cycle polls the per-process utilization.
+        sampler.sample(&mut sys, &procs, &mut gpu);
+        let after_first = UTIL_POLLS.load(Ordering::SeqCst);
+        assert!(
+            after_first > 0,
+            "the first sample must poll per-process utilization"
+        );
+        assert_eq!(gpu.live(10).map(|m| m.pct), Some(GpuMetric::Value(5_000)));
+
+        // The rest of the cadence window reuses the held value — no new polls, still materialized.
+        for _ in 0..PROCESS_UTIL_REFRESH_CYCLES - 1 {
+            sampler.sample(&mut sys, &procs, &mut gpu);
+        }
+        assert_eq!(
+            UTIL_POLLS.load(Ordering::SeqCst),
+            after_first,
+            "utilization is held between polls, not re-polled every cycle"
+        );
+        assert_eq!(
+            gpu.live(10).map(|m| m.pct),
+            Some(GpuMetric::Value(5_000)),
+            "the held utilization is still materialized on non-poll cycles"
+        );
+
+        // Crossing the cadence boundary re-polls (reset-then-fill, so a quiet client would decay).
+        sampler.sample(&mut sys, &procs, &mut gpu);
+        assert!(
+            UTIL_POLLS.load(Ordering::SeqCst) > after_first,
+            "the poll re-runs after PROCESS_UTIL_REFRESH_CYCLES"
+        );
+    }
+
+    #[test]
+    fn device_queries_plural_util_path_aggregates_like_grid() {
+        // The preferred Device-Queries API (versioned container + sized array) must produce the
+        // same per-client aggregation as the GRID path: pid 10 summed across both GPUs to 5000.
+        let mut sampler = fake_sampler();
+        sampler.api.shutdown = noop_shutdown;
+        sampler.api.close = noop_close;
+        sampler.api.process_get_utilization = Some(ProcessUtil::Info(fake_processes_util_info));
+        let mut sys = SystemStats::default();
+        let mut p10 = ProcessEntry::TOMBSTONE;
+        p10.pid = 10;
+        let procs = [p10];
+        let mut gpu = GpuProcessStats::default();
+
+        sampler.sample(&mut sys, &procs, &mut gpu);
+
+        assert_eq!(
+            gpu.live(10),
+            Some(GpuMetrics {
+                pct: GpuMetric::Value(5_000),
+                mem_bytes: GpuMetric::Value(300),
+            })
+        );
+        assert_eq!(sampler.devices[0].last_seen_timestamp, 11);
+        assert_eq!(sampler.devices[1].last_seen_timestamp, 22);
     }
 }

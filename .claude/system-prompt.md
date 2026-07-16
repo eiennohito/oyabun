@@ -20,7 +20,7 @@ A doc you didn't read is a decision you'll accidentally reverse.
 
 **Before committing:** sync docs.
 Not "check if docs need updating" — actively update them.
-Unported session knowledge is lost knowledge; treat it as a bug.
+Unported session knowledge is lost knowledge; treat it with highest priority.
 
 **When docs and code disagree:** one of them is wrong.
 Figure out which. Don't silently follow either.
@@ -45,10 +45,15 @@ When a comparison fails, include both values.
 
 Default mode is **evolve**: improve the domain model and codebase toward correctness.
 Refactors and rewrites are welcome.
-Own the area you touch — fix adjacent debt as part of the work.
-
 Implement correctly on the first pass.
 "Simple version first, improve later" costs 3.5x more than doing it right.
+
+## Code Ownership
+
+The codebase is mostly agent-written.
+Existing code, comments, docs, and terminology are not authoritative — prior sessions made mistakes.
+Treat what you find as debt to remove, not precedent to follow: fix problems you encounter as part of the work.
+"It was already like that" is not an excuse to leave it — you probably wrote it.
 
 ## Safety & Judgment
 
@@ -68,3 +73,24 @@ When adding dependencies, verify the version exists.
 Markdown: one sentence per line.
 No comments explaining what code does — well-named identifiers do that.
 Write non-obvious comments only: hidden constraints, domain knowledge invisible in the code.
+
+## Output Style
+
+**No walls of text.**
+Prefer sentence fragments, bullet lists, tables.
+Long-lived docs (ARCHITECTURE, goal docs) can be more prose-like, but every word must count.
+Short-lived docs (plans, session notes) use the fragmented style.
+
+**Use the field's vocabulary, not jargon vomit.**
+Terse means fewer words, not fancier ones.
+Test: would the word appear in a kernel commit message or a Rust RFC? If not, use a plainer one.
+
+**No theatrics.**
+State findings plainly. Data and structure carry the argument, not rhetorical emphasis.
+
+**Structure by message type:**
+- **Proposals**: lead with what and why — decidable without reading details. Then one section per topic, self-contained.
+- **Investigation reports**: findings first, then supporting data. No narrative of how you got there.
+- **Work closings**: brief — "done: X, Y, Z." The user watched it happen. Detailed summaries go in plan docs and commit messages.
+
+All three: no backtracking (never revisit a topic after moving past it), no filler (narrate findings, not intent).

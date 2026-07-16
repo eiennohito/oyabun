@@ -18,6 +18,7 @@ use std::os::fd::RawFd;
 use super::config::STAT_SLOT;
 use super::parse;
 use crate::fxhash::PidMap;
+use crate::log::debug_log;
 use crate::procs::Procs;
 use crate::sys::ProcPath;
 
@@ -188,12 +189,11 @@ fn fill_stat(
     // SAFETY: scratch is a valid writable region; fd is open.
     let n = unsafe { libc::read(fd, scratch.as_mut_ptr().cast(), scratch.len()) };
     if n <= 0 {
-        #[cfg(debug_assertions)]
-        {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            let pid = procs.as_slice().get(idx).map_or(0, |p| p.pid);
-            eprintln!("[syscall] fill_stat failed: pid={pid} fd={fd} n={n} errno={errno}");
-        }
+        debug_log!(
+            "[syscall] fill_stat failed: pid={} fd={fd} n={n} errno={}",
+            procs.as_slice().get(idx).map_or(0, |p| p.pid),
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        );
         return None;
     }
     let len = usize::try_from(n).unwrap_or(0).min(scratch.len());

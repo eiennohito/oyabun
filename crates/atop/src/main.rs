@@ -3,6 +3,7 @@ mod application;
 mod fxhash;
 mod gather;
 mod identity;
+mod log;
 mod palette;
 mod procs;
 mod sys;
@@ -46,6 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = run(display, app);
 
     restore_terminal()?;
+    if let Some(path) = log::log_path() {
+        eprintln!("debug log: {}", path.display());
+    }
     result
 }
 

@@ -11,6 +11,7 @@ use super::source::{CycleResult, Source, SourceCtx};
 use super::syscall::SyscallBackend;
 use super::table::PidIndex;
 use super::uring::UringBackend;
+use crate::log::debug_log;
 use crate::procs::Procs;
 use crate::sys::{self, ProcDir};
 
@@ -134,14 +135,16 @@ impl ProcSource {
         // Before compact: rows with real PIDs but unfilled (state='?' = TOMBSTONE default) are
         // rows `fill` never submitted a read for AND never tombstoned.
         #[cfg(debug_assertions)]
-        {
-            for (i, r) in procs.as_slice().iter().enumerate() {
-                if r.pid != 0 && r.state == b'?' {
-                    eprintln!(
-                        "[UNFILLED] idx={i} pid={} ppid={} state=? mem={} ticks={} start_time={}",
-                        r.pid, r.ppid, r.mem_bytes, r.ticks, r.start_time,
-                    );
-                }
+        for (i, r) in procs.as_slice().iter().enumerate() {
+            if r.pid != 0 && r.state == b'?' {
+                debug_log!(
+                    "[UNFILLED] idx={i} pid={} ppid={} state=? mem={} ticks={} start_time={}",
+                    r.pid,
+                    r.ppid,
+                    r.mem_bytes,
+                    r.ticks,
+                    r.start_time,
+                );
             }
         }
 
@@ -196,12 +199,9 @@ impl ProcSource {
         for cand in anchor.saturating_add(1)..=hi {
             self.pids.push(cand);
         }
-        #[cfg(debug_assertions)]
-        {
-            let n_added = hi.saturating_sub(anchor);
-            if n_added > 0 {
-                eprintln!("[probe] anchor={anchor} frontier={frontier} hi={hi} added={n_added}");
-            }
+        let n_added = hi.saturating_sub(anchor);
+        if n_added > 0 {
+            debug_log!("[probe] anchor={anchor} frontier={frontier} hi={hi} added={n_added}");
         }
     }
 

@@ -16,6 +16,7 @@ use zerocopy::FromBytes;
 use super::super::source::{CycleResult, Source, SourceCtx};
 use super::types::{EVENT_FORK, EVENT_FREE, ProcEvent, TaskInfo};
 use crate::fxhash::{FxBuildHasher, FxMap};
+use crate::log::debug_log;
 use crate::procs::{ProcessEntry, Procs};
 
 /// The committed BPF object — sources in `bpf/`, rebuilt via `just bpf`. Embedded so a normal
@@ -116,9 +117,11 @@ impl BpfSource {
         match Self::load(arena, page_size, clk_tck) {
             Ok(src) => Some(src),
             Err(e) => {
-                if std::env::var_os("ATOP_FORCE_BPF").is_some() || cfg!(debug_assertions) {
+                if std::env::var_os("ATOP_FORCE_BPF").is_some() {
+                    // Before UI init — stderr is safe here.
                     eprintln!("atop: privileged BPF mode unavailable, using /proc: {e}");
                 }
+                debug_log!("privileged BPF mode unavailable, using /proc: {e}");
                 None
             }
         }
@@ -285,9 +288,7 @@ impl BpfSource {
         let mut file = match self.open_iter() {
             Ok(f) => f,
             Err(e) => {
-                if cfg!(debug_assertions) {
-                    eprintln!("atop: task-iter attach failed: {e}");
-                }
+                debug_log!("task-iter attach failed: {e}");
                 return 0;
             }
         };

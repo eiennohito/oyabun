@@ -39,6 +39,7 @@ use super::config::STAT_SLOT;
 use super::parse;
 use super::syscall::read_transient;
 use crate::fxhash::PidMap;
+use crate::log::debug_log;
 use crate::procs::Procs;
 use crate::sys::{self, ProcPath};
 
@@ -282,10 +283,10 @@ impl UringBackend {
                 &mut self.stat_path,
                 scratch,
             ) {
-                #[cfg(debug_assertions)]
-                eprintln!(
+                debug_log!(
                     "[uring] reopen transient failed: pid={} idx={}",
-                    job.pid, job.pid_idx
+                    job.pid,
+                    job.pid_idx
                 );
                 procs.tombstone(job.pid_idx);
             }
@@ -294,8 +295,7 @@ impl UringBackend {
             let (idx, pid) = self.overflow_buf[i];
             let scratch = self.read_pad.slice_mut(scratch_off, STAT_SLOT);
             if !read_transient(pid, idx, procs, page_size, &mut self.stat_path, scratch) {
-                #[cfg(debug_assertions)]
-                eprintln!("[uring] overflow transient failed: pid={pid} idx={idx}");
+                debug_log!("[uring] overflow transient failed: pid={pid} idx={idx}");
                 procs.tombstone(idx);
             }
         }
@@ -398,8 +398,7 @@ impl UringBackend {
                 // fd-pool exhausted (not pad-full — `read_free` still has slots here):
                 // this PID gets no persistent descriptor, so defer it to the transient
                 // overflow pass. `*next` advances — overflow is a real disposition, not a retry.
-                #[cfg(debug_assertions)]
-                eprintln!(
+                debug_log!(
                     "[uring] overflow: pid={pid} idx={idx} held={} free_fixed=0",
                     self.held.len()
                 );
@@ -480,10 +479,10 @@ impl UringBackend {
                         // 1. PID cross-check: the stat line's PID must match what we
                         //    asked for. A mismatch means the read hit a stale fd.
                         if f.parsed_pid != ctx.pid {
-                            #[cfg(debug_assertions)]
-                            eprintln!(
+                            debug_log!(
                                 "[uring] PID MISMATCH: expected={} parsed={} fixed={fixed}",
-                                ctx.pid, f.parsed_pid,
+                                ctx.pid,
+                                f.parsed_pid,
                             );
                             self.held.remove(&ctx.pid);
                             let _ = self.ring.submitter().register_files_update(fixed, &[-1]);
@@ -507,8 +506,7 @@ impl UringBackend {
                     }
                     f.write_into(procs.row_mut(idx), page_size, slot);
                 } else {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
+                    debug_log!(
                         "[uring] parse failed: pid={} len={} first_bytes={:?}",
                         ctx.pid,
                         ctx.stat_len,
@@ -519,10 +517,10 @@ impl UringBackend {
                 self.read_free.push(ctx.read_slot);
             } else if ctx.open_failed {
                 // New PID vanished before open — slot never installed.
-                #[cfg(debug_assertions)]
-                eprintln!(
+                debug_log!(
                     "[uring] open failed: pid={} fixed={fixed} open_res={}",
-                    ctx.pid, ctx.open_res,
+                    ctx.pid,
+                    ctx.open_res,
                 );
                 self.held.remove(&ctx.pid);
                 self.free_fixed.push(fixed);
@@ -530,10 +528,11 @@ impl UringBackend {
                 procs.tombstone(idx);
             } else {
                 // Installed fd read failed — log the raw CQE result for diagnosis.
-                #[cfg(debug_assertions)]
-                eprintln!(
+                debug_log!(
                     "[uring] read failed: pid={} fixed={fixed} res={} open_failed={}",
-                    ctx.pid, ctx.read_res, ctx.open_failed,
+                    ctx.pid,
+                    ctx.read_res,
+                    ctx.open_failed,
                 );
                 let _ = self.ring.submitter().register_files_update(fixed, &[-1]);
                 self.held.remove(&ctx.pid);

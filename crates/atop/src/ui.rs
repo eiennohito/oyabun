@@ -92,11 +92,18 @@ pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
     let overflow = app.pool_overflow();
     let privileged = app.is_privileged();
     let short_lived = app.short_lived();
+    let log_path = crate::log::log_path();
     // Gate on every value the footer shows, so a change in any of them repaints it.
     frame.line(
         footer_row,
-        (row_count, overflow, privileged, short_lived),
-        |l| build_footer(l, row_count, overflow, privileged, short_lived),
+        (
+            row_count,
+            overflow,
+            privileged,
+            short_lived,
+            log_path.is_some(),
+        ),
+        |l| build_footer(l, row_count, overflow, privileged, short_lived, log_path),
     );
 }
 
@@ -290,6 +297,7 @@ fn build_footer(
     pool_overflow: u32,
     privileged: bool,
     short_lived: u32,
+    log_path: Option<&std::path::Path>,
 ) {
     // Mode tag: which observation source is live (BPF privileged vs /proc).
     let (tag, tag_color) = if privileged {
@@ -314,6 +322,9 @@ fn build_footer(
     // Short-lived processes caught only by the BPF fork/exit events this cycle.
     if short_lived > 0 {
         l.span(&format!(" [+{short_lived} short-lived]"), palette::NOTICE);
+    }
+    if let Some(path) = log_path {
+        l.span(&format!(" [log: {}]", path.display()), palette::FOOTER);
     }
     l.fill(' ');
 }

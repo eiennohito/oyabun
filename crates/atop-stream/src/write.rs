@@ -34,18 +34,28 @@ impl SystemStats {
     pub(crate) fn write_header(self, out: &mut String, wall_ns: u64) {
         let _ = writeln!(
             out,
-            "cycle {}ns cores={} mem={} mem_used={} mem_cached={} swap_total={} swap_used={} \
-             cpu_user={} cpu_sys={} cpu_iowait={} load={},{},{} uptime={}",
+            "cycle {}ns cores={} \
+             stat_user={} stat_nice={} stat_system={} stat_idle={} \
+             stat_iowait={} stat_irq={} stat_softirq={} stat_steal={} \
+             mem={} mem_available={} mem_buffers={} mem_cached={} \
+             swap_total={} swap_free={} \
+             load={},{},{} uptime={}",
             wall_ns,
             self.num_cores,
+            self.stat_user,
+            self.stat_nice,
+            self.stat_system,
+            self.stat_idle,
+            self.stat_iowait,
+            self.stat_irq,
+            self.stat_softirq,
+            self.stat_steal,
             self.mem_total,
-            self.mem_used,
+            self.mem_available,
+            self.mem_buffers,
             self.mem_cached,
             self.swap_total,
-            self.swap_used,
-            self.cpu_user_bp,
-            self.cpu_sys_bp,
-            self.cpu_iowait_bp,
+            self.swap_free,
             self.load[0],
             self.load[1],
             self.load[2],

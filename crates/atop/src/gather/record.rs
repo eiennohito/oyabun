@@ -11,7 +11,8 @@ use atop_stream::{
 
 use super::table::ProcTable;
 use crate::identity::ProcMeta;
-use crate::procs::{ProcessEntry, SystemStats};
+use crate::procs::ProcessEntry;
+use crate::sys::RawSystemSnapshot;
 
 pub(crate) struct Recorder {
     file: BufWriter<File>,
@@ -32,7 +33,7 @@ impl Recorder {
     pub(crate) fn record(
         &mut self,
         now: Instant,
-        sys: &SystemStats,
+        raw_sys: &RawSystemSnapshot,
         procs: &[ProcessEntry],
         table: &ProcTable,
     ) {
@@ -43,7 +44,7 @@ impl Recorder {
 
         let mut cycle = CycleEvent {
             wall_ns,
-            sys: convert_sys(*sys),
+            sys: convert_sys(raw_sys),
             procs: Vec::with_capacity(procs.len()),
         };
         for proc in procs {
@@ -89,20 +90,8 @@ fn open_recording(path: &std::path::Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn convert_sys(sys: SystemStats) -> StreamSystemStats {
-    StreamSystemStats {
-        cpu_user_bp: sys.cpu_user_bp,
-        cpu_sys_bp: sys.cpu_sys_bp,
-        cpu_iowait_bp: sys.cpu_iowait_bp,
-        mem_total: sys.mem_total,
-        mem_used: sys.mem_used,
-        mem_cached: sys.mem_cached,
-        swap_total: sys.swap_total,
-        swap_used: sys.swap_used,
-        load: sys.load,
-        uptime_secs: sys.uptime_secs,
-        num_cores: sys.num_cores,
-    }
+fn convert_sys(snap: &RawSystemSnapshot) -> StreamSystemStats {
+    snap.to_stream(crate::sys::num_cpus())
 }
 
 fn convert_proc(proc: &ProcessEntry) -> RawProc {

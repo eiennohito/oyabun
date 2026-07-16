@@ -20,7 +20,7 @@ use super::sysstat::SystemSampler;
 use super::table::{ProcReader, ProcTable, RealProcReader, cmdline_refresh_n};
 use crate::identity::{IdentityResolver, ProcessIdentity};
 use crate::procs::{GpuMetrics, GpuProcessStats, NONE, ProcessEntry, Procs, SystemStats};
-use crate::sys::{ProcDir, clk_tck};
+use crate::sys::{self, ProcDir, RawSystemSnapshot, clk_tck};
 use crate::tree;
 
 /// Where the live process rows come from. Selected once at startup ([`Gatherer::with_source`]):
@@ -104,12 +104,12 @@ impl ObservationSource {
     }
 
     #[cfg(test)]
-    fn replay_sys(&self) -> Option<SystemStats> {
+    fn replay_snapshot(&self) -> Option<(RawSystemSnapshot, u32)> {
         match self {
             ObservationSource::Proc(_) => None,
             #[cfg(feature = "bpf")]
             ObservationSource::Bpf(_) => None,
-            ObservationSource::Replay(r) => Some(r.sys()),
+            ObservationSource::Replay(r) => Some((r.raw_snapshot(), r.num_cores())),
         }
     }
 }
@@ -401,23 +401,27 @@ impl Gatherer {
         self.pool_overflow = result.pool_overflow;
         self.short_lived = result.short_lived;
 
-        // System CPU/memory plus optional GPU telemetry. Replay streams carry their own system
-        // stats; live sources read the host counters here.
+        // System CPU/memory: both replay and live paths feed raw counters through SystemSampler,
+        // so replay exercises the same windowed-CPU and derived-memory logic as live.
         #[cfg(test)]
-        let replay_sys = self.source.replay_sys();
+        let replay_snap = self.source.replay_snapshot();
         #[cfg(not(test))]
-        let replay_sys: Option<SystemStats> = None;
-        if let Some(sys) = replay_sys {
-            self.sys = sys;
+        let replay_snap: Option<(RawSystemSnapshot, u32)> = None;
+        let raw_snap = if let Some((snap, num_cores)) = replay_snap {
+            self.sys_sampler.set_num_cores(num_cores);
+            self.sys_sampler.update(&mut self.sys, snap);
             self.gpu.clear_unavailable();
+            snap
         } else {
-            self.sys_sampler.update(&mut self.sys);
+            let snap = sys::read_system_snapshot();
+            self.sys_sampler.update(&mut self.sys, snap);
             if let Some(nvml) = &mut self.nvml {
                 nvml.sample(&mut self.sys, self.procs.as_slice(), &mut self.gpu);
             } else {
                 self.gpu.clear_unavailable();
             }
-        }
+            snap
+        };
         self.first_root = tree::build(
             self.procs.as_mut_slice(),
             &mut self.tree_stack,
@@ -435,8 +439,10 @@ impl Gatherer {
 
         #[cfg(feature = "record")]
         if let Some(recorder) = &mut self.recorder {
-            recorder.record(result.now, &self.sys, self.procs.as_slice(), &self.table);
+            recorder.record(result.now, &raw_snap, self.procs.as_slice(), &self.table);
         }
+        #[cfg(not(feature = "record"))]
+        let _ = raw_snap;
 
         self.generation = building_gen;
 

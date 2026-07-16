@@ -11,7 +11,8 @@ use super::table::{CmdlineRead, ProcReader};
 use crate::app::App;
 use crate::fxhash::{FxMap, PidMap};
 use crate::gather::Gatherer;
-use crate::procs::{ProcessEntry, Procs, SystemStats};
+use crate::procs::{ProcessEntry, Procs};
+use crate::sys::RawSystemSnapshot;
 
 trait RawProcExt {
     fn write_into(&self, e: &mut ProcessEntry);
@@ -36,21 +37,9 @@ impl RawProcExt for RawProc {
     }
 }
 
-fn convert_sys(sys: atop_stream::SystemStats) -> SystemStats {
-    SystemStats {
-        cpu_user_bp: sys.cpu_user_bp,
-        cpu_sys_bp: sys.cpu_sys_bp,
-        cpu_iowait_bp: sys.cpu_iowait_bp,
-        mem_total: sys.mem_total,
-        mem_used: sys.mem_used,
-        mem_cached: sys.mem_cached,
-        swap_total: sys.swap_total,
-        swap_used: sys.swap_used,
-        load: sys.load,
-        uptime_secs: sys.uptime_secs,
-        num_cores: sys.num_cores,
-        ..SystemStats::default()
-    }
+/// Convert stream-format raw fields into the internal snapshot that `SystemSampler` consumes.
+fn convert_sys(sys: atop_stream::SystemStats) -> RawSystemSnapshot {
+    RawSystemSnapshot::from(sys)
 }
 
 pub(crate) struct ReplaySource {
@@ -58,22 +47,29 @@ pub(crate) struct ReplaySource {
     next: usize,
     base: Instant,
     metadata: PidMap<ProcMetadata>,
-    sys: SystemStats,
+    raw_snap: RawSystemSnapshot,
+    num_cores: u32,
 }
 
 impl ReplaySource {
     pub(crate) fn new(stream: Stream) -> Self {
+        let default = atop_stream::default_sys();
         Self {
             stream,
             next: 0,
             base: Instant::now(),
             metadata: PidMap::default(),
-            sys: default_sys(),
+            raw_snap: convert_sys(default),
+            num_cores: default.num_cores,
         }
     }
 
-    pub(crate) fn sys(&self) -> SystemStats {
-        self.sys
+    pub(crate) fn raw_snapshot(&self) -> RawSystemSnapshot {
+        self.raw_snap
+    }
+
+    pub(crate) fn num_cores(&self) -> u32 {
+        self.num_cores
     }
 }
 
@@ -91,7 +87,8 @@ impl Source for ReplaySource {
             self.metadata
                 .insert(snapshot.raw.pid, snapshot.metadata.clone());
         }
-        self.sys = convert_sys(event.sys);
+        self.raw_snap = convert_sys(event.sys);
+        self.num_cores = event.sys.num_cores;
 
         procs.clear();
         procs.reserve(event.procs.len());
@@ -152,14 +149,6 @@ impl ProcReader for ReplaySource {
 
     fn lib_deleted(&mut self, _pid: u32) -> bool {
         false
-    }
-}
-
-fn default_sys() -> SystemStats {
-    SystemStats {
-        mem_total: 8 * 1024 * 1024 * 1024,
-        num_cores: 4,
-        ..SystemStats::default()
     }
 }
 
@@ -987,14 +976,17 @@ mod tests {
 
     #[test]
     fn replay_full_frame_layout_at_80_by_24() {
+        // Raw cumulative jiffies: 4 cores at 100 Hz = 400 jiffies/s total.
+        // Cycle 0 seeds the ring; cycle 1 computes the delta.
+        // Delta: user=80, sys=40, idle=280 out of 400 total → 20% user, 10% sys.
         let stream = stream(
             r"
-            cycle 0 cpu_user=1000 cpu_sys=500 mem_used=2G mem_cached=512M swap_total=4G load=125,75,50 uptime=3600
+            cycle 0 stat_idle=10000 mem=8G mem_available=6G mem_buffers=256M mem_cached=256M swap_total=4G swap_free=4G load=125,75,50 uptime=3600
               1 uid=0 comm=init cmd=/sbin/init
               42 ppid=1 comm=hot cmd=/usr/bin/hot
               100 comm=batch cmd=/opt/batch
 
-            cycle +1s cpu_user=2000 cpu_sys=1000 mem_used=3G swap_used=128M load=150,100,80 uptime=3660
+            cycle +1s stat_user=+80 stat_system=+40 stat_idle=+280 mem_available=5G swap_free=3872M load=150,100,80 uptime=3660
               1 ticks=1
               42 ticks=50 mem=64M
               100 ticks=5 mem=12M

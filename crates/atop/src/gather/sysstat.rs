@@ -15,7 +15,7 @@
 use super::config::REFRESH_MS;
 use super::ring::Ring;
 use crate::procs::SystemStats;
-use crate::sys::{self, RawCpuCounters};
+use crate::sys::{self, RawCpuCounters, RawSystemSnapshot};
 
 /// System CPU averaging window as wall-clock time (matches the per-process CPU window).
 const SYS_CPU_WINDOW_MS: u64 = 10_000;
@@ -42,11 +42,16 @@ impl SystemSampler {
         }
     }
 
-    /// Read current counters, compute basis-point rates over the window (older endpoint =
-    /// the oldest retained snapshot), and fill `sys` with CPU + memory + load stats. The
-    /// first call has no endpoint to difference against, so it only seeds the ring.
-    pub(crate) fn update(&mut self, sys: &mut SystemStats) {
-        let cur = sys::read_cpu_counters();
+    /// Override the core count (replay streams carry their own `num_cores`).
+    pub(crate) fn set_num_cores(&mut self, n: u32) {
+        self.num_cores = n;
+    }
+
+    /// Compute basis-point rates over the window from the provided raw snapshot, and fill
+    /// `sys` with CPU + memory + load stats. The first call has no endpoint to difference
+    /// against, so it only seeds the ring.
+    pub(crate) fn update(&mut self, sys: &mut SystemStats, snap: RawSystemSnapshot) {
+        let cur = snap.cpu;
         if let Some(oldest) = self.ring.oldest() {
             let d_user = cur.user.wrapping_sub(oldest.user) + cur.nice.wrapping_sub(oldest.nice);
             let d_sys = cur.system.wrapping_sub(oldest.system)
@@ -62,14 +67,14 @@ impl SystemSampler {
         self.ring.push(cur);
         sys.num_cores = self.num_cores;
 
-        let mem = sys::read_meminfo();
+        let mem = snap.mem;
         sys.mem_total = mem.total;
         sys.mem_used = mem.total.saturating_sub(mem.available);
         sys.mem_cached = mem.buffers.saturating_add(mem.cached);
         sys.swap_total = mem.swap_total;
         sys.swap_used = mem.swap_total.saturating_sub(mem.swap_free);
 
-        sys.load = sys::read_loadavg();
-        sys.uptime_secs = sys::read_uptime_secs();
+        sys.load = snap.load;
+        sys.uptime_secs = snap.uptime_secs;
     }
 }

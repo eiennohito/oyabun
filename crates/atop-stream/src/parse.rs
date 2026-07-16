@@ -206,16 +206,28 @@ impl SystemStats {
     fn apply_field(&mut self, key: &str, value: &str, line_no: usize) -> Result<(), ParseError> {
         match key {
             "cores" | "num_cores" => self.num_cores = parse_u32(value, line_no)?,
+            // Raw cumulative /proc/stat CPU jiffies — support +delta syntax for readability.
+            "stat_user" => self.stat_user = apply_delta_u64(self.stat_user, value, line_no)?,
+            "stat_nice" => self.stat_nice = apply_delta_u64(self.stat_nice, value, line_no)?,
+            "stat_system" => {
+                self.stat_system = apply_delta_u64(self.stat_system, value, line_no)?;
+            }
+            "stat_idle" => self.stat_idle = apply_delta_u64(self.stat_idle, value, line_no)?,
+            "stat_iowait" => {
+                self.stat_iowait = apply_delta_u64(self.stat_iowait, value, line_no)?;
+            }
+            "stat_irq" => self.stat_irq = apply_delta_u64(self.stat_irq, value, line_no)?,
+            "stat_softirq" => {
+                self.stat_softirq = apply_delta_u64(self.stat_softirq, value, line_no)?;
+            }
+            "stat_steal" => self.stat_steal = apply_delta_u64(self.stat_steal, value, line_no)?,
+            // Raw /proc/meminfo fields (bytes).
             "mem" | "mem_total" => self.mem_total = parse_bytes(value, line_no)?,
-            "mem_used" => self.mem_used = parse_bytes(value, line_no)?,
+            "mem_available" => self.mem_available = parse_bytes(value, line_no)?,
+            "mem_buffers" => self.mem_buffers = parse_bytes(value, line_no)?,
             "mem_cached" => self.mem_cached = parse_bytes(value, line_no)?,
             "swap_total" => self.swap_total = parse_bytes(value, line_no)?,
-            "swap_used" => self.swap_used = parse_bytes(value, line_no)?,
-            "cpu_user" | "cpu_user_bp" => self.cpu_user_bp = parse_u32(value, line_no)?,
-            "cpu_sys" | "cpu_sys_bp" => self.cpu_sys_bp = parse_u32(value, line_no)?,
-            "cpu_iowait" | "cpu_iowait_bp" => {
-                self.cpu_iowait_bp = parse_u32(value, line_no)?;
-            }
+            "swap_free" => self.swap_free = parse_bytes(value, line_no)?,
             "load" => self.load = parse_load(value, line_no)?,
             "load1" => self.load[0] = parse_u32(value, line_no)?,
             "load5" => self.load[1] = parse_u32(value, line_no)?,
@@ -229,6 +241,17 @@ impl SystemStats {
             }
         }
         Ok(())
+    }
+}
+
+/// Parse `value` as either an absolute u64 or `+delta` added to `current`.
+fn apply_delta_u64(current: u64, value: &str, line_no: usize) -> Result<u64, ParseError> {
+    if let Some(delta) = value.strip_prefix('+') {
+        current
+            .checked_add(parse_u64(delta, line_no)?)
+            .ok_or_else(|| ParseError::new(line_no, "stat counter overflow"))
+    } else {
+        parse_u64(value, line_no)
     }
 }
 

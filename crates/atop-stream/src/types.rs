@@ -93,17 +93,26 @@ impl fmt::Display for ProcState {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SystemStats {
-    pub cpu_user_bp: u32,
-    pub cpu_sys_bp: u32,
-    pub cpu_iowait_bp: u32,
+    pub num_cores: u32,
+    // Raw cumulative /proc/stat CPU jiffies
+    pub stat_user: u64,
+    pub stat_nice: u64,
+    pub stat_system: u64,
+    pub stat_idle: u64,
+    pub stat_iowait: u64,
+    pub stat_irq: u64,
+    pub stat_softirq: u64,
+    pub stat_steal: u64,
+    // Raw /proc/meminfo fields (bytes)
     pub mem_total: u64,
-    pub mem_used: u64,
+    pub mem_available: u64,
+    pub mem_buffers: u64,
     pub mem_cached: u64,
     pub swap_total: u64,
-    pub swap_used: u64,
+    pub swap_free: u64,
+    // Other raw reads
     pub load: [u32; 3],
     pub uptime_secs: u64,
-    pub num_cores: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,8 +170,11 @@ impl Stream {
 #[must_use]
 pub fn default_sys() -> SystemStats {
     SystemStats {
-        mem_total: 8 * 1024 * 1024 * 1024,
         num_cores: 4,
+        // Large idle seed so tests that never set CPU fields see ~0% usage.
+        stat_idle: 1_000_000,
+        mem_total: 8 * 1024 * 1024 * 1024,
+        mem_available: 6 * 1024 * 1024 * 1024,
         ..SystemStats::default()
     }
 }

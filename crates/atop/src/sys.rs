@@ -232,6 +232,84 @@ fn parse_u64_bytes(b: &[u8]) -> Option<u64> {
     Some(n)
 }
 
+/// All raw system reads bundled for a single cycle — the source data that
+/// [`SystemSampler`](crate::gather::sysstat::SystemSampler) consumes to produce
+/// derived CPU percentages and memory stats.
+#[derive(Clone, Copy)]
+pub struct RawSystemSnapshot {
+    pub cpu: RawCpuCounters,
+    pub mem: MemInfo,
+    pub load: [u32; 3],
+    pub uptime_secs: u64,
+}
+
+/// Read `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`, and `/proc/uptime` into one snapshot.
+pub fn read_system_snapshot() -> RawSystemSnapshot {
+    RawSystemSnapshot {
+        cpu: read_cpu_counters(),
+        mem: read_meminfo(),
+        load: read_loadavg(),
+        uptime_secs: read_uptime_secs(),
+    }
+}
+
+// --- stream ↔ internal conversions (colocated so the two directions are reviewable together) ---
+
+#[cfg(any(feature = "record", test))]
+impl From<atop_stream::SystemStats> for RawSystemSnapshot {
+    fn from(s: atop_stream::SystemStats) -> Self {
+        Self {
+            cpu: RawCpuCounters {
+                user: s.stat_user,
+                nice: s.stat_nice,
+                system: s.stat_system,
+                idle: s.stat_idle,
+                iowait: s.stat_iowait,
+                irq: s.stat_irq,
+                softirq: s.stat_softirq,
+                steal: s.stat_steal,
+            },
+            mem: MemInfo {
+                total: s.mem_total,
+                available: s.mem_available,
+                buffers: s.mem_buffers,
+                cached: s.mem_cached,
+                swap_total: s.swap_total,
+                swap_free: s.swap_free,
+            },
+            load: s.load,
+            uptime_secs: s.uptime_secs,
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl RawSystemSnapshot {
+    /// Convert to the stream format, stamped with the given core count (which is a
+    /// startup-time value, not part of the per-cycle raw snapshot).
+    pub fn to_stream(self, num_cores: u32) -> atop_stream::SystemStats {
+        atop_stream::SystemStats {
+            num_cores,
+            stat_user: self.cpu.user,
+            stat_nice: self.cpu.nice,
+            stat_system: self.cpu.system,
+            stat_idle: self.cpu.idle,
+            stat_iowait: self.cpu.iowait,
+            stat_irq: self.cpu.irq,
+            stat_softirq: self.cpu.softirq,
+            stat_steal: self.cpu.steal,
+            mem_total: self.mem.total,
+            mem_available: self.mem.available,
+            mem_buffers: self.mem.buffers,
+            mem_cached: self.mem.cached,
+            swap_total: self.mem.swap_total,
+            swap_free: self.mem.swap_free,
+            load: self.load,
+            uptime_secs: self.uptime_secs,
+        }
+    }
+}
+
 /// Kernel `PID_MAX_LIMIT` (2^22 on 64-bit). A real PID never exceeds it; used to
 /// reject a pathologically long numeric dirent name that would otherwise wrap.
 const PID_MAX_LIMIT: u32 = 1 << 22;

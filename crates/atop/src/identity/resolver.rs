@@ -1,4 +1,4 @@
-//! Identity types and the change-gated resolver.
+//! Identity types and the change-driven resolver.
 //!
 //! [`ProcessIdentity`] carries only what every kind shares (`owner_uid`); everything
 //! kind-specific lives inside the [`IdentityKind`] variant, so a field that is meaningless for a

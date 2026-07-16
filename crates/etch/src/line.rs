@@ -1,9 +1,10 @@
 //! [`Line`]: a free-form styled line (system-stat header, footer).
 //!
-//! A line is gated on the *values* that feed it (passed to [`Frame::line`](crate::Frame::line)),
-//! exactly like a table cell — so on an unchanged frame the build closure never runs
-//! and nothing is formatted. The builder itself just records colored runs into reused
-//! buffers; the painter emits them only when the gate misses.
+//! A line is change-tracked on the *values* that feed it (passed to
+//! [`Frame::line`](crate::Frame::line)), exactly like a table cell — so on an unchanged
+//! frame the build closure never runs and nothing is formatted. The builder itself just
+//! records colored runs into reused buffers; the painter emits them only when a change
+//! is detected.
 
 use crate::style::Rgb;
 

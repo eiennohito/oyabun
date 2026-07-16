@@ -282,7 +282,7 @@ impl BpfSource {
 
     /// Read the whole task-iterator stream into `self.words`, returning the byte length. A fresh
     /// iterator instance is created per cycle (attach → create iter fd → read → drop); the few
-    /// extra syscalls are negligible at the gather cadence. Returns 0 on any failure (the next
+    /// extra syscalls are negligible at the gather interval. Returns 0 on any failure (the next
     /// cycle retries — there is no mid-run fallback to `/proc`).
     fn read_snapshot(&mut self) -> usize {
         let mut file = match self.open_iter() {

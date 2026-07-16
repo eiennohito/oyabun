@@ -1,6 +1,6 @@
 # thoop — THP Generational Storage (the mechanism)
 
-> **Scope.** A policy-free substrate for storing flat records on transparent-huge-page memory
+> **Scope.** A policy-free foundation for storing flat records on transparent-huge-page memory
 > with a generational lifecycle. It is built for atop but holds **zero atop concepts** — no PID,
 > snapshot, gather, and crucially no "single thread" written into a *contract* as a law — and is
 > meant to be extractable as a standalone library. atop layers its own policy on top; see the
@@ -81,7 +81,7 @@ Records are `Flat`: fixed-size, `Copy`, no heap, embeddable handles only.
 
 ## The concurrency seam (named, not built)
 
-The substrate is policy-agnostic; the single-thread instantiation is a *choice*, never asserted
+The storage layer is policy-agnostic; the single-thread instantiation is a *choice*, never asserted
 as law in a contract. A multithread layer is **additive**, confined to:
 
 - the **base cell**: `Cell` → an atomic, swapped in the one accessor;

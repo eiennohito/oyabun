@@ -11,13 +11,13 @@ use std::ptr;
 use crate::fxhash::PidMap;
 use crate::procs::{GpuMetric, GpuMetrics, GpuProcessStats, SystemStats, VramStats};
 
-/// Coarse cadence, in cycles, for the GPU process-list + VRAM refresh. The client set and each
+/// Coarse interval, in cycles, for the GPU process-list + VRAM refresh. The client set and each
 /// client's framebuffer footprint change slowly, and enumerating them is the second-largest NVML
 /// cost, so re-reading every cycle is waste; ~8 cycles ≈ 4 s at the gather interval. A GPU
 /// process born between refreshes is invisible until the next one — a brief, acceptable delay.
 const CLIENT_REFRESH_CYCLES: u64 = 8;
 
-/// Cadence, in cycles, of the expensive per-process utilization poll. That call is a ~1 ms
+/// Interval, in cycles, of the expensive per-process utilization poll. That call is a ~1 ms
 /// GSP busy-poll (it round-trips to the GPU's processor for fresh perfmon samples), so running
 /// it every cycle dominated the profile. Two measured driver constants make a coarser poll
 /// lossless: the driver produces a new per-process sample only every ~200 ms, and it retains
@@ -25,7 +25,7 @@ const CLIENT_REFRESH_CYCLES: u64 = 8;
 /// 500 ms gather interval) still reads the full backlog while cutting the busy-poll rate 4×.
 /// Utilization is *held* between polls (like VRAM); the goal is ranking GPU users, for which
 /// ~2 s staleness is imperceptible. A client-list rebuild resets held utilization, so a poll is
-/// forced on any cycle that rebuilds (see `sample`) regardless of this cadence — the two are
+/// forced on any cycle that rebuilds (see `sample`) regardless of this interval — the two are
 /// independent by construction, not by a numeric relationship between the two periods.
 const PROCESS_UTIL_REFRESH_CYCLES: u64 = 4;
 
@@ -337,8 +337,8 @@ struct PidMemory {
 
 /// Per-client GPU state held across cycles. Both fields are *held* between the coarse refreshes
 /// that produce them, because both read data that moves slower than the gather interval. `vram`
-/// is refreshed on the client-list cadence — a client whose GPU is idle still owns its
-/// framebuffer. `util_bp` is refreshed on the (finer) per-process utilization cadence and held
+/// is refreshed on the client-list interval — a client whose GPU is idle still owns its
+/// framebuffer. `util_bp` is refreshed on the (finer) per-process utilization interval and held
 /// between those polls; it is forced to a true zero whenever the device reads idle, since then
 /// there is genuinely nothing running to attribute.
 #[derive(Clone, Copy, Default)]
@@ -365,12 +365,12 @@ pub(crate) struct NvmlSampler {
     /// Known GPU clients (from the last coarse process-list refresh) → held VRAM + this cycle's
     /// utilization. Materialized into the sparse per-process view each cycle.
     clients: PidMap<ClientGpu>,
-    /// Monotonic sample counter. Both cadences are pure functions of it (`cycle % PERIOD == 0`),
+    /// Monotonic sample counter. Both intervals are pure functions of it (`cycle % PERIOD == 0`),
     /// so there is nothing to keep in phase; starts at 0 so the first sample both refreshes and
     /// polls.
     cycle: u64,
     /// A coarse refresh whose process-list query failed; retried next cycle regardless of the
-    /// cadence, so a transient NVML error costs at most one cycle rather than a full period.
+    /// interval, so a transient NVML error costs at most one cycle rather than a full period.
     refresh_pending: bool,
 }
 
@@ -423,7 +423,7 @@ impl NvmlSampler {
         sys.gpu_count = self.device_count();
 
         if !self.process_available() {
-            // No per-process capability, hence no client set to gate on: sample device telemetry
+            // No per-process capability, hence no client set to check: sample device telemetry
             // every cycle (as before) and leave the per-process view unavailable.
             self.sample_device_util(sys);
             self.sample_device_vram(sys);
@@ -434,7 +434,7 @@ impl NvmlSampler {
         let cycle = self.cycle;
         self.cycle = self.cycle.wrapping_add(1);
 
-        // Coarse cadence: rediscover the client set + per-client VRAM + device VRAM totals, all
+        // Coarse interval: rediscover the client set + per-client VRAM + device VRAM totals, all
         // held between refreshes because they move slowly. A failed query arms `refresh_pending`
         // so the next cycle retries instead of waiting a whole period. `rebuilt` records that the
         // client set (and its held utilization) was just reset.
@@ -452,10 +452,10 @@ impl NvmlSampler {
         };
 
         // Device utilization every cycle (a cheap counter read that also drives the system bar).
-        // `active` is the gate for the expensive per-process busy-poll: it is the *GPU-side*
+        // `active` controls the expensive per-process busy-poll: it is the *GPU-side*
         // activity signal, not CPU, because a rendering-idle desktop client is still CPU-busy
         // (CPU would never let us skip) while a long compute kernel runs GPU-busy at ~0% host CPU
-        // (CPU would wrongly zero it). An unreadable device counts as active (never gate on the
+        // (CPU would wrongly zero it). An unreadable device counts as active (never skip based on the
         // unknown).
         let active = self.sample_device_util(sys);
 
@@ -487,12 +487,12 @@ impl NvmlSampler {
     }
 
     /// Sum per-device SM utilization into the system bar and report whether any device is doing
-    /// work. A device that fails to read is treated as active (do not gate on an unknown) and
+    /// work. A device that fails to read is treated as active (do not skip based on an unknown) and
     /// nulls the bar total, matching the prior all-or-nothing system semantics.
     fn sample_device_util(&self, sys: &mut SystemStats) -> bool {
         let Some(get) = self.api.device_get_utilization else {
             sys.gpu_util_bp = None;
-            return true; // cannot measure GPU activity → never gate the per-process poll away
+            return true; // cannot measure GPU activity → never skip the per-process poll
         };
         let mut total = Some(0u32);
         let mut active = false;
@@ -538,7 +538,7 @@ impl NvmlSampler {
     }
 
     /// The expensive per-process utilization busy-poll. Runs only when a device is active and only
-    /// on the coarse utilization cadence. Each call retrieves every sample since the device's
+    /// on the coarse utilization interval. Each call retrieves every sample since the device's
     /// `last_seen_timestamp`, so skipped cycles lose no data — the next call drains the backlog.
     /// The two underlying APIs (`ProcessUtil::Info`/`Samples`) both fill the normalized
     /// `util_samples`, so the aggregation — latest sample per PID, summed across a client's GPUs —
@@ -1257,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn process_list_refreshes_on_a_coarse_cadence() {
+    fn process_list_refreshes_on_a_coarse_interval() {
         static LIST_CALLS: AtomicUsize = AtomicUsize::new(0);
         unsafe extern "C" fn counting_compute(
             device: Device,
@@ -1287,7 +1287,7 @@ mod tests {
             "the first sample must discover the client set"
         );
 
-        // The next full cadence of cycles reuses the held client set — no re-enumeration.
+        // The next full interval of cycles reuses the held client set — no re-enumeration.
         for _ in 0..CLIENT_REFRESH_CYCLES - 1 {
             sampler.sample(&mut sys, &procs, &mut gpu);
         }
@@ -1297,16 +1297,16 @@ mod tests {
             "the process list must be held between coarse refreshes"
         );
 
-        // One more cycle crosses the cadence boundary and refreshes again.
+        // One more cycle crosses the interval boundary and refreshes again.
         sampler.sample(&mut sys, &procs, &mut gpu);
         assert!(
             LIST_CALLS.load(Ordering::SeqCst) > after_first,
-            "the coarse cadence must re-enumerate after CLIENT_REFRESH_CYCLES"
+            "the coarse interval must re-enumerate after CLIENT_REFRESH_CYCLES"
         );
     }
 
     #[test]
-    fn process_util_polls_on_coarse_cadence_and_holds_between() {
+    fn process_util_polls_on_coarse_interval_and_holds_between() {
         static UTIL_POLLS: AtomicUsize = AtomicUsize::new(0);
         unsafe extern "C" fn counting_util(
             device: Device,
@@ -1342,7 +1342,7 @@ mod tests {
         );
         assert_eq!(gpu.live(10).map(|m| m.pct), Some(GpuMetric::Value(5_000)));
 
-        // The rest of the cadence window reuses the held value — no new polls, still materialized.
+        // The rest of the interval window reuses the held value — no new polls, still materialized.
         for _ in 0..PROCESS_UTIL_REFRESH_CYCLES - 1 {
             sampler.sample(&mut sys, &procs, &mut gpu);
         }
@@ -1357,7 +1357,7 @@ mod tests {
             "the held utilization is still materialized on non-poll cycles"
         );
 
-        // Crossing the cadence boundary re-polls (reset-then-fill, so a quiet client would decay).
+        // Crossing the interval boundary re-polls (reset-then-fill, so a quiet client would decay).
         sampler.sample(&mut sys, &procs, &mut gpu);
         assert!(
             UTIL_POLLS.load(Ordering::SeqCst) > after_first,

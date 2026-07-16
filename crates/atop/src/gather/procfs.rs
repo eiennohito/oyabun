@@ -1,4 +1,4 @@
-//! The unprivileged `/proc` observation source: a maintained live set, a cadenced `getdents`
+//! The unprivileged `/proc` observation source: a maintained live set, a periodic `getdents`
 //! re-scan, a skip-cycle birth probe, and an `io_uring`/syscall [`Backend`] reading each live
 //! PID's stat into the row buffer. The peer of `bpf::BpfSource` behind the gatherer's source
 //! enum — it owns everything the cycle does *before* the source-agnostic per-PID table / tree
@@ -48,7 +48,7 @@ impl Backend {
     }
 }
 
-/// The unprivileged `/proc` observation source: maintained live set + cadenced `getdents`
+/// The unprivileged `/proc` observation source: maintained live set + periodic `getdents`
 /// re-scan + skip-cycle birth probe, with an `io_uring`/syscall [`Backend`] reading each PID's
 /// stat. This is everything the gatherer's cycle does *before* the per-PID table / tree build —
 /// the peer to `bpf::BpfSource`.
@@ -94,8 +94,8 @@ impl ProcSource {
     }
 
     /// Fill `procs` with the live set's stat fields, leaving it **compacted and PID-sorted**.
-    /// `prev_gen` (the just-finished generation) drives the enumeration cadence and the
-    /// skip-cycle leader gate; `index` is the per-PID table's index, read by that gate to tell
+    /// `prev_gen` (the just-finished generation) drives the enumeration interval and the
+    /// skip-cycle leader check; `index` is the per-PID table's index, read by that check to tell
     /// a known PID from a probe-introduced non-leader thread. Returns the sample instant and
     /// the pool-overflow count.
     pub(crate) fn scan(
@@ -105,7 +105,7 @@ impl ProcSource {
         page_size: u64,
         prev_gen: u64,
     ) -> (Instant, u32) {
-        // Enumeration cadence (§3): a full `getdents` re-scan every K cycles is the resync
+        // Enumeration interval (§3): a full `getdents` re-scan every K cycles is the resync
         // that catches any birth the probe missed (non-sequential, burst > W, post-wrap);
         // skip cycles reuse the maintained live set plus a cheap sequential-birth probe.
         // The set is rebuilt from survivors below, so deaths drop the same cycle (held read →

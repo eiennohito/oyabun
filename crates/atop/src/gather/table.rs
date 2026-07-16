@@ -20,9 +20,9 @@ use crate::sys::{self, ProcPath};
 
 /// A freshly-seen PID reads cmdline/uid every cycle for this many cycles (exec/argv
 /// still settling — `nginx`/`postgres` rewrite their argv after exec) before dropping
-/// to the coarse staggered cadence.
+/// to the coarse staggered interval.
 const CMDLINE_SETTLE_GENS: u32 = 3;
-/// Default coarse cmdline/uid refresh cadence: PID `p` refreshes when
+/// Default coarse cmdline/uid refresh interval: PID `p` refreshes when
 /// `(cur_gen + p) % N == 0`, so ~1/N settled PIDs refresh each cycle (no thundering herd).
 /// At `REFRESH_MS=500` and `N=16`, worst-case staleness ≈ 8 s. See [`cmdline_refresh_n`].
 const CMDLINE_REFRESH_N: u32 = 16;
@@ -74,7 +74,7 @@ const CPURING_MIN_SLOTS: usize = 2048;
 /// host rehashes into a bigger arena chunk automatically.
 const PIDINDEX_MIN_CAP: usize = 4096;
 
-/// Coarse cmdline/uid refresh cadence, overridable via `ATOP_CMDLINE_REFRESH_N`
+/// Coarse cmdline/uid refresh interval, overridable via `ATOP_CMDLINE_REFRESH_N`
 /// (1 = refresh every PID every cycle).
 pub(crate) fn cmdline_refresh_n() -> u32 {
     env_u32("ATOP_CMDLINE_REFRESH_N")
@@ -106,7 +106,7 @@ impl ProcMeta for ProcTable {
 /// `GenStore<PidMeta>`. `Flat` (`Copy`) — no heap. The row carries the resolved `uid` and a
 /// cmdline handle, so a dead PID's `PidMeta` slot is freed immediately (no reader leases it).
 /// The **cold** counterpart to [`CpuRing`] — a separate store so a CPU sample never loads it.
-/// Incarnation/cadence bookkeeping lives in [`PidSlot`], not here.
+/// Incarnation/interval bookkeeping lives in [`PidSlot`], not here.
 #[derive(Clone, Copy)]
 struct PidMeta {
     uid: u32,
@@ -117,9 +117,9 @@ struct PidMeta {
     /// The cmdline contains a byte ≥ 0x80 (renderer unicode path).
     cmd_non_ascii: bool,
     /// Effective-capability privilege level (from `/proc/<pid>/status`), refreshed on the
-    /// coarse cadence like uid/cmdline.
+    /// coarse interval like uid/cmdline.
     caps: CapLevel,
-    /// Raw `/proc/<pid>/cgroup` content, refreshed on the cold metadata cadence.
+    /// Raw `/proc/<pid>/cgroup` content, refreshed on the cold metadata interval.
     cgroup: StringRef<CgroupBytes>,
     /// Raw `/proc/<pid>/root/.flatpak-info` content for likely Flatpak/sandbox processes.
     flatpak: StringRef<FlatpakBytes>,
@@ -127,7 +127,7 @@ struct PidMeta {
     /// Absorbing per incarnation: once observed, latched here for the process's lifetime.
     exe_deleted: bool,
     /// An executable mapping in `/proc/<pid>/maps` points at a deleted file (a replaced .so).
-    /// Transient — re-resolved on the coarse [`LIB_RECHECK_GENS`] cadence.
+    /// Transient — re-resolved on the coarse [`LIB_RECHECK_GENS`] interval.
     uses_deleted_lib: bool,
 }
 
@@ -157,7 +157,7 @@ pub(crate) struct PidSlot {
     meta: Ref<PidMeta>,
     /// Incarnation discriminator: `start_time` from stat. A change ⇒ PID reuse.
     start_time: u64,
-    /// Generation first seen — drives the age-adaptive cmdline cadence (settling window).
+    /// Generation first seen — drives the age-adaptive cmdline interval (settling window).
     first_seen_gen: u64,
     /// Generation last seen — evicts vanished PIDs.
     seen_gen: u64,
@@ -261,7 +261,7 @@ impl ProcTable {
         self.flatpak_store.wire(arena);
     }
 
-    /// The shared PID index — read by the `/proc` source's skip-cycle leader gate to tell a
+    /// The shared PID index — read by the `/proc` source's skip-cycle leader check to tell a
     /// known PID from a probe-introduced non-leader thread.
     pub(crate) fn index(&self) -> &PidIndex {
         &self.index
@@ -280,7 +280,7 @@ impl ProcTable {
     }
 
     /// One per-PID pass filling CPU% + uid + cmdline, then evicting vanished PIDs. `now` drives
-    /// the CPU window; `cur_gen` keys the cmdline cadence. CPU% reads fresh every cycle;
+    /// the CPU window; `cur_gen` keys the cmdline interval. CPU% reads fresh every cycle;
     /// uid/cmdline read fresh on first sighting, while settling, or on the staggered coarse
     /// tick, else reuse the cached handle (no I/O, no copy) — an unchanged cmdline keeps its
     /// slot, a changed one frees the old at once.
@@ -341,7 +341,7 @@ impl ProcTable {
             // CPU ring (hot): mutated in place; its &mut never spans the cmd/meta ops below.
             let cpu_ref = self.sample_cpu(&mut e, prior, reused, jiff);
 
-            // Metadata (cold): uid + cmdline + cgroup provenance on the cadence.
+            // Metadata (cold): uid + cmdline + cgroup provenance on the interval.
             let stagger =
                 refresh_n <= 1 || cur_gen.wrapping_add(u64::from(pid)) % u64::from(refresh_n) == 0;
             let refresh = prior.is_none() || reused || settling || stagger;
@@ -587,9 +587,9 @@ impl ProcTable {
     /// over the reader + the caller's local `pm` so it composes with the disjoint store borrows
     /// around it, exactly like [`refresh_meta`](Self::refresh_meta).
     ///
-    /// Each signal refreshes on the cadence its change-rate warrants: caps only through the
-    /// settling window (`cap_refresh` — they are fixed at exec); exe-deleted is absorbing
-    /// (re-probed on the cmdline cadence only while unmarked, then latched); deleted-lib is
+    /// Each signal refreshes on the interval its change-rate warrants: caps only through the
+    /// settling window (`cap_refresh` — they are fixed at exec); exe-deleted is permanent
+    /// (re-probed on the cmdline interval only while unmarked, then latched); deleted-lib is
     /// transient (first scan after settling, then ≤ once per [`LIB_RECHECK_GENS`], globally
     /// ≤ [`LIB_CHECKS_PER_CYCLE`] per cycle). Exe deletion takes visual priority, so when it is
     /// set the (heavier, redundant) maps scan is skipped and any prior lib warning cleared.
@@ -623,18 +623,18 @@ impl ProcTable {
     }
 }
 
-/// Cadence inputs for [`ProcTable::refresh_deletions`], grouped so the call stays a few
+/// Interval inputs for [`ProcTable::refresh_deletions`], grouped so the call stays a few
 /// arguments. All are per-PID values the caller already computed for the metadata refresh.
 #[derive(Clone, Copy)]
 struct DelCtx {
-    /// The cmdline cadence fired this cycle — the trigger for the (absorbing) exe re-probe.
+    /// The cmdline interval fired this cycle — the trigger for the (permanent) exe re-probe.
     refresh: bool,
     /// The PID is new / reused / still settling — the only window in which capabilities (fixed
     /// at exec) are read, so the steady state issues no per-tick status read.
     cap_refresh: bool,
     /// Full capability mask for this kernel (for classifying `CapEff`).
     cap_full_mask: u64,
-    /// Cycles since first seen — gates the first deleted-library scan (settling).
+    /// Cycles since first seen — controls the first deleted-library scan (settling).
     age: u64,
     /// Generation of the prior deleted-library scan (0 = never), for the re-check interval.
     prior_lib_gen: u64,

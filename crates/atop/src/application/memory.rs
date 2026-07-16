@@ -56,7 +56,7 @@ struct MemberSample {
 ///
 /// Correct application memory sums proportional set size across **every** member, and reading a
 /// member's PSS forces a kernel walk of its whole address space — the dominant interactive cost
-/// on a real desktop if done every cycle. The governing invariant is that the *shape* of a
+/// on a real desktop if done every cycle. The key invariant is that the *shape* of a
 /// member's footprint — its shared-vs-private split — changes far more slowly than its size. So
 /// PSS is estimated, not re-read: each member caches that split from one walk, then every cycle
 /// recombines it with the free live resident reading (resident growth is attributed to private

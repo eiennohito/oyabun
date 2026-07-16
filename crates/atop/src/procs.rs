@@ -291,9 +291,9 @@ pub struct ProcessEntry {
     pub exe_deleted: bool,
     /// An executable mapping in `/proc/<pid>/maps` points at a deleted/replaced file (e.g. a
     /// linked `.so` swapped out by a system update). Transient — re-resolved on a coarse
-    /// cadence. Colors the Command basename as a warning (unless `exe_deleted` takes priority).
+    /// interval. Colors the Command basename as a warning (unless `exe_deleted` takes priority).
     pub uses_deleted_lib: bool,
-    /// Effective-capability privilege level (from `/proc/<pid>/status`, coarse cadence).
+    /// Effective-capability privilege level (from `/proc/<pid>/status`, coarse interval).
     /// Colors the USER column — the interesting axis is what a process *can do*, not who owns
     /// it. Kernel threads and unprivileged processes read [`CapLevel::None`].
     pub caps: CapLevel,

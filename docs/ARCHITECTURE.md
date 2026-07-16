@@ -3,7 +3,7 @@
 Status: **implemented** (Linux). macOS and several features below are still future work.
 
 This describes how atop is actually built. For *why* (goals/constraints) see `GOALS.md`.
-The single-thread storage *policy* on top of the `thoop` substrate (mechanism) is
+The single-thread storage *policy* on top of `thoop` (the storage foundation) is
 `docs/plans/thoop.md`. With the PID index now on huge pages too, every hot, randomly-probed
 per-PID structure is THP-resident.
 
@@ -46,7 +46,7 @@ A row carries the process identity (`pid`+`ppid`+`uid`, and the `start_time` tha
 names a unique incarnation — see **PID reuse model** below), the volatile stat fields (state,
 priority, nice, thread count, raw ticks, resident bytes), the derived CPU% (a stable moving
 average plus a separate peak), the process name and cmdline, two cheap flags (a non-ASCII bit
-that gates the renderer's unicode path; a kernel-thread bit that means "never read cmdline"),
+that selects the renderer's unicode path; a kernel-thread bit that means "never read cmdline"),
 and the tree links + inclusive subtree aggregates used for collapsed-group display.
 
 System-wide stats (CPU deltas, memory, swap, load, uptime, task-state tallies) are a separate
@@ -59,7 +59,7 @@ low fd limit is never silent.
 mechanisms because they have different *change rates*. `comm` is re-parsed from `stat` every
 cycle anyway, so a store for it would be pure overhead — it lives **inline** in the row as
 fixed bytes (≤ 15, `TASK_COMM_LEN`; truncated beyond). `cmdline` is slow-changing and read on
-a coarse cadence, so re-copying it every cycle was waste — it lives in a generational `Cmd`
+a coarse interval, so re-copying it every cycle was waste — it lives in a generational `Cmd`
 string store (`thoop`) and the row holds only a stable handle. The general rule: a volatile
 field the gatherer rewrites each cycle is copied into the row; only slow, change-detected data
 earns a referenced store slot.
@@ -108,9 +108,9 @@ backward-counter guard catches most tick-discontinuities; metadata self-heals wi
 window. The worst case is one frame of wrong CPU% — bounded and self-correcting. No special
 guard is needed beyond what the normal eviction + reopen path already does.
 
-## Storage substrate (`thoop`) and atop's single-thread policy
+## Storage foundation (`thoop`) and atop's single-thread policy
 
-`thoop` is a policy-free THP storage substrate; its mechanism (the `MmapRegion` primitive, the
+`thoop` is a policy-free THP storage layer; its mechanism (the `MmapRegion` primitive, the
 arena suballocator, the self-healing cached bases, the generational lifecycle, and the
 deliberately-unbuilt multithread seam) is documented in `docs/plans/thoop.md`. This section is
 only atop's *policy* on top of it. The short version of the mechanism: hot, randomly-accessed
@@ -123,7 +123,7 @@ an allocation.
 atop holds three per-PID stores (a hot CPU-history ring, cold uid/cmdline metadata, and the
 `Cmd` string store), the **PID index** (an open-addressing map), **and** the process row buffer
 in one shared arena. Because gather and
-render never overlap, atop picks the cheapest sound instantiation of the substrate — each
+render never overlap, atop picks the cheapest sound instantiation — each
 choice is exactly a cross-thread-safety piece *removed*:
 
 - **immediate `free`**, not deferred `demote`/`gc`: nothing holds a reference across the
@@ -132,21 +132,21 @@ choice is exactly a cross-thread-safety piece *removed*:
   cmdline's old slot are reclaimed at once.
 - **retired arena regions reclaimed immediately**: a regime-B repack retires the old region;
   with no reader leasing its bytes, the region is freed at the end of the same cycle (the
-  substrate's generational region-GC driven with `min_live` = the just-finished generation —
+  generational region-GC driven with `min_live` = the just-finished generation —
   no lag).
 - **rows read directly, cmdline resolved directly** from the `Cmd` store through `&self` — no
   per-cycle copy, no published lease view.
 
 The per-PID fill still copies each row out by value, mutates it, and writes it back, because a
 store allocation can trigger a regime-B repack that relocates the row buffer's chunk — holding
-a `&row` across a store op would dangle. That is the substrate's invariant, not a threading
+a `&row` across a store op would dangle. That is the storage layer's invariant, not a threading
 concern, so it stays.
 
 Re-adding the removed pieces (an atomic base cell, deferred `free`, a copy-on-write lease view,
 `Send`/`Sync`) is the documented multithread path — `thoop`'s concurrency seam — if the latency
 budget ever changes. Single thread is atop **policy**, not a `thoop` limit.
 
-## `/proc` enumeration — maintained live set + cadence + birth probe
+## `/proc` enumeration — maintained live set + refresh interval + birth probe
 
 `getdents64` directly into a reused buffer, parsing dirent records by hand — no
 per-entry `String`/`PathBuf` (unlike `fs::read_dir`). The `/proc` dir fd is opened
@@ -164,13 +164,13 @@ cost is kernel-side dirent materialization, so the only unprivileged lever is fr
   allocation frontier. New arrivals are caught within one cycle; in steady state the window
   is empty (zero cost). Bursts and the post-wrap low range wait for the full re-scan — a
   hit-rate, not a correctness, concern (the failed speculative reads rely on the hygiene
-  rule above). A **thread-leader gate** (`pidfd_open`, one syscall) rejects non-leader
+  rule above). A **thread-leader check** (`pidfd_open`, one syscall) rejects non-leader
   threads: `/proc/<N>` resolves any task ID via VFS lookup (PIDs and TIDs alike), but
-  `getdents` returns only TGIDs — without the gate, worker threads whose TID falls in the
+  `getdents` returns only TGIDs — without it, worker threads whose TID falls in the
   probe window would appear as phantom processes that flicker on alternating cycles.
 
-This enumeration cadence is the shared component the scale-observation plan's per-PID
-*sampling* cadence builds on — the two are independent knobs.
+This enumeration interval is the shared component the scale-observation plan's per-PID
+*sampling* interval builds on — the two are independent knobs.
 
 ## Stat parse
 
@@ -276,10 +276,10 @@ value, `PidSlot`, is the deliberate extension point). It replaced the former sep
 
 Two per-PID records sit in *separate* huge-page generational stores, split by access
 temperature: the **hot** CPU-history ring (touched every sample) and the **cold** metadata
-(uid + cmdline handle, touched on the refresh cadence). Co-locating them would pull cold
+(uid + cmdline handle, touched on the refresh interval). Co-locating them would pull cold
 cache lines into every CPU update. Under the single-thread policy *every* store is freed
 eagerly on death — including the cmdline string slot, since nothing leases it across the
-gather/render boundary. Incarnation/cadence bookkeeping (`start_time`, first/last-seen
+gather/render boundary. Incarnation/refresh bookkeeping (`start_time`, first/last-seen
 generation) lives in the index value, not the records, so the reuse/settling/eviction
 decisions never chase into a store.
 
@@ -299,14 +299,14 @@ low-volume ops stay synchronous):
   is gone. PID reuse (`start_time` change) and eviction free the slot at once (no lease — see
   the storage policy above).
 
-**Deleted-binary and capability signals** are cold metadata on this same coarse cadence, for
+**Deleted-binary and capability signals** are cold metadata on this same coarse interval, for
 the same reason cmdline is: they change slowly and are read from `/proc`, so re-reading every
 cycle would be waste. Their *lifecycle rules differ by how each transitions*:
 
-- A deleted **exe** is **absorbing** — once the kernel marks `/proc/pid/exe` `" (deleted)"` the
+- A deleted **exe** is **permanent** — once the kernel marks `/proc/pid/exe` `" (deleted)"` the
   original inode is gone and can never come back for that incarnation — so it is probed only
   while still unmarked, then latched for the process's life (a cheap `readlink`, re-tried on the
-  cmdline cadence until it fires, so a mid-run package upgrade is still caught).
+  cmdline interval until it fires, so a mid-run package upgrade is still caught).
 - A deleted **library** is **transient** (a process can unmap the old `.so` and load a
   replacement), so it must be re-resolved periodically. Because scanning a whole `maps` file is
   the heavy check, it is bounded two ways: a coarse per-process re-check interval *and* a hard
@@ -393,7 +393,7 @@ exotic unmapped combo degrades to a placeholder, never to a wrong identity.
 table reads it (free, riding the cmdline fd's `fstat`); the BPF source carries uid in the
 iterator output. So the table must *not* overwrite a source-provided uid from the cmdline read
 — a permission-denied cmdline open would otherwise clobber a good uid. `cmdline` itself stays
-a `/proc` read on the coarse cadence in both modes (it lives in process memory, not
+a `/proc` read on the coarse interval in both modes (it lives in process memory, not
 `task_struct`).
 
 **fork/free tracepoints — births in the delta, deaths on reap.** Births now flow through the
@@ -403,7 +403,7 @@ because a zombie is still a live entry the walk keeps showing as `Z` (its hot fi
 it re-emits once on zombifying then bails: O(1), never per-cycle). The reap tracepoint is
 **RCU-deferred** (it fires from an RCU callback, not synchronously at the wait), so a removal
 lands within roughly a grace period of the reap — far inside the cycle interval, so effectively
-next-cycle, the same latency a synchronous signal would give at this cadence. **Short-lived**
+next-cycle, the same latency a synchronous signal would give at this interval. **Short-lived**
 processes — a reap whose fork was never reconciled by any snapshot, i.e. born and gone *between*
 two walks — are what a snapshot-only tool can never see, surfaced as a footer count.
 
@@ -471,11 +471,11 @@ makes them one group. Containers, pods, and system services cohere the same way,
 own cgroup shape. A cgroup boundary is trusted (kernel-owned, stable across runs); a purely
 structural one — a shared-binary process fan, a runtime worker pool — is not, and is recognized
 only where no cgroup identity exists, so the trusted identity always wins with no arbitrary
-tiebreak. Identity resolution is change-gated, not per-cycle: a process's grouping is a pure
+tiebreak. Identity resolution runs only on change, not per-cycle: a process's grouping is a pure
 function of its cgroup and argv and the surrounding tree shape, which move only on a birth, death,
 PID reuse, or argv/cgroup rewrite. The gather layer folds exactly those into a monotonic version
 stamp; while it holds steady the resolver and the view-side grouping both reuse their prior
-result, so a settled desktop does no grouping work — the governing goal is that work track change,
+result, so a settled desktop does no grouping work — the key goal is that work track change,
 not population. Reuse is exact (a stable input provably yields identical groups), so a startup
 transient still self-corrects on the next change without a settling window.
 
@@ -504,7 +504,7 @@ each cycle proportional set size is re-derived by attributing the resident chang
 to private pages and recombining with the cached shared share — exact for private growth, and
 wrong only when the *shared mapping set* itself changes. The expensive walk therefore runs only to
 bootstrap a member and, on a slow refresh, to catch that shared-set drift; the earlier
-"re-walk whenever the resident set moved" gate is gone precisely because a moving resident set is
+"re-walk whenever the resident set moved" trigger is gone precisely because a moving resident set is
 what the estimate now handles for free. That backstop is **staggered by PID**, not a fixed age: a
 whole application is folded in one cycle, so an age-based backstop would make every member come due
 on the same later cycle and walk as a thundering herd — the dominant idle cost of an *untouched*
@@ -517,7 +517,7 @@ cache and kernel resources, not resident footprint. See
 
 ## Rendering (`etch`)
 
-A separate workspace crate, `crates/etch/` — a **retained-mode, value-gated** terminal
+A separate workspace crate, `crates/etch/` — a **retained-mode, change-tracked** terminal
 renderer with no atop domain types. It replaced ratatui, whose `Paragraph`/
 `LineTruncator` grapheme segmentation (≈43% of CPU) and blind 10k-cell `Buffer::diff`
 (≈22%) dominated profiles. Work is now proportional to what *changed*, not to screen
@@ -531,18 +531,18 @@ Two-level API: **structure declared once, values bound per frame.**
 - Per frame, `Display::begin_frame` → `Frame` exposes `line()` (free-form styled spans
   for the stat header/footer), `header()` (titles from the schema), and `table()`.
   Inside `table`, each `row(id, style, …)` binds columns: `r.field(value)` and
-  `r.fill(gate, closure)`.
+  `r.fill(key, closure)`.
 
-**The gate is the bound value itself.** `field<T: Display + Hash>(v)` hashes `v`
+**The change key is the bound value itself.** `field<T: Display + Hash>(v)` hashes `v`
 (fast `FxHash`) and compares to the value that produced the cell's last output. On a
 match the `Display` impl is *never invoked* — zero formatting, zero output. Because the
-formatted value and the gated value are the same `T`, the gate can never drift from
-what's shown. The `fill` column (Command) takes an explicit gate + a closure that runs
-only on a miss; its gate is a **content hash of the cmdline bytes + tree prefix**, not the
+formatted value and the change key are the same `T`, the check can never drift from
+what's shown. The `fill` column (Command) takes an explicit key + a closure that runs
+only on change; its key is a **content hash of the cmdline bytes + tree prefix**, not the
 `Cmd`-store handle (a changed cmdline reuses a freed slot index, so the handle is not a stable
 identity of the *content* — hashing the bytes is what stays correct across reuse).
 
-Per-row identity is the PID: same PID at the same screen line ⇒ per-cell gating; a
+Per-row identity is the PID: same PID at the same screen line ⇒ per-cell change tracking; a
 different PID (scroll happened) ⇒ the whole row repaints. A style change (selection
 move, state-color change) also forces the row. Unoccupied rows below the table are
 blanked. A terminal-size change (or the first frame) clears the screen and repaints
@@ -574,7 +574,7 @@ gigabytes indistinguishable); nice diverges from a neutral zero. CPU% has one de
 visible floor, because "used nothing" and "used a sliver" are categorically different, not
 adjacent magnitudes that should blend. Categorical columns (state, user, tree glyphs) use
 named colors — there is no ordering to interpolate. This is *why* the
-per-cell gate hashes the value **and** its style: a gradient-band crossing must repaint even
+per-cell change key hashes the value **and** its style: a gradient-band crossing must repaint even
 when the formatted text is byte-identical. The Command cell is multi-colored (dim path prefix,
 bright basename, muted tree connectors, an alarm tint when the binary or a linked library was
 deleted), so it records color *runs* the fill painter emits with per-run escapes. Row-level
@@ -583,7 +583,7 @@ flickered, and magnitude/kind now live in the per-cell colors instead.
 
 Not yet done (deliberately deferred, measured first): terminal **scroll regions**
 (`CSI S`/`T`) so a ±1 scroll shifts the terminal's own buffer instead of repainting the
-visible window. The value-gated renderer already removed both ratatui hot spots; scroll
+visible window. The change-tracked renderer already removed both ratatui hot spots; scroll
 regions are a pure optimization for the held-arrow case.
 
 ## CPU%
@@ -631,7 +631,7 @@ kernel state, not the "is it active" question the display answers.
 
 **System-wide CPU% is windowed the same way.** The machine-wide rate differences a ring of
 recent `/proc/stat` snapshots at its two endpoints (the same multi-second window as per-process
-CPU), not a single interval. A bare `cur − prev` delta at this cadence resolves only a few tens
+CPU), not a single interval. A bare `cur − prev` delta at this sample rate resolves only a few tens
 of jiffies, so a transient burst dominates one sample then vanishes — the bar jumps. The
 user/sys/iowait split is preserved because every counter is differenced over the same endpoints.
 
@@ -639,20 +639,20 @@ user/sys/iowait split is preserved because every counter is differenced over the
 
 Optional NVIDIA telemetry is a `dlsym`-loaded NVML with no build dependency (see the module doc);
 any probe failure just leaves atop CPU-only. It is the third of a rough gather : GPU : UI
-frame-time split, so its per-cycle work is gated on change the same way the two others are —
+frame-time split, so its per-cycle work runs only on change the same way the two others do —
 otherwise it dominated the profile, because the naive shape re-ran every NVML call every cycle
 regardless of whether the GPU did anything.
 
 Two costs are separated by how fast the thing they read moves. **Client discovery + VRAM** (the
 process-list enumeration that names GPU clients and their framebuffer footprint, plus device VRAM
-totals) moves slowly, so it runs on a **coarse cadence** and the result is *held* between
+totals) moves slowly, so it runs on a **coarse interval** and the result is *held* between
 refreshes — a client whose GPU is idle still owns its VRAM, so holding it is correct, not stale.
 The **per-process utilization poll** busy-polls the GPU's own processor for fresh perfmon samples
-and is by far the expensive call, so it is constrained two ways. First it is **gated**: it runs
-only when the GPU is actually doing work. Second, even then it runs on its own **coarse cadence**,
-its result *held* between polls rather than re-polled every cycle — because the driver produces a
-new per-process sample only every fraction of a second and retains several seconds of them, so a
-poll spaced well inside that retention drains the whole backlog losslessly. The governing goal is
+and is by far the expensive call, so it is constrained two ways. First, it runs only when the
+GPU is actually doing work. Second, even then it runs on its own **coarse interval**, its result
+*held* between polls rather than re-polled every cycle — because the driver produces a new
+per-process sample only every fraction of a second and retains several seconds of them, so a
+poll spaced well inside that retention drains the whole backlog losslessly. The key goal is
 *which* processes are (ab)using the GPU, not a precise instantaneous per-unit figure, so holding a
 reading for a second or two is imperceptible while cutting the busy-poll rate several-fold. The
 held reading is forced to a true zero the moment the device reads idle, so a process that stops is
@@ -661,20 +661,20 @@ virtualization-oriented one: the two cost the same, but the general call is spec
 concurrent processes while the older one assumes a single tenant — so the older call is kept only
 as a fallback where the newer symbol is absent.
 
-The gate is **device utilization, not client CPU activity** — a deliberate departure from the
-first instinct. A desktop GPU client (a browser, a compositor) is almost always CPU-busy even
-when it renders nothing, so a CPU gate would essentially never let the poll be skipped; and a
+The condition is **device utilization, not client CPU activity** — a deliberate departure from
+the first instinct. A desktop GPU client (a browser, a compositor) is almost always CPU-busy
+even when it renders nothing, so a CPU condition would essentially never skip the poll; and a
 long compute kernel runs the GPU flat-out while its host thread blocks at ~0% CPU, which a CPU
-gate would wrongly read as idle and zero. Device utilization is one cheap counter read that is
+check would wrongly read as idle and zero. Device utilization is one cheap counter read that is
 needed for the system bar anyway and answers exactly the right question — *is the GPU doing
-anything* — for both cases. An unreadable device counts as active, so the poll is never gated on
-an unknown. Because the utilization API is timestamp-based (it returns everything since the last
-observed sample), skipped cycles — whether gated away as idle or merely between coarse polls —
-lose no data: the next poll drains the backlog since the last one.
+anything* — for both cases. An unreadable device counts as active, so the poll is never skipped
+on an unknown. Because the utilization API is timestamp-based (it returns everything since the
+last observed sample), skipped cycles — whether idle or merely between coarse polls — lose no
+data: the next poll drains the backlog since the last one.
 Utilization sums across devices for a client spanning more than one GPU; VRAM is per-device max
 (compute and graphics lists double-report one context) then summed across devices. Idle steady
 state therefore costs only the coarse client refresh; an active GPU pays the utilization poll only
-on its own coarse cadence, which is all the per-process breakdown needs.
+on its own coarse interval, which is all the per-process breakdown needs.
 
 ## Dependencies
 
@@ -687,7 +687,7 @@ on its own coarse cadence, which is all the per-process breakdown needs.
   output backend.
 - `thoop` (workspace path crate) — THP-backed storage primitives (`MmapRegion`, the arena
   suballocator, `GenStore`, `TypedBuf`, `StrStore`). Backs the process row buffer and the
-  per-PID stores; depends only on `libc`. See the storage substrate section above.
+  per-PID stores; depends only on `libc`. See the storage foundation section above.
 - `libc` — syscalls. No `procfs` crate (it allocates and parses more than we need).
 
 (No lock-free snapshot cell anymore — the single-thread collapse retired `arc-swap`.)
@@ -696,7 +696,7 @@ on its own coarse cadence, which is all the per-process breakdown needs.
 
 - **Persistent-fd pool** replaced the per-cycle `open→read→close` chains — the
   close-storm fix. Cmdline/uid moved out of the io_uring chain into the `ProcTable` (plain
-  syscalls, coarse cadence).
+  syscalls, coarse interval).
 - **I/O target decoupled from storage** (implemented as a separate fixed landing pad): reads
   land in the pad, then `comm` is copied inline into the row. This bounds pinned memory and let
   the two-tier long-stat slot mechanism go away (one fixed slot size with ample margin).

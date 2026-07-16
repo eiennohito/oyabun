@@ -1,4 +1,4 @@
-//! Rendering via `etch` (retained-mode, value-gated).
+//! Rendering via `etch` (retained-mode, change-tracked).
 //!
 //! Layout (top → bottom):
 //! - System stats header (3 lines): CPU bar, Mem/Swap bars, Load/Tasks/Uptime.
@@ -8,8 +8,9 @@
 //!
 //! The table's column geometry lives in one [`Schema`] (see [`columns`]) that drives
 //! both the header and every body row. Each body cell binds a value that is *both*
-//! formatted and gated, so an unchanged column does zero work; the Command column
-//! gates on a content hash (the arena offset is not stable across snapshots) plus the
+//! formatted and change-tracked, so an unchanged column does zero work; the Command
+//! column uses a content hash as its change key (the arena offset is not stable across
+//! snapshots) plus the
 //! tree prefix. Collapsed rows show subtree-aggregate CPU%/MEM and a `▸ [+N]` marker.
 
 use std::fmt;
@@ -70,9 +71,9 @@ pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
     let gpu = app.gpu_available();
     let header_lines = header_lines(gpu);
 
-    // Each stat line is gated on the values that feed it: a width change forces a full
-    // repaint anyway, so the data alone is the gate. On interactive (non-gather) frames
-    // the build closures never run — no `format!`, no allocation.
+    // Each stat line is change-tracked on the values that feed it: a width change
+    // forces a full repaint anyway, so the data alone is the change key. On interactive
+    // (non-gather) frames the build closures never run — no `format!`, no allocation.
     frame.line(0, sys, |l| build_cpu_line(l, &sys, wsz));
     frame.line(1, sys, |l| build_mem_line(l, &sys, wsz));
     if gpu {
@@ -93,7 +94,7 @@ pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
     let privileged = app.is_privileged();
     let short_lived = app.short_lived();
     let log_path = crate::log::log_path();
-    // Gate on every value the footer shows, so a change in any of them repaints it.
+    // Change key covers every value the footer shows, so a change in any repaints it.
     frame.line(
         footer_row,
         (
@@ -452,7 +453,7 @@ fn render_body<W: Write>(
 
             // Selection is the only row-level color: a distinct background, applied to every
             // cell. A change flips the row-level style below, forcing a full-row repaint (so
-            // the bg reaches every cell); otherwise each cell gates and colors independently.
+            // the bg reaches every cell); otherwise each cell is change-tracked and colored independently.
             let bg = selected.then_some(palette::SELECTION_BG);
             let cmd = CommandCell {
                 prefix: prefix.as_str(),
@@ -484,9 +485,9 @@ fn render_body<W: Write>(
                     Mem(metrics.mem_bytes),
                     cell(Some(palette::rss(metrics.mem_bytes)), bg),
                 );
-                // Command gate: content hash (a changed cmdline reuses a freed store slot, so
-                // the handle isn't a stable content identity) + tree prefix + collapse suffix +
-                // the flags that drive its per-span colors.
+                // Command change key: content hash (a changed cmdline reuses a freed store
+                // slot, so the handle isn't a stable content identity) + tree prefix +
+                // collapse suffix + the flags that drive its per-span colors.
                 r.fill(
                     (
                         cmd.prefix,
@@ -551,14 +552,14 @@ struct RowView<'a> {
     suffix_n: u32,
     state: u8,
     nice: i8,
-    /// Stable per-row identity for the retained renderer's value gate.
+    /// Stable per-row identity for the retained renderer's change detection.
     key: u64,
     is_kthread: bool,
     basename_fg: Rgb,
 }
 
 /// Everything the Command cell needs to render itself, gathered once per row so the fill
-/// closure (and its gate) has a single value to close over.
+/// closure (and its change key) has a single value to close over.
 struct CommandCell<'a> {
     prefix: &'a str,
     prefix_cols: usize,
@@ -752,8 +753,8 @@ fn application_row_key(key: &crate::application::AppGroupKey) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Value formatters: Display (what's shown) + Hash (the gate). Same value for both,
-// so the gate can never drift from the rendered text.
+// Value formatters: Display (what's shown) + Hash (the change key). Same value for
+// both, so the change key can never drift from the rendered text.
 // ---------------------------------------------------------------------------
 
 /// CPU% in basis points, rendered as `N.NN%`.

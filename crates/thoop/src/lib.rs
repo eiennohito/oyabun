@@ -116,7 +116,7 @@ impl<T> std::fmt::Debug for Ref<T> {
 ///
 /// Only recently-released slots occupy the demoted range, so GC cost is proportional to
 /// churn, not population. The demoted range is 254 values wide (the two sentinels take the
-/// rest); at a ~2 Hz cadence that is ~127 generations of unambiguous wrapping comparison —
+/// rest); at a ~2 Hz interval that is ~127 generations of unambiguous wrapping comparison —
 /// vastly more than a live window of two readers. All sentinel and wrapping logic lives
 /// here so callers never see a raw byte.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

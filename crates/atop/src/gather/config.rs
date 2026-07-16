@@ -1,4 +1,4 @@
-//! Gatherer tuning knobs: slot sizes, cadences, pool sizing, and the env-overridable
+//! Gatherer tuning knobs: slot sizes, intervals, pool sizing, and the env-overridable
 //! [`Config`]. Grouped so the knob set is one named thing rather than scattered single-use
 //! readers. The slot-size and ring constants are also the contract the I/O backends
 //! (`uring`/`syscall`) read, re-exported from the `gather` root.
@@ -37,7 +37,7 @@ pub(crate) const MAX_POOL: u32 = 4096;
 /// box without a regrow; a busier host grows automatically.
 pub(crate) const INITIAL_ROWS: usize = 4096;
 
-/// Display refresh / gather cadence — the loop gathers this often.
+/// Display refresh / gather interval — the loop gathers this often.
 pub(crate) const REFRESH_MS: u64 = 500;
 pub const REFRESH_INTERVAL: Duration = Duration::from_millis(REFRESH_MS);
 
@@ -66,7 +66,7 @@ pub(crate) fn force_syscall() -> bool {
 /// Gatherer tuning knobs, read once from the environment. Grouped so the knob set is one
 /// named thing rather than scattered single-use readers.
 pub(crate) struct Config {
-    /// Full-scan cadence K — cycles between full `getdents` re-enumerations; skip cycles
+    /// Full-scan interval K — cycles between full `getdents` re-enumerations; skip cycles
     /// reuse the maintained live set + birth probe. Derived from a wall-clock target so
     /// birth latency is `≤ K × interval`. `ATOP_ENUM_EVERY` (1 = full scan every cycle).
     pub(crate) enum_every: u64,

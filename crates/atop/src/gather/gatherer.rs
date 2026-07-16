@@ -168,7 +168,7 @@ impl Gatherer {
         Self::with_source(page_size, proc_dir, true)
     }
 
-    /// Like [`new`](Self::new) but `allow_bpf` gates the privileged probe — `false` forces the
+    /// Like [`new`](Self::new) but `allow_bpf` controls the privileged probe — `false` forces the
     /// `/proc` source (the proc-path tests assert proc-specific behaviour and must not flip to
     /// BPF when run under `caprun`).
     fn with_source(page_size: u64, proc_dir: ProcDir, allow_bpf: bool) -> Self {
@@ -290,7 +290,7 @@ impl Gatherer {
     }
 
     /// The generation of the latest completed cycle. Advances by one each cycle, in lock-step
-    /// with per-PID sidecar liveness — the change-gated memory sampler keys its cache on it.
+    /// with per-PID sidecar liveness — the change-driven memory sampler keys its cache on it.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
@@ -298,7 +298,7 @@ impl Gatherer {
 
     /// Version of the identity-relevant per-PID inputs — advances only on real change (birth,
     /// death, PID reuse, or a cmdline/cgroup/flatpak rewrite). Both the identity resolver and the
-    /// view-side grouping gate their recomputation on it, so a settled desktop rebuilds neither.
+    /// view-side grouping skip recomputation unless it moves, so a settled desktop rebuilds neither.
     #[must_use]
     pub(crate) fn meta_epoch(&self) -> u64 {
         self.table.meta_epoch()
@@ -385,7 +385,7 @@ impl Gatherer {
     /// reclaimed at once (`min_live` = the just-finished generation).
     pub fn cycle(&mut self) {
         // The generation being built. It advances every cycle, in lock-step with the per-PID
-        // cadence and the arena's region-retirement tagging.
+        // interval and the arena's region-retirement tagging.
         let building_gen = self.generation + 1;
         self.arena.set_gen(building_gen);
 
@@ -469,7 +469,7 @@ mod tests {
         Gatherer::with_source(crate::sys::page_size(), proc_dir, false)
     }
 
-    /// The `/proc` source's tuning knobs, for tests that drive the enumeration cadence.
+    /// The `/proc` source's tuning knobs, for tests that drive the enumeration interval.
     /// Panics if the gatherer is not in `/proc` mode (it always is here — `new_test`).
     fn proc_config(g: &mut Gatherer) -> &mut Config {
         match &mut g.source {
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(g.pool_overflow(), 0, "default pool should not overflow");
     }
 
-    /// cmdline survives the coarse cadence: a PID not refreshed this cycle keeps its
+    /// cmdline survives the coarse interval: a PID not refreshed this cycle keeps its
     /// persistent `Cmd`-store slot, still resolvable directly from the store.
     #[test]
     fn cmdline_persists_across_coarse_cycles() {
@@ -710,7 +710,7 @@ mod tests {
         );
     }
 
-    /// §3b + cadence: a process that dies vanishes the **same** (skip) cycle via the pool
+    /// §3b + interval: a process that dies vanishes the **same** (skip) cycle via the pool
     /// `ESRCH` → re-tombstone → compact → survivor-rebuild path — it never lingers until
     /// the next full scan, and no phantom row is left behind.
     #[test]
@@ -759,7 +759,7 @@ mod tests {
         }
 
         g.cycle();
-        g.cycle(); // second cycle exercises CPU% windowing + cmdline cadence in bpf mode
+        g.cycle(); // second cycle exercises CPU% windowing + cmdline interval in bpf mode
 
         let procs = g.procs().as_slice();
         assert!(procs.iter().any(|p| p.pid == 1), "pid 1 missing");

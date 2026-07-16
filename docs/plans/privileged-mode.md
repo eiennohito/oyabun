@@ -56,7 +56,7 @@ Dual path — both adequate, BPF is the bonus:
   output — near-zero marginal cost, already walking the task. Gated on the kernel having task
   I/O accounting compiled in; absent ⇒ the field is simply zero.
 - **Unprivileged**: `/proc/<pid>/io` with persistent fds and delta math like CPU ticks.
-  Same-user is free; other users need `CAP_SYS_PTRACE`. Visibility-gated (only read for visible
+  Same-user is free; other users need `CAP_SYS_PTRACE`. Only read for visible
   rows when the I/O column is shown).
 
 These are independently valuable and independently testable; either can land first. Both add

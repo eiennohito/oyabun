@@ -19,7 +19,7 @@
 //! PID count — the arena no longer counts against the per-process lock limit, which is
 //! what lets a non-root `perf` fit its own ring alongside us. In-flight depth is bounded
 //! by `READ_SLOTS`; at high PID counts a cycle takes a few more wait rounds (negligible
-//! against the 500 ms cadence).
+//! against the 500 ms interval).
 //!
 //! A held read returning `ESRCH` (the incarnation died / the PID was reused) closes the
 //! slot and reads the current incarnation transiently this cycle; it gets a fresh
@@ -27,7 +27,7 @@
 //! `RLIMIT_NOFILE`), the overflow uses the shared transient read.
 //!
 //! `uid`/`cmdline` are not read here — they are the `ProcTable`'s job (plain syscalls on a
-//! coarse cadence). This backend produces only the volatile stat fields.
+//! coarse interval). This backend produces only the volatile stat fields.
 
 use std::io;
 
@@ -474,7 +474,7 @@ impl UringBackend {
                     .read_pad
                     .bytes(ctx.read_slot as usize * STAT_SLOT, ctx.stat_len as usize);
                 if let Some(f) = parse::parse_stat(slot) {
-                    // New chain (open_res > 0): two gates before accepting.
+                    // New chain (open_res > 0): two checks before accepting.
                     if ctx.open_res > 0 {
                         // 1. PID cross-check: the stat line's PID must match what we
                         //    asked for. A mismatch means the read hit a stale fd.
@@ -491,7 +491,7 @@ impl UringBackend {
                             procs.tombstone(idx);
                             continue;
                         }
-                        // 2. Thread-leader gate: reject non-leader threads whose TID
+                        // 2. Thread-leader check: reject non-leader threads whose TID
                         //    falls in the probe window (`/proc` VFS gotcha — `open`
                         //    resolves any task, `getdents` returns only TGIDs).
                         //    `pidfd_open(pid, 0)` — one syscall, EINVAL for non-leaders.

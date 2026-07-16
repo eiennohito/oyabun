@@ -24,7 +24,7 @@ generational GC) and makes data races non-representable. See `docs/ARCHITECTURE.
 ## Core constraints
 
 - **Lowest possible footprint, on purpose**: a *full-featured* process manager **and** the
-  smallest CPU/memory cost we can engineer — a hard goal, not a nicety. The governing belief:
+  smallest CPU/memory cost we can engineer — a hard goal, not a nicety. The core belief:
   **nothing is free.** Every convenience has a price — a per-cycle copy, an allocation, a
   syscall, a bounds check on the hot path — and we would rather build the careful primitive
   once than pay that price every cycle forever. This is deliberately anti-pragmatic: when the
@@ -60,7 +60,7 @@ Collapse rules live in the state cache. Matching: check inode first (survives re
 ## I/O monitoring
 
 - **Disk I/O**: per-process read/write bytes from `/proc/pid/io`. Nearly free — same cost as
-  `/proc/pid/stat`, fits zero-copy arena model. Visibility-gated (only read for visible
+  `/proc/pid/stat`, fits zero-copy arena model. Only read for visible
   processes when I/O column shown). Requires same-user or `CAP_SYS_PTRACE`/root for other
   users' processes. In privileged mode, read from `task->ioac` in the BPF task iterator
   (zero marginal cost).

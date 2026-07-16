@@ -1,7 +1,7 @@
 //! End-to-end rendering tests: render to an in-memory writer, parse the emitted
 //! bytes with a real terminal emulator (`vt100`), and assert both the resulting
 //! screen *and* that work is proportional to what changed (the whole point of the
-//! gate mechanism).
+//! change-detection mechanism).
 
 use etch::{ColSpec, Display, Rgb, Schema, Style};
 
@@ -263,7 +263,7 @@ fn unchanged_line_skips_the_build_closure() {
     }
     let after1 = d.get_ref().len();
 
-    // Same gate value: the closure must not run at all (no formatting), no output.
+    // Same change key: the closure must not run at all (no formatting), no output.
     let ran = Cell::new(false);
     {
         let mut f = d.begin_frame(20, 2);
@@ -273,16 +273,23 @@ fn unchanged_line_skips_the_build_closure() {
         });
         f.commit().unwrap();
     }
-    assert!(!ran.get(), "gate hit must skip the build closure entirely");
-    assert_eq!(d.get_ref().len(), after1, "gate hit must emit nothing");
+    assert!(
+        !ran.get(),
+        "unchanged value must skip the build closure entirely"
+    );
+    assert_eq!(
+        d.get_ref().len(),
+        after1,
+        "unchanged value must emit nothing"
+    );
 
-    // Different gate value: repaints.
+    // Different change key: repaints.
     {
         let mut f = d.begin_frame(20, 2);
         f.line(0, 8u32, |l| l.span("hello", CYAN));
         f.commit().unwrap();
     }
-    assert!(d.get_ref().len() > after1, "gate miss must repaint");
+    assert!(d.get_ref().len() > after1, "changed value must repaint");
 }
 
 #[test]
@@ -359,7 +366,7 @@ fn styled_field_emits_its_color() {
 #[test]
 fn color_band_crossing_repaints_same_value() {
     // Same displayed text, different per-cell color (a gradient-band crossing) must
-    // repaint — the gate hashes (value, style), not the value alone.
+    // repaint — the change key hashes (value, style), not the value alone.
     let schema = schema();
     let mut d = Display::new(Vec::new());
     let draw = |d: &mut Display<Vec<u8>>, color: Rgb| {
@@ -436,7 +443,7 @@ fn unicode_fill_neutralizes_control_chars() {
         t.row(1, Style::NONE, |r| {
             r.field(1u32);
             r.field("0.00%");
-            r.fill("gate", |c| c.unicode("é\u{1b}x".as_bytes()));
+            r.fill("cmd", |c| c.unicode("é\u{1b}x".as_bytes()));
         });
     });
     f.commit().unwrap();

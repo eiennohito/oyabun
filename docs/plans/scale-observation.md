@@ -6,7 +6,7 @@
 > the `Arc<Snapshot>`/`ArcSwap`-release ordering, and the lease-lifetime reasoning are all gone
 > — incremental carry-forward is now just in-place store updates between cycles, with no lease
 > and no buffer to seed (the row buffer persists and is mutated in place). The **sampling
-> cadence** core of this plan (amortizing O(n) observation across cycles, the two-tier
+> interval** core of this plan (amortizing O(n) observation across cycles, the two-tier
 > display-relevant-vs-background split) is unchanged and independent of threading.
 
 ## Problem
@@ -155,13 +155,13 @@ This is the riskiest part of the plan and the reason the THP storage work (now l
 arena, the per-PID stores, the stable `Cmd` string store, and the THP-resident PID index; see
 `../ARCHITECTURE.md`) came first.
 
-### 4. Enumeration cadence decoupled from sampling
+### 4. Enumeration interval decoupled from sampling
 
 **Implemented — see `ARCHITECTURE.md`, "`/proc` enumeration".** Enumeration is a maintained
 live set: full re-scan only every ~1 s, a birth probe between scans, hygiene that keeps the
 snapshot phantom-free, deaths dropped the same cycle. **Reuse it** — do not re-implement. The
 only addition here:
-- Enumeration cadence (births, K) and per-PID sampling cadence (load, N from the X-second SLA)
+- Enumeration interval (births, K) and per-PID sampling interval (load, N from the X-second SLA)
   are **independent knobs**. K bounds *birth* latency; X/N bounds *sampling* staleness.
 - Deaths of sampled PIDs are caught immediately by the pool; the rest at the next scan.
 
@@ -203,7 +203,7 @@ only addition here:
 - `gather/mod.rs`: `CpuTracker` → per-PID `last`/wall-clock ring; the **two-axis** tier decision
   (display-relevance ∪ volatility, §1/§1b); a `CpuHistory`-derived volatility hint; rotation by
   the X-second SLA (`N = ceil(X/interval)`); the incremental-snapshot seeding. Enumeration
-  cadence (K) + birth probe are reused from the coordination plan (§4 here), not re-built.
+  interval (K) + birth probe are reused from the coordination plan (§4 here), not re-built.
 - `gather/mod.rs` (`Ctrl`): `Ctrl::Viewport { visible, collapsed }`; subset-carrying `Refresh`.
 - `snapshot.rs`: incremental seed-from-previous; per-entry last-sampled generation (for the
   tier logic / debugging); carried-forward string validity.
@@ -234,7 +234,7 @@ only addition here:
   reparents its children immediately in the kernel but our tree lags ≤ N cycles unless we
   re-read a dead parent's former children on its death. Decide whether that targeted re-read is
   worth it.
-- **Worth-it gate**: this is pure extreme-scale investment with real complexity and new coupling.
+- **Worth-it check**: this is pure extreme-scale investment with real complexity and new coupling.
   It should not be built unless the extreme-hardware target is active — at normal scale the THP
   arena plan already makes all-PID observation cheap enough.
 

@@ -13,7 +13,7 @@ Implemented:
 - All inline tests ported from `StreamBuilder` to `Stream::parse` DSL strings
 - Synthetic CPU/display-state, birth/death, and terminal text smoke tests
 - Tree reshuffling on reparenting
-- Cmdline settling window and staggered refresh cadence
+- Cmdline settling window and staggered refresh interval
 - Collapsed subtree CPU/memory aggregate rendering
 - Full-frame 80×24 layout assertions
 - `vt100::Cell`-based foreground/background color assertions for CPU, selection, and state cells
@@ -67,7 +67,7 @@ All nine originally planned test scenarios are covered:
 - Display-state stabilization (S→R when ticks accumulate)
 - Birth/death across cycles
 - Tree reshuffling on reparenting
-- Cmdline settling window + staggered refresh cadence
+- Cmdline settling window + staggered refresh interval
 - Full-frame layout at 80×24
 - Collapsed subtree with aggregate CPU/mem
 - CPU color gradient band crossings
@@ -137,7 +137,7 @@ not the source; the stream carries the inputs to those decisions, not their outp
 ### What replaying a stream tests
 
 The full common tail: CPU% computation (ring, moving average, peak), display-state
-derivation (S→R stabilization), the cmdline cadence and settling window, tree build,
+derivation (S→R stabilization), the cmdline interval and settling window, tree build,
 subtree aggregation, system-stats windowing — and then the renderer on top of it. One
 stream, one replay, both the state-computation and UI pipelines exercised.
 

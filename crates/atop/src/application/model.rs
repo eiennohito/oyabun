@@ -386,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn regroup_is_epoch_gated_but_metrics_still_refresh() {
+    fn regroup_is_epoch_driven_but_metrics_still_refresh() {
         let procs = vec![proc(1, 1000), proc(2, 1000), proc(3, 1000)];
         let ids = [
             desktop_id("foo", true),
@@ -399,7 +399,7 @@ mod tests {
         assert_eq!(groups.groups().len(), 1);
 
         // Same epoch, but feed no identities: were regroup to run, the group would vanish. The
-        // gate holds it, and metrics still refresh over the current buffer.
+        // epoch holds it, and metrics still refresh over the current buffer.
         groups.rebuild(&procs, std::iter::empty(), &mut resolver, |_| None, 5);
         assert_eq!(groups.groups().len(), 1);
         assert_eq!(groups.groups()[0].threads, 6);

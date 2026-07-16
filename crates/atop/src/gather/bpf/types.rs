@@ -73,7 +73,7 @@ const _: () = assert!(
 /// ±1-jiffy quantized) and to start-time identity (a mismatch only makes `kill` refuse — safe).
 ///
 /// If profiling ever shows the per-row `ns / ns_per_tick` division is hot (unlikely: ~2 per
-/// process per cycle at a ~2 Hz cadence), the divisor is a single value — swap in a precomputed
+/// process per cycle at a ~2 Hz interval), the divisor is a single value — swap in a precomputed
 /// libdivide-style magic multiply+shift here without touching call sites.
 pub fn ns_per_tick(clk_tck: u64) -> u64 {
     (1_000_000_000 / clk_tck.max(1)).max(1)

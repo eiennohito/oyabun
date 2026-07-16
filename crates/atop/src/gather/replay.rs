@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn application_memory_sampling_is_visible_and_gated() {
+    fn application_memory_sampling_is_visible_and_change_driven() {
         let mut r =
             Replayer::from_stream(stream(include_str!("../../tests/fixtures/app-groups.dsl")));
         r.cycle();
@@ -607,7 +607,7 @@ mod tests {
         let after_first = r.app.memory_read_count();
         assert!(after_first > 0, "a visible folded row samples its members");
 
-        // Same generation, same viewport: the resident-set gate reads nothing further.
+        // Same generation, same viewport: the resident-set check reads nothing further.
         r.app.prepare_visible_rows(1);
         assert_eq!(r.app.memory_read_count(), after_first);
     }
@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_cmdline_settles_then_waits_for_refresh_cadence() {
+    fn replay_cmdline_settles_then_waits_for_refresh_interval() {
         let stream = stream(
             r"
             cycle 0

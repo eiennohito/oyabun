@@ -10,7 +10,7 @@
 //! keyed on it may persist; a structural heuristic is *session-only*. Cgroup identity always
 //! wins over structural, so a process can never present two competing identities.
 //!
-//! Recomputation is change-gated (goal #1: work tracks change, not population). The gather
+//! Recomputation runs only on change (goal #1: work tracks change, not population). The gather
 //! table reports a metadata epoch that moves only when a per-PID input actually changes; while
 //! it holds steady the resolver reuses its cached identities and a settled desktop does no
 //! identity work at all.

@@ -22,7 +22,7 @@ It earns display space because acting on it (a restart) is cheap and the cost of
 
 This asymmetry is imposed by the operating system, not chosen by us, and any solution must honor it.
 
-An **executable** deletion is *absorbing*: once the kernel marks the running image gone, that incarnation can never return to a good state, so the fact is permanent for the life of the process.
+An **executable** deletion is *permanent*: once the kernel marks the running image gone, that incarnation can never return to a good state.
 The truth, once established, never needs re-checking.
 
 A **library** deletion is *transient*: a process can unmap a replaced library and map its successor, so the condition can appear and later clear.

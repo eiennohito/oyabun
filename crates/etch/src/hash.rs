@@ -1,9 +1,9 @@
-//! The gate hasher.
+//! Value hashing for change detection.
 //!
-//! A cell's gate is the hash of the value(s) bound to it. On the next frame we hash
-//! the new value and compare: equal ⇒ the value is unchanged ⇒ skip formatting and
-//! I/O entirely. Collisions are statistically negligible for u64 and self-correct on
-//! the next change, so a fast non-cryptographic mix beats `SipHash` here (the keys
+//! A cell's change key is the hash of the value(s) bound to it. On the next frame we
+//! hash the new value and compare: equal ⇒ the value is unchanged ⇒ skip formatting
+//! and I/O entirely. Collisions are statistically negligible for u64 and self-correct
+//! on the next change, so a fast non-cryptographic mix beats `SipHash` here (the keys
 //! are domain values, not attacker-controlled).
 
 use std::hash::{Hash, Hasher};
@@ -12,18 +12,18 @@ const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
 /// `FxHash`-style hasher: one rotate-xor-multiply per word.
 #[derive(Default)]
-pub struct GateHasher {
+pub struct ChangeHasher {
     state: u64,
 }
 
-impl GateHasher {
+impl ChangeHasher {
     #[inline]
     fn add(&mut self, word: u64) {
         self.state = (self.state.rotate_left(5) ^ word).wrapping_mul(SEED);
     }
 }
 
-impl Hasher for GateHasher {
+impl Hasher for ChangeHasher {
     #[inline]
     fn finish(&self) -> u64 {
         self.state
@@ -64,10 +64,10 @@ impl Hasher for GateHasher {
     }
 }
 
-/// Hash one gate value to a `u64`.
+/// Hash a value to a `u64` for change detection.
 #[inline]
-pub fn gate<T: Hash>(value: &T) -> u64 {
-    let mut h = GateHasher::default();
+pub fn hash_value<T: Hash>(value: &T) -> u64 {
+    let mut h = ChangeHasher::default();
     value.hash(&mut h);
     h.finish()
 }
@@ -78,17 +78,17 @@ mod tests {
 
     #[test]
     fn distinct_values_distinct_hashes() {
-        assert_ne!(gate(&1_u32), gate(&2_u32));
-        assert_ne!(gate(&"foo"), gate(&"bar"));
-        assert_ne!(gate(&(1_u32, 2_u32)), gate(&(2_u32, 1_u32)));
+        assert_ne!(hash_value(&1_u32), hash_value(&2_u32));
+        assert_ne!(hash_value(&"foo"), hash_value(&"bar"));
+        assert_ne!(hash_value(&(1_u32, 2_u32)), hash_value(&(2_u32, 1_u32)));
     }
 
     #[test]
     fn equal_values_equal_hashes() {
-        assert_eq!(gate(&12345_u64), gate(&12345_u64));
+        assert_eq!(hash_value(&12345_u64), hash_value(&12345_u64));
         assert_eq!(
-            gate(&"slack --type=renderer"),
-            gate(&"slack --type=renderer")
+            hash_value(&"slack --type=renderer"),
+            hash_value(&"slack --type=renderer")
         );
     }
 }

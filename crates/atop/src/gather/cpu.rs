@@ -14,7 +14,7 @@ use super::ring::Ring;
 /// 10 s). Longer = a calmer moving average and a longer spike memory.
 const CPU_WINDOW_MS: u64 = 10_000;
 /// Per-process history depth, derived as `window ÷ refresh` so the window stays
-/// ~`CPU_WINDOW_MS` regardless of the refresh cadence.
+/// ~`CPU_WINDOW_MS` regardless of the refresh interval.
 const CPU_WINDOW: usize = {
     let n = (CPU_WINDOW_MS / REFRESH_MS) as usize;
     if n == 0 { 1 } else { n }
@@ -27,7 +27,7 @@ pub(crate) const MIN_SAMPLE: Duration = Duration::from_millis(100);
 /// time — short enough that a genuinely idle process reverts to its real state within a
 /// couple of seconds, long enough that a low-but-active process reads R without flicker.
 const ACTIVE_WINDOW_MS: u64 = 2_000;
-/// [`ACTIVE_WINDOW_MS`] expressed in samples at the current refresh cadence — the `n`
+/// [`ACTIVE_WINDOW_MS`] expressed in samples at the current refresh interval — the `n`
 /// passed to [`CpuRing::had_ticks`].
 pub(crate) const ACTIVE_SAMPLES: usize = {
     let n = (ACTIVE_WINDOW_MS / REFRESH_MS) as usize;

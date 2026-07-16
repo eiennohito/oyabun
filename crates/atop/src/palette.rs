@@ -14,7 +14,7 @@
 //! All color is [`Rgb`]; a `None` returned by a per-column rule means "terminal default" (used
 //! where a value is deliberately unremarkable, e.g. a multi-threaded thread count). Gradients
 //! interpolate with integer math — no float accumulation, cheap enough to run per repainted
-//! cell (and the renderer gates repaints, so it rarely does).
+//! cell (and the renderer skips unchanged cells, so it rarely does).
 
 use etch::Rgb;
 

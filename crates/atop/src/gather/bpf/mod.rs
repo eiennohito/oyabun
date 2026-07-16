@@ -6,7 +6,7 @@
 //!
 //! **Emit-on-change.** The iterator walks every task each cycle (there is no kernel signal for
 //! "a sleeping process's rss/utime moved", so polling is unavoidable), but the BPF program
-//! writes a row only when the process's observable state *changed* — gated by a per-tgid
+//! writes a row only when the process's observable state *changed* — conditional on a per-tgid
 //! kernel hash of its **hot** fields (CPU time, run state, resident pages, parent). So the
 //! `read()` stream userspace drains is O(changed), not O(all): the kernel walk cost stays, but
 //! the `copy_to_user` + parse cost — the measured hot spot — collapses on an idle box. The

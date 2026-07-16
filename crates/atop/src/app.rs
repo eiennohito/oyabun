@@ -252,7 +252,7 @@ impl App {
             gatherer.meta_epoch(),
         );
         // Reset the per-cycle proportional-read budget and evict cached members of dead/reused
-        // PIDs. The resident-set gate then reads only what actually moved, when a group is
+        // PIDs. The resident-set check then reads only what actually moved, when a group is
         // visible and collapsed (`prepare_visible_rows`).
         memory.begin_cycle(gatherer.generation(), procs);
     }

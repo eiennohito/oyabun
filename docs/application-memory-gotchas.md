@@ -61,10 +61,10 @@ inaccurate only while the *shared mapping set* itself has changed since the last
 The expensive walk then runs only in two situations: to bootstrap a member with no cached split
 yet, and, on a slow staggered refresh, to re-establish the split and so catch shared-set drift —
 the one thing the free resident reading cannot reveal. The earlier "re-walk whenever the resident
-set moved enough" gate is gone, because a moving resident set is exactly what the estimate now
-absorbs for free; that gate was what made a busy application re-walk every cycle. Walks are bounded
+set moved enough" trigger is gone, because a moving resident set is exactly what the estimate
+handles for free; that trigger was what made a busy application re-walk every cycle. Walks are bounded
 by a fixed per-cycle budget and prioritized largest-member-first, so newly folding a large
-application converges over a few cycles instead of spiking one, and a settled desktop walks
+application settles over a few cycles instead of spiking one, and a settled desktop walks
 essentially nothing. The staggered refresh is spread by PID rather than by a fixed age, so the
 members of a group folded together do not all come due on the same later cycle and walk as one
 herd.

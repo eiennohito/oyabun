@@ -5,7 +5,7 @@
 //! fresh each cycle. The result lands in the cycle's [`SystemStats`].
 //!
 //! **Windowed, not single-interval.** A bare `cur − prev` delta at the 500 ms / 100 Hz
-//! cadence resolves only ~50 jiffies, so a transient burst dominates one sample then
+//! interval resolves only ~50 jiffies, so a transient burst dominates one sample then
 //! vanishes — the bar jumps. Instead this keeps a ring of the last N snapshots (a ~10 s
 //! window, matching the per-process CPU window) and rates the two window endpoints:
 //! `(counter[now] − counter[now − window]) / (total[now] − total[now − window])`. O(1) per
@@ -19,7 +19,7 @@ use crate::sys::{self, RawCpuCounters, RawSystemSnapshot};
 
 /// System CPU averaging window as wall-clock time (matches the per-process CPU window).
 const SYS_CPU_WINDOW_MS: u64 = 10_000;
-/// Snapshot ring depth: the window in samples at the current cadence. The oldest retained
+/// Snapshot ring depth: the window in samples at the current interval. The oldest retained
 /// snapshot is this many cycles back, so the rate spans ~`SYS_CPU_WINDOW_MS`.
 const SYS_CPU_SAMPLES: usize = {
     let n = (SYS_CPU_WINDOW_MS / REFRESH_MS) as usize;

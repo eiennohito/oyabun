@@ -17,18 +17,18 @@ use crossterm::terminal::{Clear, ClearType};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::cell::Cell;
-use crate::hash::gate;
+use crate::hash::hash_value;
 use crate::line::{Line, Run};
 use crate::schema::{Align, Geom, Schema};
 use crate::style::{self, Rgb, Style};
 
-/// Addresses one cell within the retained grid for gate comparison.
+/// Addresses one cell within the retained grid for change detection.
 #[derive(Clone, Copy)]
 struct Slot {
     row: u16,
     idx: usize,
     /// The whole row is forced to repaint (new identity at this line, or a style
-    /// change) — bypass the per-cell gate.
+    /// change) — bypass per-cell change detection.
     full: bool,
 }
 
@@ -43,11 +43,11 @@ struct FillGeom {
 /// What a screen row currently shows, so the next frame can diff against it.
 enum RowSlot {
     Empty,
-    /// A free-form line, gated by a single content hash.
+    /// A free-form line, change-tracked by a single content hash.
     Line {
         hash: u64,
     },
-    /// A table row, gated per cell plus a row identity and style.
+    /// A table row, change-tracked per cell plus a row identity and style.
     Table {
         id: u64,
         style: Style,
@@ -145,12 +145,12 @@ impl<W: Write> Display<W> {
                 cells,
             } if cells.len() == ncols => {
                 if *pid == id {
-                    // Same process at this line: per-cell gating applies.
+                    // Same process at this line: per-cell change detection applies.
                     let full = frame_full || *st != style;
                     *st = style;
                     full
                 } else {
-                    // Different process (scroll / churn): reuse the buffer, reset gates.
+                    // Different process (scroll / churn): reuse the buffer, reset hashes.
                     *pid = id;
                     *st = style;
                     cells.fill(0);
@@ -169,9 +169,9 @@ impl<W: Write> Display<W> {
         }
     }
 
-    /// Compare a cell's new gate hash against the stored one and update it. Returns
-    /// whether the cell must repaint (gate miss, or the row is forced).
-    fn gate_cell(&mut self, slot: Slot, g: u64) -> bool {
+    /// Compare a cell's new hash against the stored one and update it. Returns
+    /// whether the cell must repaint (changed, or the row is forced).
+    fn cell_changed(&mut self, slot: Slot, g: u64) -> bool {
         if usize::from(slot.row) >= self.rows.len() {
             return false;
         }
@@ -186,10 +186,10 @@ impl<W: Write> Display<W> {
         }
     }
 
-    /// Bind a fixed-width field with an explicit per-cell style. The gate hashes
-    /// `(value, style)`, so a color-band crossing (same value, new color) repaints even
-    /// though the text is unchanged. On a gate match (and no forced repaint) the value's
-    /// `Display` impl is never invoked.
+    /// Bind a fixed-width field with an explicit per-cell style. The change key
+    /// hashes `(value, style)`, so a color-band crossing (same value, new color)
+    /// repaints even though the text is unchanged. When unchanged (and no forced
+    /// repaint) the value's `Display` impl is never invoked.
     fn paint_field<T: FmtDisplay + Hash>(
         &mut self,
         slot: Slot,
@@ -197,7 +197,7 @@ impl<W: Write> Display<W> {
         geom: Geom,
         value: &T,
     ) {
-        if !self.gate_cell(slot, gate(&(value, style))) {
+        if !self.cell_changed(slot, hash_value(&(value, style))) {
             return;
         }
         self.scratch.clear();
@@ -205,7 +205,7 @@ impl<W: Write> Display<W> {
         paint_fixed(&mut self.batch, slot.row, geom, style, &self.scratch);
     }
 
-    /// Bind the fill column. The render closure runs only on a gate miss / forced
+    /// Bind the fill column. The render closure runs only when changed / forced
     /// repaint; otherwise no formatting happens. The cell records color runs the fill
     /// painter emits with per-run SGR.
     fn paint_fill<G: Hash>(
@@ -213,10 +213,10 @@ impl<W: Write> Display<W> {
         slot: Slot,
         style: Style,
         geom: FillGeom,
-        gate_val: &G,
+        key: &G,
         render: impl FnOnce(&mut Cell),
     ) {
-        if !self.gate_cell(slot, gate(gate_val)) {
+        if !self.cell_changed(slot, hash_value(key)) {
             return;
         }
         self.scratch.clear();
@@ -254,17 +254,17 @@ impl<W: Write> Display<W> {
         &mut self,
         row: u16,
         frame_full: bool,
-        gate_val: &G,
+        key: &G,
         build: impl FnOnce(&mut Line),
     ) {
         if usize::from(row) >= self.rows.len() {
             return;
         }
-        let hash = gate(gate_val);
+        let hash = hash_value(key);
         if !frame_full
             && matches!(&self.rows[row as usize], RowSlot::Line { hash: h } if *h == hash)
         {
-            return; // gate hit: the build closure never runs — no formatting, no I/O
+            return; // unchanged: the build closure never runs — no formatting, no I/O
         }
         {
             let mut line = Line::new(&mut self.line_text, &mut self.line_runs, self.width);
@@ -297,7 +297,7 @@ impl<W: Write> Display<W> {
                 push_aligned(&mut self.scratch, geom, spec.title);
             }
         }
-        let hash = gate(&(self.scratch.as_str(), style));
+        let hash = hash_value(&(self.scratch.as_str(), style));
         let changed = !matches!(&self.rows[row as usize], RowSlot::Line { hash: h } if *h == hash);
         if !frame_full && !changed {
             return;
@@ -329,11 +329,11 @@ impl<W: Write> Frame<'_, W> {
         (self.d.width, self.d.height)
     }
 
-    /// A free-form styled line (system stats, footer), gated on the value(s) that
-    /// determine its content. On a gate match the `build` closure never runs — no
-    /// formatting, no allocation, no I/O.
-    pub fn line<G: Hash>(&mut self, row: u16, gate: G, build: impl FnOnce(&mut Line)) {
-        self.d.paint_line(row, self.full, &gate, build);
+    /// A free-form styled line (system stats, footer), change-tracked on the
+    /// value(s) that determine its content. When unchanged the `build` closure
+    /// never runs — no formatting, no allocation, no I/O.
+    pub fn line<G: Hash>(&mut self, row: u16, key: G, build: impl FnOnce(&mut Line)) {
+        self.d.paint_line(row, self.full, &key, build);
     }
 
     /// The table's column-title row, derived from the schema.
@@ -426,15 +426,15 @@ pub struct Row<'d, 's, W: Write> {
 
 impl<W: Write> Row<'_, '_, W> {
     /// Bind the next fixed column to a value in the row's style. The value is both
-    /// formatted (`Display`) and gated (`Hash`) — the same value for both, so the gate
-    /// can never drift from what's shown.
+    /// formatted (`Display`) and hashed (`Hash`) — the same value for both, so the
+    /// change key can never drift from what's shown.
     pub fn field<T: FmtDisplay + Hash>(&mut self, value: T) {
         self.styled_field(value, self.style);
     }
 
     /// Like [`field`](Self::field) but overrides the row style for this one cell — the
-    /// per-cell coloring path (magnitude gradients, categorical roles). The gate hashes
-    /// `(value, style)`, so a same-value color-band crossing still repaints.
+    /// per-cell coloring path (magnitude gradients, categorical roles). The change key
+    /// hashes `(value, style)`, so a same-value color-band crossing still repaints.
     pub fn styled_field<T: FmtDisplay + Hash>(&mut self, value: T, style: Style) {
         let i = self.idx;
         self.idx += 1;
@@ -447,9 +447,9 @@ impl<W: Write> Row<'_, '_, W> {
         self.d.paint_field(slot, style, geom, &value);
     }
 
-    /// Bind the fill column: an explicit gate plus a render closure (run only on a
-    /// gate miss) for content too complex for a single `Display`.
-    pub fn fill<G: Hash>(&mut self, gate_val: G, render: impl FnOnce(&mut Cell)) {
+    /// Bind the fill column: an explicit change key plus a render closure (run
+    /// only when changed) for content too complex for a single `Display`.
+    pub fn fill<G: Hash>(&mut self, key: G, render: impl FnOnce(&mut Cell)) {
         let i = self.idx;
         self.idx += 1;
         let (x, sep, avail) = self.schema.fill_geom(i, self.d.width);
@@ -458,13 +458,8 @@ impl<W: Write> Row<'_, '_, W> {
             idx: i,
             full: self.full,
         };
-        self.d.paint_fill(
-            slot,
-            self.style,
-            FillGeom { x, sep, avail },
-            &gate_val,
-            render,
-        );
+        self.d
+            .paint_fill(slot, self.style, FillGeom { x, sep, avail }, &key, render);
     }
 }
 

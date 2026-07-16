@@ -42,8 +42,8 @@ typedef signed long long __s64;
  * buffer). Mirrors /proc/<pid>/stat's fields, but as raw kernel values.
  */
 struct atop_task_info {
-	__u64 utime_ns;          /* task->utime (nanoseconds) */
-	__u64 stime_ns;          /* task->stime (nanoseconds) */
+	__u64 utime_ns;          /* thread-group utime total (nanoseconds) */
+	__u64 stime_ns;          /* thread-group stime total (nanoseconds) */
 	__u64 start_boottime_ns; /* task->start_boottime — matches /proc field 22 after nsec_to_clock_t */
 	__s64 rss_pages;         /* sum of FILE+ANON+SHMEM rss counters (pages; may be transiently <0) */
 	__u32 pid;               /* task->tgid (userspace PID) */

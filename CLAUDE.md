@@ -32,7 +32,7 @@ Before proposing a fix: what general capability does this case need? Does the sy
 - **NEVER commit unless the user literally says "commit."** When committing, run `/precommit`.
 - **Commit to `main` directly** — no feature branches. No remote/PR workflow yet, so branches are pure overhead.
 - **Use `just`**, not raw commands. Never pipe `just` output through filters.
-- **Both feature configs must be green.** `bpf` is default-on; `just precommit` runs `test` (bpf) and `test-nobpf` (`--no-default-features`) so a `cfg`-gated regression in either build is caught.
+- **All three test configs must be green.** `just precommit` runs `test` (bpf compiled in), `test-nobpf` (`--no-default-features`), and `test-bpf` (privileged tests under `caprun` — verifier + runtime correctness). A BPF change that compiles but is rejected by the verifier is broken; `test-bpf` catches it.
 - **Default-suite tests can't hard-require optional external tools.** A test that needs an absent binary aborts the whole suite; mark it `#[ignore]` (with run instructions) or skip gracefully.
 
 ## Workflow

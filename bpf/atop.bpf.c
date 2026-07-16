@@ -16,11 +16,14 @@
 // collapses on an idle box.
 //
 // The change key is a 64-bit hash of the **hot** fields — the ones that move without notice:
-// CPU time, run state, resident pages (reclaim/swap edit these while the task sleeps), and the
-// parent (reparenting). An unchanged hot hash lets us bail *before* reading the cold fields
-// (uid, nice, thread count, start time, comm) or writing anything. Cold fields refresh only on
-// an emit (a hot change) or a forced full snapshot, so a sleeping process that is *only*
-// reniced/reparented lags until the next resync — cosmetic, and the resync bounds it.
+// thread-group CPU time, run state, resident pages (reclaim/swap edit while sleeping), and the
+// parent (reparenting). An unchanged hot hash bails *before* reading cold fields (uid, nice,
+// thread count, start time, comm). Cold fields refresh only on an emit or a forced resync.
+//
+// CPU time is the thread-group total (`signal->{utime,stime}` + every live thread's), matching
+// `/proc/<pid>/stat`'s `thread_group_cputime()`. The leader's per-thread `task->utime` alone
+// would miss non-leader-thread activity in both the hash and the emitted value. The group walk
+// via `bpf_loop` costs O(nr_threads) per leader; single-threaded processes take a fast path.
 //
 // Leader filter: the iterator and both tracepoints fire per *thread*; we act only on
 // thread-group leaders (kernel pid == tgid) so the output is processes, matching the /proc
@@ -90,6 +93,81 @@ static __always_inline __u64 hmix(__u64 h, __u64 x)
 	return (h ^ x) * ATOP_FNV_PRIME;
 }
 
+// Verifier bound for the thread-group walk; beyond it, tail threads' time is omitted
+// (bounded-stale, self-healing on the next resync).
+#define ATOP_MAX_THREADS 4096
+
+struct group_walk_ctx {
+	__u64 utime;
+	__u64 stime;
+	struct list_head *pos;
+	struct list_head *sentinel; // &sig->thread_head — stop when we loop back here
+	unsigned long off;          // CO-RE byte offset of thread_node in task_struct
+};
+
+// bpf_loop callback: stop at the sentinel (a thread exiting mid-walk shortens the list
+// below the snapshotted nr_threads), then container_of → accumulate → advance.
+// `list_head.next` is at offset 0 — a plain probe_read avoids the CO-RE relocation the
+// verifier rejects on a stack-held pointer.
+static int sum_thread_cputime(unsigned int idx, void *data)
+{
+	struct group_walk_ctx *ctx = data;
+	if (ctx->pos == ctx->sentinel)
+		return 1; // looped back to head — list shorter than nr_threads
+	struct task_struct *t =
+		(struct task_struct *)((unsigned long)ctx->pos - ctx->off);
+	ctx->utime += BPF_CORE_READ(t, utime);
+	ctx->stime += BPF_CORE_READ(t, stime);
+	struct list_head *next;
+	bpf_probe_read_kernel(&next, sizeof(next), ctx->pos);
+	ctx->pos = next;
+	return 0;
+}
+
+// Thread-group CPU time matching `thread_group_cputime()`: dead-thread accumulation from
+// signal + live-thread walk via signal->thread_head.  The leader is a member of the
+// thread_head list (linked at fork by copy_signal), so nr_threads iterations from
+// thread_head.next cover every live thread including the leader.  sig->{utime,stime}
+// (accumulated unconditionally in __exit_signal for every exiting thread) must always be
+// added, even for single-threaded processes.
+static __always_inline void group_cputime(struct task_struct *leader,
+					  __u64 *out_ut, __u64 *out_st)
+{
+	struct signal_struct *sig = BPF_CORE_READ(leader, signal);
+
+	// Dead-thread accumulation — unconditional (a process that was multi-threaded and
+	// dropped back to nr_threads=1 still has exited threads' time here).
+	*out_ut = BPF_CORE_READ(sig, utime);
+	*out_st = BPF_CORE_READ(sig, stime);
+
+	__u32 nr = BPF_CORE_READ(sig, nr_threads);
+	if (nr <= 1) {
+		// Single-threaded fast path: only the leader's own time to add.
+		*out_ut += BPF_CORE_READ(leader, utime);
+		*out_st += BPF_CORE_READ(leader, stime);
+		return;
+	}
+
+	// Compute the sentinel address: sig + CO-RE offset of thread_head.
+	// CO-RE relocation through __CORE_RELO on signal_struct would need a typed
+	// expression; use the same raw-offset trick as the thread_node container_of.
+	struct list_head *sentinel = (struct list_head *)(
+		(unsigned long)sig + __CORE_RELO(sig, thread_head, BYTE_OFFSET));
+
+	struct group_walk_ctx ctx = {
+		.utime    = *out_ut,
+		.stime    = *out_st,
+		.pos      = BPF_CORE_READ(sig, thread_head.next),
+		.sentinel = sentinel,
+		.off      = __CORE_RELO(leader, thread_node, BYTE_OFFSET),
+	};
+	if (nr > ATOP_MAX_THREADS)
+		nr = ATOP_MAX_THREADS;
+	bpf_loop(nr, sum_thread_cputime, &ctx, 0);
+	*out_ut = ctx.utime;
+	*out_st = ctx.stime;
+}
+
 static __always_inline __s64 read_rss(struct mm_struct *mm)
 {
 	if (!mm)
@@ -121,10 +199,9 @@ int atop_task_iter(struct bpf_iter__task *ctx)
 	if (pid != tgid)
 		return 0; // non-leader thread — emit processes only
 
-	// Hot fields: read + hash every task. These move without warning — CPU time, run state,
-	// reclaimed pages, reparenting — so they are the change detector.
-	__u64 utime = BPF_CORE_READ(task, utime);
-	__u64 stime = BPF_CORE_READ(task, stime);
+	// Hot fields (thread-group CPU time, state, rss, ppid): hash for emit-on-change.
+	__u64 utime, stime;
+	group_cputime(task, &utime, &stime);
 	__u32 state = BPF_CORE_READ(task, __state);
 	__u32 exit_state = BPF_CORE_READ(task, exit_state);
 	__u32 ppid = BPF_CORE_READ(task, real_parent, tgid);

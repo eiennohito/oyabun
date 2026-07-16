@@ -70,6 +70,15 @@ build-profiling: _require-cargo
 run-profiling *ARGS: _require-cargo
     @RUSTFLAGS="-C force-frame-pointers=yes" cargo run --profile profiling -- {{ ARGS }}
 
+# Run the BPF tests under caprun (verifier + runtime correctness). Skipped if caprun
+# is not installed (setup: scripts/setup-caps.sh).
+test-bpf: _require-cargo
+    @if [ -x tools/caprun ]; then \
+        ATOP_FORCE_BPF=1 {{ _run }} test-bpf tools/caprun cargo test -p atop --release -- bpf_; \
+    else \
+        echo "skipping test-bpf: tools/caprun not installed (run scripts/setup-caps.sh)"; \
+    fi
+
 # --- BPF (dev-only) ---
 
 # Rebuild the committed BPF object (needs clang + libbpf headers). Run after editing
@@ -85,13 +94,12 @@ bpf-vmlinux:
 
 # --- Pre-commit ---
 
-# Pre-commit checklist: format, lint, check, test (BPF on + BPF off)
+# Pre-commit checklist: format, lint, check, then all three test configs in parallel
 precommit: _require-cargo
     @just fmt
     @just lint
     @just check
-    @just test
-    @just test-nobpf
+    @just test & just test-nobpf & just test-bpf & wait
     @echo ""
     @echo "Pre-commit done. Logs: $ATOP_LOGDIR/"
 

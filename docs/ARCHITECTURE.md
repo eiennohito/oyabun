@@ -356,20 +356,29 @@ process's observable state changed since last cycle, so the bytes crossing to us
 parse are proportional to churn, not process count; on an idle box (the target of the near-zero
 idle goal) the stream is nearly empty. This was the fix for the measured cost: the read syscall
 was dominated by `copy_to_user` of the full set every cycle. The change test is a per-leader
-kernel hash of the **hot** fields — the ones that move without the process running (CPU time,
-run state, resident pages that reclaim/swap edit while it sleeps, and the parent on reparenting)
-— so an unchanged hash bails *before* reading the **cold** fields (uid, nice, thread count, start
-time, name) or writing anything. Cold fields refresh only on a change or a resync, so a sleeping
-process that is *only* reniced or reparented lags until the next resync — cosmetic, and bounded
-by it. (A collision in the 64-bit hash, vanishingly unlikely, would also self-heal at the next
-resync, so it is bounded-stale, not a correctness hole.)
+kernel hash of the **hot** fields — the ones that move without the process running
+(**thread-group-wide** CPU time, run state, resident pages that reclaim/swap edit while it
+sleeps, and the parent on reparenting) — so an unchanged hash bails *before* reading the
+**cold** fields (uid, nice, thread count, start time, name) or writing anything. Cold fields
+refresh only on a change or a resync, so a sleeping process that is *only* reniced or reparented
+lags until the next resync — cosmetic, and bounded by it. (A collision in the 64-bit hash,
+vanishingly unlikely, would also self-heal at the next resync, so it is bounded-stale, not a
+correctness hole.)
+
+**CPU time is the thread-group total, not the leader's per-thread value.** `task->utime` is
+per-thread; `/proc/<pid>/stat` reports the group sum via `thread_group_cputime_adjusted()`. The
+BPF program must match that or a multi-threaded process whose non-leader threads do the work
+shows near-zero CPU% — both because the emitted value is a fraction, and because the hash
+(keyed on the same value) never fires for non-leader activity. The iterator walks each leader's
+thread list via `bpf_loop`, summing live threads and adding the dead-thread accumulator from the
+signal struct. Single-threaded processes take a fast path with no walk.
 
 The maintained full set lives in userspace: a cycle applies the delta to it, drains the
 birth/reap events, then materializes the whole set into the row buffer so the source-agnostic
 tail runs unchanged. **CPU% stays exact under deltas** precisely because CPU time is a hot field
-— any activity forces a re-emit, so the history ring always sees a correct per-interval delta,
-and a process absent from the delta genuinely consumed nothing that interval (a true zero, not a
-missed sample).
+— any thread's activity forces a re-emit, so the history ring always sees a correct per-interval
+delta, and a process absent from the delta genuinely consumed nothing that interval (a true zero,
+not a missed sample).
 
 **Units convert in Rust, identity is load-bearing.** The kernel exposes CPU time and start
 time in nanoseconds; the row carries clock ticks, matching the `/proc` path's semantics so the

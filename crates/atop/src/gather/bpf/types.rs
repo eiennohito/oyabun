@@ -80,8 +80,8 @@ pub fn ns_per_tick(clk_tck: u64) -> u64 {
 }
 
 impl TaskInfo {
-    /// `utime + stime` in clock ticks — the input to the CPU% delta, same unit as the stat
-    /// parser's `ticks`. `ns_per_tick` is the source's precomputed divisor.
+    /// Thread-group `utime + stime` in clock ticks (the CPU% delta input, same unit as the
+    /// stat parser). The BPF program walks the thread list to match `/proc/<pid>/stat`.
     fn ticks(&self, ns_per_tick: u64) -> u64 {
         self.utime_ns.saturating_add(self.stime_ns) / ns_per_tick
     }

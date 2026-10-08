@@ -30,7 +30,7 @@ lint: _require-cargo
 # --- Check ---
 
 # Compile-check workspace
-check: _require-cargo
+check: _require-cargo _toolchain-nag
     @{{ _run }} check-rust cargo check --workspace --all-targets
 
 # --- Test ---
@@ -107,6 +107,17 @@ precommit: _require-cargo
     @echo "Pre-commit done. Logs: $OYA_LOGDIR/"
 
 # --- Requirements (private) ---
+
+# Warn (never fail) when the installed stable is newer than the rust-toolchain.toml pin:
+# the pin keeps CI reproducible, but as an app we want to track stable, so bump it.
+[private]
+_toolchain-nag:
+    @pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml | cut -d. -f1,2); \
+    local=$(rustup run stable rustc --version 2>/dev/null | cut -d' ' -f2 | cut -d. -f1,2); \
+    if [ -n "$local" ] && [ "$local" != "$pin" ] && \
+       [ "$(printf '%s\n%s\n' "$pin" "$local" | sort -V | tail -1)" = "$local" ]; then \
+        echo "note: stable Rust $local is newer than the pinned $pin — bump rust-toolchain.toml and fix new clippy lints" >&2; \
+    fi
 
 [private]
 [no-exit-message]

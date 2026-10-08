@@ -1,0 +1,7 @@
+# Pinned so a new stable release can't break CI (new clippy lints) behind our back. This is
+# an app, not a library: track the latest stable deliberately — `just check` nags when the
+# installed stable is newer than this pin.
+[toolchain]
+channel = "1.99"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

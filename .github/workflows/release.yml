@@ -37,7 +37,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src" -w /src \
             quay.io/pypa/manylinux2014_${{ matrix.arch }} bash -euc '
-              curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
               . ~/.cargo/env
               cargo build --release --locked -p oyabun
               chown -R '"$(id -u):$(id -g)"' target'

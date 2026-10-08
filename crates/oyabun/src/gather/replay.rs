@@ -908,7 +908,7 @@ mod tests {
         assert_eq!(r.display_pids(), vec![200, 200, 201, 202]);
 
         r.cycle();
-        assert!(r.display_pids().is_empty());
+        assert_eq!(r.display_pids(), Vec::<u32>::new());
 
         r.cycle();
         assert_eq!(r.display_pids(), vec![200]);

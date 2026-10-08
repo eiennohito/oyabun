@@ -6,9 +6,9 @@ Status: **partially implemented**
 
 Implemented:
 
-- `atop-stream` crate: text DSL parser (stateful inheritance/deltas/birth/death), verbose
+- `oya-stream` crate: text DSL parser (stateful inheritance/deltas/birth/death), verbose
   writer, `ProcState` enum, `Stream::parse`/`Stream::load`/`Stream::to_verbose_dsl`
-- `Recorder` (`gather/record.rs`): `ATOP_RECORD=path` live capture, feature-gated (`record`)
+- `Recorder` (`gather/record.rs`): `OYA_RECORD=path` live capture, feature-gated (`record`)
 - Source-output replay through the common tail (`ReplaySource`, `Replayer`)
 - All inline tests ported from `StreamBuilder` to `Stream::parse` DSL strings
 - Synthetic CPU/display-state, birth/death, and terminal text smoke tests
@@ -33,7 +33,7 @@ The two structural changes to non-test code that the plan called for are complet
    `/proc` reads; `ReplaySource` implements it with in-memory lookup tables. `ProcTable::update`
    is generic over the reader.
 
-### DSL crate (`atop-stream`) — done
+### DSL crate (`oya-stream`) — done
 
 Separate workspace crate with the text DSL parser and writer. Types: `RawProc`, `ProcState`
 (enum with `TryFrom<u8>`), `SystemStats`, `CycleEvent`, `Stream`. The parser resolves
@@ -43,8 +43,8 @@ writer emits full-state-per-cycle DSL (the recording format). Round-trip tested.
 
 ### Recording (`gather/record.rs`) — done
 
-`Recorder` activated by `ATOP_RECORD=path`, feature-gated behind `record`. Converts live
-`ProcessEntry` + `SystemStats` → `atop_stream` types → verbose DSL text → file append.
+`Recorder` activated by `OYA_RECORD=path`, feature-gated behind `record`. Converts live
+`ProcessEntry` + `SystemStats` → `oya_stream` types → verbose DSL text → file append.
 Wired into the gatherer cycle after the tree build and system stats.
 
 ### System stats — done, simplified
@@ -205,7 +205,7 @@ replay is always sequential, and LLM subsetting reads the whole file.
 
 ### Two modes
 
-**Raw captures** (`ATOP_RECORD` output): full state every cycle, no deltas, no inheritance.
+**Raw captures** (`OYA_RECORD` output): full state every cycle, no deltas, no inheritance.
 Every process lists all fields every time. Verbose but self-contained per cycle — easier to
 grep, easier for the LLM to read a single cycle in isolation when exploring.
 
@@ -219,7 +219,7 @@ full state (simple, no bookkeeping). Minimization converts to the compact form.
 ### Four uses
 
 1. **Inline test fixtures**: `Stream::parse(r"...")` in Rust tests — replaces `StreamBuilder`
-2. **Captured files**: `Stream::load("fixtures/regression-123.atop")` — same parser
+2. **Captured files**: `Stream::load("fixtures/regression-123.oya")` — same parser
 3. **LLM-authored subsets**: Python library reads a capture, ad-hoc script subsets it
 4. **Human review**: readable in any editor, diffable in git
 
@@ -228,7 +228,7 @@ paths.
 
 ## Python library
 
-A small library (`tools/atopstream.py` or `python/atopstream/`) for reading, writing, and
+A small library (`tools/oyastream.py` or `python/oyastream/`) for reading, writing, and
 subsetting DSL streams. This is the **durable** piece of the subsetting workflow — the
 scripts that use it are throwaway, but the library itself is maintained.
 
@@ -277,17 +277,17 @@ the library provides the primitives, the script composes them.
 ### Recorder — done
 
 `Recorder` (`gather/record.rs`) emits verbose (full-state) DSL text after each gather
-cycle, appending to a file. Activated by `ATOP_RECORD=path`. Feature-gated (`record`) so
+cycle, appending to a file. Activated by `OYA_RECORD=path`. Feature-gated (`record`) so
 the production binary pays zero cost. Not a source wrapper — it reads from the populated
 `Procs` buffer and `ProcTable` cmdline store after the common tail completes, converting
-live types to `atop_stream` types for serialization.
+live types to `oya_stream` types for serialization.
 
 ### Capture → fixture workflow
 
-1. Run atop with `ATOP_RECORD=path` — captures the full session as verbose DSL text
+1. Run oyabun with `OYA_RECORD=path` — captures the full session as verbose DSL text
 2. Reproduce the scenario (CPU spike, process death, tree reshuffle, etc.)
 3. LLM reads the capture, identifies the interesting region
-4. LLM writes an ad-hoc Python script using the `atopstream` library to subset the capture
+4. LLM writes an ad-hoc Python script using the `oyastream` library to subset the capture
    (time window, PID filter, ancestor closure) and emit a compact-mode fixture
 5. Fixture checked in under `tests/fixtures/`
 
@@ -328,7 +328,7 @@ coverage (NVML availability).
 
 The DSL crate, recording, replay harness, and all inline tests are done. What remains:
 
-1. **Python library** (`tools/atopstream.py`) — parse, write, filter DSL streams. Tested
+1. **Python library** (`tools/oyastream.py`) — parse, write, filter DSL streams. Tested
    against the Rust parser for round-trip fidelity.
 
 2. **Compact writer** — delta/inheritance mode for `Stream::to_compact_dsl()`, producing
@@ -341,7 +341,7 @@ The DSL crate, recording, replay harness, and all inline tests are done. What re
 ## Design constraints
 
 - **No DSL crate in the hot path.** `Recorder` is feature-gated (`record`); `ReplaySource`
-  is `#[cfg(test)]`. The production binary with neither pays zero cost — `atop-stream` is a
+  is `#[cfg(test)]`. The production binary with neither pays zero cost — `oya-stream` is a
   dev-dependency only.
 - **`ReplaySource` uses a real arena.** The CPU ring/cmdline store live on huge pages via
   the arena. Replay constructs a real `Arena` + `ProcTable` — the `RawProc` → row

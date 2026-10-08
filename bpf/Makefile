@@ -1,8 +1,8 @@
-# Dev-only: rebuild the committed BPF object (atop.bpf.o).
+# Dev-only: rebuild the committed BPF object (oya.bpf.o).
 #
 # Normal `cargo build` does NOT run this — it embeds the committed .o via include_bytes!.
-# Rerun (`make` here, or `just bpf` from the repo root) only after editing atop.bpf.c or
-# atop_types.h, then commit the regenerated .o alongside the source. This keeps clang +
+# Rerun (`make` here, or `just bpf` from the repo root) only after editing oya.bpf.c or
+# oya_types.h, then commit the regenerated .o alongside the source. This keeps clang +
 # libbpf headers out of the standard build, exactly like a committed protobuf-generated file.
 #
 # vmlinux.h is a *build-only* input (NOT committed, NOT needed at runtime): the committed .o
@@ -15,7 +15,7 @@ ARCH      := $(shell uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/;s/ppc64le/po
 
 BPF_CFLAGS := -target bpf -D__TARGET_ARCH_$(ARCH) -mcpu=v3 -O2 -g -Wall -Werror
 
-atop.bpf.o: atop.bpf.c atop_types.h vmlinux.h
+oya.bpf.o: oya.bpf.c oya_types.h vmlinux.h
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 	$(LLVM_STRIP) -g $@   # drop DWARF, keep the .BTF section CO-RE needs
 
@@ -28,4 +28,4 @@ vmlinux: # force-regenerate (e.g. after a kernel upgrade)
 	rm -f vmlinux.h && $(MAKE) vmlinux.h
 
 clean:
-	rm -f atop.bpf.o
+	rm -f oya.bpf.o

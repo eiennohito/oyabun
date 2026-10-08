@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build and install the caprun setuid wrapper for running atop with
+# Build and install the caprun setuid wrapper for running oyabun with
 # BPF/tracing capabilities without sudo.
 #
 # One-time setup — requires sudo for chown+chmod only.
-# After setup, `tools/caprun target/debug/atop` works without sudo.
+# After setup, `tools/caprun target/debug/oya` works without sudo.
 #
 # Usage:
 #   scripts/setup-caps.sh           — build + install caprun
@@ -49,9 +49,9 @@ status() {
         echo "  → ready (setuid root)"
         echo "  Caps: $CAPS_HUMAN"
         echo ""
-        echo "  Use: tools/caprun target/debug/atop"
-        echo "       tools/caprun target/release/atop"
-        echo "       tools/caprun target/profiling/atop"
+        echo "  Use: tools/caprun target/debug/oya"
+        echo "       tools/caprun target/release/oya"
+        echo "       tools/caprun target/profiling/oya"
     else
         echo "  → NOT ready (need setuid root)"
         echo "  Run: $0"
@@ -73,7 +73,7 @@ install() {
         echo "Done. caprun is ready."
         echo "  Caps: $CAPS_HUMAN"
         echo ""
-        echo "  Use: tools/caprun target/debug/atop"
+        echo "  Use: tools/caprun target/debug/oya"
         echo "       tools/caprun cargo test --workspace"
     else
         echo "ERROR: setuid install failed" >&2

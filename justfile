@@ -2,7 +2,7 @@
 # Install: pacman -S just
 
 # Shared log directory — recursive `just` calls inherit via env
-export ATOP_LOGDIR := env_var_or_default("ATOP_LOGDIR", "target/logs/" + `date +%Y%m%d-%H%M%S`)
+export OYA_LOGDIR := env_var_or_default("OYA_LOGDIR", "target/logs/" + `date +%Y%m%d-%H%M%S`)
 
 # Tool detection
 _has_cargo := `command -v cargo >/dev/null 2>&1 && echo true || echo false`
@@ -39,10 +39,10 @@ check: _require-cargo
 test: _require-cargo
     @{{ _run }} test-rust cargo test --workspace
 
-# Run atop's tests with the privileged layer compiled out (the "absent BPF" build). Only
-# atop has the `bpf` feature, so etch/thoop are already covered by `test`.
+# Run oyabun's tests with the privileged layer compiled out (the "absent BPF" build). Only
+# oyabun has the `bpf` feature, so etch/thoop are already covered by `test`.
 test-nobpf: _require-cargo
-    @{{ _run }} test-nobpf cargo test -p atop --no-default-features
+    @{{ _run }} test-nobpf cargo test -p oyabun --no-default-features
 
 # Run a filtered subset (e.g. `just testf thpmap -p thoop`); FILTER matches test names
 testf FILTER *ARGS: _require-cargo
@@ -74,7 +74,7 @@ run-profiling *ARGS: _require-cargo
 # is not installed (setup: scripts/setup-caps.sh).
 test-bpf: _require-cargo
     @if [ -x tools/caprun ]; then \
-        ATOP_FORCE_BPF=1 {{ _run }} test-bpf tools/caprun cargo test -p atop --release -- bpf_; \
+        OYA_FORCE_BPF=1 {{ _run }} test-bpf tools/caprun cargo test -p oyabun --release -- bpf_; \
     else \
         echo "skipping test-bpf: tools/caprun not installed (run scripts/setup-caps.sh)"; \
     fi
@@ -82,7 +82,7 @@ test-bpf: _require-cargo
 # --- BPF (dev-only) ---
 
 # Rebuild the committed BPF object (needs clang + libbpf headers). Run after editing
-# bpf/*.c or bpf/atop_types.h, then commit the regenerated bpf/atop.bpf.o. A normal
+# bpf/*.c or bpf/oya_types.h, then commit the regenerated bpf/oya.bpf.o. A normal
 # `cargo build` embeds the committed object and needs none of this toolchain.
 bpf:
     @{{ _run }} bpf make -C bpf
@@ -101,7 +101,7 @@ precommit: _require-cargo
     @just check
     @just test & just test-nobpf & just test-bpf & wait
     @echo ""
-    @echo "Pre-commit done. Logs: $ATOP_LOGDIR/"
+    @echo "Pre-commit done. Logs: $OYA_LOGDIR/"
 
 # --- Requirements (private) ---
 

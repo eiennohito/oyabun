@@ -68,7 +68,7 @@ a grab-bag. A module small enough for one file uses `foo.rs`, not `foo/mod.rs`.
 
 ```
 crates/
-  atop/     process-manager TUI: one thread, serialized gather→render loop
+  oyabun/   process-manager TUI: one thread, serialized gather→render loop
     gather/ source (/proc or BPF) fills rows; CPU%, tree; common tail
     gather/bpf/ privileged source: emit-on-change iter + fork/free (feature "bpf")
     identity/ per-process group identity + trust (cgroup + structural)
@@ -83,7 +83,7 @@ scripts/    setup-caps.sh, perf-toggle.sh, run-logged.sh
 
 ## Project Goals
 
-**atop** — a Rust CLI/TUI process manager. See `docs/GOALS.md` for full goals and
+**oyabun** — a Rust CLI/TUI process manager. See `docs/GOALS.md` for full goals and
 `docs/ARCHITECTURE.md` for the implemented design.
 Linux (io_uring + syscall fallback) and macOS (`sysctl`/`libproc`). Windows is not a goal.
 Core invariants: 

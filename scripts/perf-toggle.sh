@@ -8,7 +8,7 @@
 #   scripts/perf-toggle.sh status   — show current settings
 set -euo pipefail
 
-SAVE_FILE="/tmp/atop-perf-paranoid-saved"
+SAVE_FILE="/tmp/oya-perf-paranoid-saved"
 
 # Knobs we touch:
 #   perf_event_paranoid  -1 = allow everything incl. kernel tracing
@@ -59,7 +59,7 @@ enable() {
 
     sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
 
-    # perf record pins ~4 MiB of ring buffers (128 KiB × ncpus); atop's io_uring
+    # perf record pins ~4 MiB of ring buffers (128 KiB × ncpus); oyabun's io_uring
     # registers ~4 MiB of arena buffers. Default memlock (8 MiB) is too tight for both.
     # 64 MiB is generous without being reckless.
     local cur_memlock need_kib=65536

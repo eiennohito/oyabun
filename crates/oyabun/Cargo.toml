@@ -1,0 +1,34 @@
+[package]
+name = "oyabun"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "oya"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = ["bpf"]
+# Privileged BPF observation layer (task iterator + fork/exit tracepoints).
+# On by default; disabling drops the aya/zerocopy deps entirely and the binary runs the
+# unprivileged /proc backend unconditionally — the "absent privileged layer" build.
+bpf = ["dep:aya", "dep:zerocopy"]
+# Optional live capture support. Normal production builds do not compile the DSL support crate.
+record = ["dep:oya-stream"]
+
+[dependencies]
+etch = { path = "../etch" }
+thoop = { path = "../thoop" }
+oya-stream = { path = "../oya-stream", optional = true }
+crossterm = "0.29"
+libc = "0.2"
+io-uring = "0.7.12"
+aya = { version = "0.14", optional = true }
+zerocopy = { version = "0.8", features = ["derive"], optional = true }
+
+[dev-dependencies]
+oya-stream = { path = "../oya-stream" }
+vt100 = "0.16.2"

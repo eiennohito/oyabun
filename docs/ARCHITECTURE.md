@@ -2,7 +2,7 @@
 
 Status: **implemented** (Linux). macOS and several features below are still future work.
 
-This describes how atop is actually built. For *why* (goals/constraints) see `GOALS.md`.
+This describes how oyabun is actually built. For *why* (goals/constraints) see `GOALS.md`.
 The single-thread storage *policy* on top of `thoop` (the storage foundation) is
 `docs/plans/thoop.md`. With the PID index now on huge pages too, every hot, randomly-probed
 per-PID structure is THP-resident.
@@ -108,22 +108,22 @@ backward-counter guard catches most tick-discontinuities; metadata self-heals wi
 window. The worst case is one frame of wrong CPU% — bounded and self-correcting. No special
 guard is needed beyond what the normal eviction + reopen path already does.
 
-## Storage foundation (`thoop`) and atop's single-thread policy
+## Storage foundation (`thoop`) and oyabun's single-thread policy
 
 `thoop` is a policy-free THP storage layer; its mechanism (the `MmapRegion` primitive, the
 arena suballocator, the self-healing cached bases, the generational lifecycle, and the
 deliberately-unbuilt multithread seam) is documented in `docs/plans/thoop.md`. This section is
-only atop's *policy* on top of it. The short version of the mechanism: hot, randomly-accessed
+only oyabun's *policy* on top of it. The short version of the mechanism: hot, randomly-accessed
 records live on 2 MiB huge pages so the working set is a handful of TLB entries regardless of
 count; many structures share one arena region (a per-structure mapping would commit a whole
 huge page each); the arena relocates chunks as they grow and heals every holder's cached base
 from the outside, so a `Ref` is a stable slot index and no reference into arena memory may span
 an allocation.
 
-atop holds three per-PID stores (a hot CPU-history ring, cold uid/cmdline metadata, and the
+oyabun holds three per-PID stores (a hot CPU-history ring, cold uid/cmdline metadata, and the
 `Cmd` string store), the **PID index** (an open-addressing map), **and** the process row buffer
 in one shared arena. Because gather and
-render never overlap, atop picks the cheapest sound instantiation — each
+render never overlap, oyabun picks the cheapest sound instantiation — each
 choice is exactly a cross-thread-safety piece *removed*:
 
 - **immediate `free`**, not deferred `demote`/`gc`: nothing holds a reference across the
@@ -144,7 +144,7 @@ concern, so it stays.
 
 Re-adding the removed pieces (an atomic base cell, deferred `free`, a copy-on-write lease view,
 `Send`/`Sync`) is the documented multithread path — `thoop`'s concurrency seam — if the latency
-budget ever changes. Single thread is atop **policy**, not a `thoop` limit.
+budget ever changes. Single thread is oyabun **policy**, not a `thoop` limit.
 
 ## `/proc` enumeration — maintained live set + refresh interval + birth probe
 
@@ -198,14 +198,14 @@ regenerates fresh content (a single-show seq_file re-traverses when `ki_pos < re
 `start_time` comparison in the hot path (see **PID reuse model**): ESRCH ⇒ death detected
 this cycle ⇒ state evicted ⇒ any later reuse of this PID number starts clean.
 
-A `Backend` enum (`Uring | Syscall`), probed at startup (`ATOP_FORCE_SYSCALL` forces
+A `Backend` enum (`Uring | Syscall`), probed at startup (`OYA_FORCE_SYSCALL` forces
 the latter); on any io_uring error mid-run the gatherer permanently downgrades to
 syscall and redoes the cycle. The **syscall backend** is also the test oracle
 (`uring_matches_syscall_backend`). **Both** backends hold a persistent stat-fd pool
 keyed by PID, generation-evicted (vanished PID ⇒ close its fd, like `CpuTracker`).
 
 **Pool capacity** = `min(RLIMIT_NOFILE.soft − 64, 4096)`, derived at startup from
-`getrlimit` (`ATOP_POOL_CAP` overrides — testing the overflow path without `ulimit`).
+`getrlimit` (`OYA_POOL_CAP` overrides — testing the overflow path without `ulimit`).
 Containers with a 256/512 fd limit get a proportionally smaller pool.
 
 ### io_uring backend
@@ -292,7 +292,7 @@ low-volume ops stay synchronous):
 - **Userspace** PIDs read cmdline (+ uid via the same fd's `fstat`) fresh while settling
   (first `CMDLINE_SETTLE_GENS=3` cycles, for exec/argv settling), then on a **staggered
   coarse tick**: PID `p` refreshes when `(gen + p) % N == 0`, so ~1/N refresh per cycle
-  (`CMDLINE_REFRESH_N=16`, ~8 s worst-case staleness; `ATOP_CMDLINE_REFRESH_N` overrides).
+  (`CMDLINE_REFRESH_N=16`, ~8 s worst-case staleness; `OYA_CMDLINE_REFRESH_N` overrides).
 - A fresh read replaces the cmdline's slot in the `Cmd` store **only when the bytes
   changed** (old slot freed, new slot interned `ALIVE`); an unchanged or not-refreshed PID
   keeps its slot, so the row's cmdline is just a handle copy — the per-cycle re-materialization
@@ -518,7 +518,7 @@ cache and kernel resources, not resident footprint. See
 ## Rendering (`etch`)
 
 A separate workspace crate, `crates/etch/` — a **retained-mode, change-tracked** terminal
-renderer with no atop domain types. It replaced ratatui, whose `Paragraph`/
+renderer with no oyabun domain types. It replaced ratatui, whose `Paragraph`/
 `LineTruncator` grapheme segmentation (≈43% of CPU) and blind 10k-cell `Buffer::diff`
 (≈22%) dominated profiles. Work is now proportional to what *changed*, not to screen
 size.
@@ -638,7 +638,7 @@ user/sys/iowait split is preserved because every counter is differenced over the
 ## GPU telemetry (NVML)
 
 Optional NVIDIA telemetry is a `dlsym`-loaded NVML with no build dependency (see the module doc);
-any probe failure just leaves atop CPU-only. It is the third of a rough gather : GPU : UI
+any probe failure just leaves oyabun CPU-only. It is the third of a rough gather : GPU : UI
 frame-time split, so its per-cycle work runs only on change the same way the two others do —
 otherwise it dominated the profile, because the naive shape re-ran every NVML call every cycle
 regardless of whether the GPU did anything.

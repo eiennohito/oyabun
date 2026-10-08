@@ -1,4 +1,4 @@
-# atop
+# oyabun
 
 A fast process manager for the terminal.
 Near-zero idle CPU, sub-millisecond input response, and observation cost that stays below O(processes) where the kernel allows it.
@@ -26,16 +26,16 @@ just fmt            # rustfmt
 just precommit      # fmt + lint + check + test, run before every commit
 ```
 
-A plain build needs no BPF toolchain: the committed `bpf/atop.bpf.o` is embedded at build time, exactly like a generated artifact.
-Run unprivileged and atop uses the `/proc` source; nothing else is required.
+A plain build needs no BPF toolchain: the committed `bpf/oya.bpf.o` is embedded at build time, exactly like a generated artifact.
+Run unprivileged and oyabun uses the `/proc` source; nothing else is required.
 
 ### Rebuilding the eBPF object (only when editing `bpf/*.c`)
 
 The committed object is the dependency.
-Regenerate it only after changing `bpf/atop.bpf.c` or `bpf/atop_types.h`, then commit the new `bpf/atop.bpf.o` alongside the source.
+Regenerate it only after changing `bpf/oya.bpf.c` or `bpf/oya_types.h`, then commit the new `bpf/oya.bpf.o` alongside the source.
 
 ```
-just bpf            # rebuild bpf/atop.bpf.o (needs clang + bpftool + libbpf headers)
+just bpf            # rebuild bpf/oya.bpf.o (needs clang + bpftool + libbpf headers)
 just bpf-vmlinux    # regenerate bpf/vmlinux.h from the running kernel (rare; CO-RE makes one object portable)
 ```
 
@@ -51,15 +51,15 @@ scripts/setup-caps.sh           # build + install the wrapper (one-time; needs s
 scripts/setup-caps.sh status    # check it is installed
 scripts/setup-caps.sh remove    # uninstall
 
-tools/caprun target/release/atop        # run privileged
+tools/caprun target/release/oya        # run privileged
 tools/caprun cargo test --workspace     # run the cap-gated BPF tests
 ```
 
-Without caps, atop falls back to the `/proc` source automatically and the BPF integration tests skip.
+Without caps, oyabun falls back to the `/proc` source automatically and the BPF integration tests skip.
 
 ## io_uring note
 
-atop uses `io_uring` when available for faster `/proc` reads, falling back to
+oyabun uses `io_uring` when available for faster `/proc` reads, falling back to
 plain syscalls otherwise. The fallback is automatic and correct — no action
 needed.
 
@@ -92,11 +92,11 @@ Treat it as a **single-user dev-box convenience**.
 Do not install it on shared or multi-user hosts, and `scripts/setup-caps.sh remove` it when you are done.
 
 **The committed BPF object is loaded into your kernel.**
-A normal build embeds `bpf/atop.bpf.o` and the privileged source loads it into the running kernel under the caps above.
+A normal build embeds `bpf/oya.bpf.o` and the privileged source loads it into the running kernel under the caps above.
 Anyone who can modify the repository can substitute a malicious object that runs in kernel context, and a binary blob shows no meaningful review diff.
 A checked-in digest would be security theater — the same actor regenerates object and digest together — so there is none.
 If you do not trust the committed object, rebuild it yourself from `bpf/*.c` with `just bpf`, which needs only clang and bpftool.
 
 **Privileged mode sees the whole system.**
-Running atop with caps reads process metadata across all users.
-That is the point of the mode, but it means a privileged atop is a system-wide observer; run it as such.
+Running oyabun with caps reads process metadata across all users.
+That is the point of the mode, but it means a privileged oyabun is a system-wide observer; run it as such.

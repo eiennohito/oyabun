@@ -1,9 +1,9 @@
 # thoop — THP Generational Storage (the mechanism)
 
 > **Scope.** A policy-free foundation for storing flat records on transparent-huge-page memory
-> with a generational lifecycle. It is built for atop but holds **zero atop concepts** — no PID,
+> with a generational lifecycle. It is built for oyabun but holds **zero oyabun concepts** — no PID,
 > snapshot, gather, and crucially no "single thread" written into a *contract* as a law — and is
-> meant to be extractable as a standalone library. atop layers its own policy on top; see the
+> meant to be extractable as a standalone library. oyabun layers its own policy on top; see the
 > storage section of `../ARCHITECTURE.md`. The current instantiation is single-threaded, but the
 > multithread path is an additive **concurrency seam** (below), never a rewrite.
 

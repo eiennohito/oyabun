@@ -1,5 +1,5 @@
 /*
- * Spike: multi-round fill/reap with read-slot reuse, matching atop's
+ * Spike: multi-round fill/reap with read-slot reuse, matching oyabun's
  * collect() loop. The question: when a read_slot is freed in reap round N
  * and reused in fill round N+1, could the old data in the pad slot be
  * misattributed to the new chain?
@@ -78,7 +78,7 @@ static __u32 parse_stat_pid(const char *d, int len) {
 
 /*
  * One collect cycle: iterate over pids[], fill SQ in rounds,
- * reap+process between rounds. Exactly atop's collect() loop.
+ * reap+process between rounds. Exactly oyabun's collect() loop.
  * Returns phantom count.
  */
 static int collect(struct io_uring *ring, __u32 *pids, int npids,
@@ -303,7 +303,7 @@ int main(void) {
         for (int i = 0; i < na && np < 80; i++)
             pids[np++] = (__u32)alive[i];      /* alive (briefly) */
 
-        /* Sort (atop requires sorted). */
+        /* Sort (oyabun requires sorted). */
         for (int i = 0; i < np - 1; i++)
             for (int j = i + 1; j < np; j++)
                 if (pids[i] > pids[j]) {

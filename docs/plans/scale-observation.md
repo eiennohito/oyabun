@@ -1,6 +1,6 @@
 # Scale Observation — Two-Tier Sampling for Extreme Hardware
 
-> **Threading note (2026-06).** This plan was written against the old two-thread design. atop
+> **Threading note (2026-06).** This plan was written against the old two-thread design. oyabun
 > has since collapsed to a **single thread** (`docs/ARCHITECTURE.md`), which moots the
 > cross-thread parts below: the "incremental carry-forward vs double-buffer recycling" hazard,
 > the `Arc<Snapshot>`/`ArcSwap`-release ordering, and the lease-lifetime reasoning are all gone
@@ -29,7 +29,7 @@ cycles instead of doing it all at once.
 
 Unprivileged constraint (proven during planning): the cheaper enumeration/event sources —
 netlink proc connector (`CAP_NET_ADMIN`), BPF task iterator (`CAP_BPF`), taskstats — are
-all privileged. atop runs unprivileged by default, so `getdents64` on `/proc` stays the
+all privileged. oyabun runs unprivileged by default, so `getdents64` on `/proc` stays the
 enumeration path. `getdents64` is already batched (whole `/proc` in ~1 syscall); its cost
 is kernel-side dirent materialization (`proc_pid_readdir`/`next_tgid`/`filldir64`), not
 syscall count. The only unprivileged lever there is **frequency**, not API.

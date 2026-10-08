@@ -2,7 +2,7 @@
  * caprun — run a command with specific Linux capabilities.
  *
  * Setuid-root wrapper. Drops to the real user, retains only the
- * capabilities atop needs for its privileged mode, passes them as
+ * capabilities oyabun needs for its privileged mode, passes them as
  * ambient so the exec'd child inherits them. The binary is the
  * policy — exactly these caps, nothing more.
  *
@@ -14,7 +14,7 @@
  *
  * Build:   cc -static -o tools/caprun tools/caprun.c
  * Install: sudo chown root tools/caprun && sudo chmod 4755 tools/caprun
- * Use:     tools/caprun target/debug/atop [args...]
+ * Use:     tools/caprun target/debug/oya [args...]
  */
 
 #define _GNU_SOURCE

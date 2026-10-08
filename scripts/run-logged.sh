@@ -4,7 +4,7 @@
 # prints a one-line ✓/✗ plus tool-aware compact summary.
 #
 # Usage: run-logged.sh <name> [--cd <dir>] <cmd...>
-# Requires: ATOP_LOGDIR env var (set by justfile)
+# Requires: OYA_LOGDIR env var (set by justfile)
 set -uo pipefail
 
 name="$1"; shift
@@ -14,7 +14,7 @@ if [ "${1:-}" = "--cd" ]; then
     shift; dir="$1"; shift
 fi
 
-logdir="${ATOP_LOGDIR:?ATOP_LOGDIR not set}"
+logdir="${OYA_LOGDIR:?OYA_LOGDIR not set}"
 mkdir -p "$logdir"
 log="$logdir/$name.log"
 

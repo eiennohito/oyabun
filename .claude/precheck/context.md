@@ -19,4 +19,4 @@ Scale to 256+ cores and thousands of processes without degradation.
 ## Where things live
 
 - Plans: `docs/plans/` (transient, never source of truth)
-- Crates: `crates/atop/` (main binary)
+- Crates: `crates/oyabun/` (main binary)

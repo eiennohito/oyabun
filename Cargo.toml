@@ -2,6 +2,12 @@
 resolver = "2"
 members = ["crates/*"]
 
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/eiennohito/oyabun"
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 

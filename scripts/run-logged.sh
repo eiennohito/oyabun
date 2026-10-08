@@ -25,9 +25,13 @@ if [ ! -f "$logdir/.header" ]; then
     ls -dt target/logs/[0-9]* 2>/dev/null | tail -n +51 | xargs rm -rf --
 fi
 
-# Detect tool for summary extraction
+# Detect tool for summary extraction (look through the caprun wrapper)
 cmd_base=$(basename "$1")
 subcmd="${2:-}"
+if [ "$cmd_base" = "caprun" ]; then
+    cmd_base=$(basename "${2:-}")
+    subcmd="${3:-}"
+fi
 
 # Run with full output to log
 (cd "$dir" && nice -n 10 "$@") > "$log" 2>&1
@@ -88,5 +92,11 @@ if [ -n "$summary" ]; then
 fi
 
 if [ $code -ne 0 ]; then
+    # CI has no log directory to open afterwards: dump the full log, folded.
+    if [ -n "${CI:-}" ]; then
+        echo "::group::$name.log"
+        cat "$log"
+        echo "::endgroup::"
+    fi
     exit $code
 fi

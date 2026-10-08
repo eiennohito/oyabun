@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    strategy:
+      matrix:
+        include:
+          # glibc, not static musl: NVML is dlopen'ed, which a static binary cannot do.
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/oyabun/Cargo.toml | head -1)
+          [ "v$version" = "${{ github.ref_name }}" ] || {
+            echo "tag ${{ github.ref_name }} != crates/oyabun version $version" >&2; exit 1; }
+      # Build inside PyPA's manylinux2014 image: the glibc it links against (2.17) is the floor
+      # for users. `docker run` from the host rather than a job container, because the
+      # actions' own node runtime needs a newer glibc than the image has.
+      - name: Build (manylinux2014)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            quay.io/pypa/manylinux2014_${{ matrix.arch }} bash -euc '
+              curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              . ~/.cargo/env
+              cargo build --release --locked -p oyabun
+              chown -R '"$(id -u):$(id -g)"' target'
+      - name: Create archive
+        run: |
+          name=oya-linux-${{ matrix.arch }}
+          mkdir "$name"
+          cp target/release/oya LICENSE-MIT LICENSE-APACHE README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oya-linux-${{ matrix.arch }}
+          path: oya-linux-${{ matrix.arch }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: sha256sum oya-linux-*.tar.gz > SHA256SUMS
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft \
+            --generate-notes \
+            oya-linux-*.tar.gz SHA256SUMS

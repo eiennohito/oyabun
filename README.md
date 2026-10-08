@@ -7,6 +7,21 @@ Linux only today (io_uring with a syscall fallback; an optional privileged eBPF 
 macOS is a goal, Windows is not.
 For *why* the design is shaped this way, read `docs/GOALS.md` then `docs/ARCHITECTURE.md` — the architecture doc is the source of truth and should be read before the code.
 
+## Install
+
+Linux x86_64 and aarch64 (glibc 2.17+). The binary is `oya`.
+
+```
+curl -fsSL https://raw.githubusercontent.com/eiennohito/oyabun/main/install.sh | sh                   # ~/.local/bin/oya
+curl -fsSL https://raw.githubusercontent.com/eiennohito/oyabun/main/install.sh | sh -s -- --privileged # /usr/local/bin/oya + caps
+```
+
+The plain install runs the unprivileged `/proc` source.
+`--privileged` installs a root-owned binary carrying file capabilities (`CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_PTRACE`) for the eBPF source; see [Security risks](#security-risks).
+`OYA_VERSION=v0.1.0` pins a release; `OYA_INSTALL_DIR` overrides the target directory.
+
+From source: `cargo install --path crates/oyabun`.
+
 ## Dev environment
 
 Prerequisites:
@@ -56,6 +71,13 @@ tools/caprun cargo test --workspace     # run the cap-gated BPF tests
 ```
 
 Without caps, oyabun falls back to the `/proc` source automatically and the BPF integration tests skip.
+`just test-bpf` (and CI) sets `OYA_FORCE_BPF`, which turns that skip into a failure: there, a BPF object that fails to load — verifier rejection included — must not pass as green.
+
+## CI and releases
+
+CI runs `just lint check test test-nobpf test-bpf` on x86_64 and arm64 runners, with `caprun` installed so the privileged tests load the BPF object into the runner's kernel for real.
+Pushing a `v*` tag matching `crates/oyabun`'s version builds both architectures and opens a draft GitHub release with the tarballs and `SHA256SUMS`.
+Releases are built in PyPA's manylinux2014 image, so they run on glibc 2.17+; they link glibc dynamically rather than static musl because GPU stats `dlopen` NVML, which a static binary cannot do.
 
 ## io_uring note
 
@@ -81,8 +103,15 @@ Or for a systemd service: `LimitMEMLOCK=128M`.
 
 ## Security risks
 
-This is a developer setup, not a hardened deployment.
-Two parts of the privileged path deliberately trade safety for dev convenience — understand them before installing on any machine you do not fully control.
+There are two ways to grant the privileged source its caps, with different trust models.
+
+**`install.sh --privileged` binds the caps to one binary.**
+The installed `oya` is root-owned, so its user cannot replace it under the granted caps, and the kernel runs file-capability binaries as secure-exec (the loader ignores `LD_PRELOAD` and similar).
+It grants only `CAP_BPF`, `CAP_PERFMON`, and `CAP_SYS_PTRACE`.
+The trade-off: every local user can run it, and therefore see the system-wide view below.
+`SHA256SUMS` protects the download's integrity, not the release's authenticity: it comes from the same GitHub release as the tarball.
+
+The dev path, below, deliberately trades safety for convenience — understand it before using it on any machine you do not fully control.
 
 **`tools/caprun` is an unrestricted capability grant.**
 It is setuid-root and grants its four capabilities to *whatever binary you hand it*, with the caller's environment and `PATH` intact.
@@ -100,3 +129,7 @@ If you do not trust the committed object, rebuild it yourself from `bpf/*.c` wit
 **Privileged mode sees the whole system.**
 Running oyabun with caps reads process metadata across all users.
 That is the point of the mode, but it means a privileged oyabun is a system-wide observer; run it as such.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

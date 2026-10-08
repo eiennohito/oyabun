@@ -63,6 +63,18 @@ pub(crate) fn force_syscall() -> bool {
     std::env::var_os("OYA_FORCE_SYSCALL").is_some()
 }
 
+/// Privileged tests skip when BPF can't load (no caps) — unless `OYA_FORCE_BPF` declares BPF
+/// required (`just test-bpf`, CI). Then a load failure (missing caps, verifier rejection)
+/// fails the test: a skip would report a broken BPF object as green.
+#[cfg(test)]
+pub(crate) fn skip_privileged_test() {
+    assert!(
+        std::env::var_os("OYA_FORCE_BPF").is_none(),
+        "OYA_FORCE_BPF is set but BPF failed to load (load error on stderr)"
+    );
+    eprintln!("BPF unavailable (no caps?) — skipping");
+}
+
 /// Gatherer tuning knobs, read once from the environment. Grouped so the knob set is one
 /// named thing rather than scattered single-use readers.
 pub(crate) struct Config {

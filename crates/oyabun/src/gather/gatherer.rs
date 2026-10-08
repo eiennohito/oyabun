@@ -754,7 +754,7 @@ mod tests {
         let proc_dir = ProcDir::open().expect("open /proc");
         let mut g = Gatherer::with_source(crate::sys::page_size(), proc_dir, true);
         if !g.is_privileged() {
-            eprintln!("not privileged (no caps?) — skipping bpf end-to-end");
+            crate::gather::config::skip_privileged_test();
             return;
         }
 

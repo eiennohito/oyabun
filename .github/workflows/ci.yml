@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      # setuid caprun wrapper: the privileged tests run for real (runners have sudo + BTF).
+      - run: scripts/setup-caps.sh
+      - run: cargo fmt --all --check
+      - run: just lint
+      - run: just check
+      - run: just test
+      - run: just test-nobpf
+      - run: just test-bpf

@@ -365,7 +365,7 @@ mod tests {
     fn bpf_snapshot_matches_proc() {
         let arena = Box::new(Arena::new(0));
         let Some(mut src) = BpfSource::probe(&arena, sys::page_size(), sys::clk_tck()) else {
-            eprintln!("BPF unavailable (no caps?) — skipping");
+            crate::gather::config::skip_privileged_test();
             return;
         };
         let mut procs = Procs::new(&arena, 256);
@@ -417,7 +417,7 @@ mod tests {
     fn bpf_detects_short_lived() {
         let arena = Box::new(Arena::new(0));
         let Some(mut src) = BpfSource::probe(&arena, sys::page_size(), sys::clk_tck()) else {
-            eprintln!("BPF unavailable (no caps?) — skipping");
+            crate::gather::config::skip_privileged_test();
             return;
         };
         let mut procs = Procs::new(&arena, 256);
@@ -455,7 +455,7 @@ mod tests {
     fn bpf_emit_on_change_is_a_delta() {
         let arena = Box::new(Arena::new(0));
         let Some(mut src) = BpfSource::probe(&arena, sys::page_size(), sys::clk_tck()) else {
-            eprintln!("BPF unavailable (no caps?) — skipping");
+            crate::gather::config::skip_privileged_test();
             return;
         };
         let mut procs = Procs::new(&arena, 256);
@@ -494,7 +494,7 @@ mod tests {
     fn bpf_num_threads_is_signal_nr_threads() {
         let arena = Box::new(Arena::new(0));
         let Some(mut src) = BpfSource::probe(&arena, sys::page_size(), sys::clk_tck()) else {
-            eprintln!("BPF unavailable (no caps?) — skipping");
+            crate::gather::config::skip_privileged_test();
             return;
         };
         let mut child = std::process::Command::new("sleep")
@@ -528,7 +528,7 @@ mod tests {
     fn bpf_flags_kernel_threads() {
         let arena = Box::new(Arena::new(0));
         let Some(mut src) = BpfSource::probe(&arena, sys::page_size(), sys::clk_tck()) else {
-            eprintln!("BPF unavailable (no caps?) — skipping");
+            crate::gather::config::skip_privileged_test();
             return;
         };
         let mut procs = Procs::new(&arena, 256);

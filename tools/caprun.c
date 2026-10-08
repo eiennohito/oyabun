@@ -9,7 +9,7 @@
  * Granted:
  *   CAP_BPF         (39) — BPF program loading (task iterator, kprobes)
  *   CAP_PERFMON     (38) — BPF tracing attachment
- *   CAP_NET_ADMIN   (12) — netlink proc connector, BPF network programs
+ *   CAP_NET_ADMIN   (12) — netlink (planned: I/O monitoring); unused until then
  *   CAP_SYS_PTRACE  (19) — /proc/<pid>/io for other users' processes
  *
  * Build:   cc -static -o tools/caprun tools/caprun.c

@@ -432,7 +432,15 @@ demand) and not read at runtime — the committed object carries its own BTF, an
 applies CO-RE relocations against the running kernel's BTF, so one object works across kernel
 versions without recompilation (the fields read are stable ABI). The cap wrapper
 (`tools/caprun`) grants exactly the needed capabilities without full root; agent sessions and
-dev runs use it instead of interactive sudo.
+dev runs use it instead of interactive sudo. Installed binaries take the opposite trade: file
+capabilities on a root-owned binary bind the grant to that one program instead of to whatever
+the caller hands a wrapper. Releases link glibc dynamically, not static musl, because GPU stats
+`dlopen` NVML.
+
+**Load failure is a test failure where BPF is required.** The privileged tests skip when the
+object cannot load, so an unprivileged `cargo test` stays green — but a verifier rejection looks
+exactly like "no caps". Where BPF is declared required (the privileged test run, CI) the skip
+becomes a failure; otherwise a broken object would ship as green.
 
 ## Tree build
 

@@ -23,9 +23,9 @@ fmt: _require-cargo
 
 # --- Lint ---
 
-# Run clippy on workspace
+# Run clippy on workspace; any warning fails (CI enforces the same)
 lint: _require-cargo
-    @{{ _run }} lint cargo clippy --workspace --all-targets
+    @{{ _run }} lint cargo clippy --workspace --all-targets -- -D warnings
 
 # --- Check ---
 
@@ -71,10 +71,13 @@ run-profiling *ARGS: _require-cargo
     @RUSTFLAGS="-C force-frame-pointers=yes" cargo run --profile profiling -- {{ ARGS }}
 
 # Run the BPF tests under caprun (verifier + runtime correctness). Skipped if caprun
-# is not installed (setup: scripts/setup-caps.sh).
+# is not installed (setup: scripts/setup-caps.sh) — except in CI, where a skip would
+# silently pass a broken BPF object.
 test-bpf: _require-cargo
     @if [ -x tools/caprun ]; then \
         OYA_FORCE_BPF=1 {{ _run }} test-bpf tools/caprun cargo test -p oyabun --release -- bpf_; \
+    elif [ -n "${CI:-}" ]; then \
+        echo "test-bpf: tools/caprun not installed (CI must run scripts/setup-caps.sh)" >&2; exit 1; \
     else \
         echo "skipping test-bpf: tools/caprun not installed (run scripts/setup-caps.sh)"; \
     fi

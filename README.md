@@ -22,6 +22,17 @@ The plain install runs the unprivileged `/proc` source.
 
 From source: `cargo install --path crates/oyabun`.
 
+For a completely local install from this checkout, with the Rust toolchain and
+dependencies already cached:
+
+```
+scripts/install-local.sh               # offline build → ~/.local/bin/oya
+scripts/install-local.sh --privileged  # offline build → /usr/local/bin/oya + caps
+```
+
+`OYA_INSTALL_DIR` also overrides the local install directory. The script builds
+the checkout in release mode using `Cargo.lock`; it does not download a release.
+
 ## Dev environment
 
 Prerequisites:

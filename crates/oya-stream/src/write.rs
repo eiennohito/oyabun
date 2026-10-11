@@ -4,6 +4,7 @@ use crate::{RawProc, Stream, SystemStats};
 
 pub(crate) fn verbose_stream(stream: &Stream) -> String {
     let mut out = String::new();
+    let mut measured: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
     for (idx, cycle) in stream.cycles.iter().enumerate() {
         if idx > 0 {
             out.push('\n');
@@ -11,7 +12,10 @@ pub(crate) fn verbose_stream(stream: &Stream) -> String {
         cycle.sys.write_header(&mut out, cycle.wall_ns);
         for snapshot in &cycle.procs {
             let proc = &snapshot.raw;
-            proc.write_full(&mut out);
+            // The parser carries values across cycles, so a wait that stopped being measured
+            // must be written; one that never was needs no mention.
+            let was_measured = measured.insert(proc.pid, proc.wait.is_some()) == Some(true);
+            proc.write_full(&mut out, was_measured);
             if let Some(cmdline) = &snapshot.metadata.cmdline {
                 out.push_str(" cmd=");
                 write_value(&mut out, cmdline);
@@ -32,14 +36,13 @@ pub(crate) fn verbose_stream(stream: &Stream) -> String {
 
 impl SystemStats {
     pub(crate) fn write_header(self, out: &mut String, wall_ns: u64) {
-        let _ = writeln!(
+        let _ = write!(
             out,
             "cycle {}ns cores={} \
              stat_user={} stat_nice={} stat_system={} stat_idle={} \
              stat_iowait={} stat_irq={} stat_softirq={} stat_steal={} \
-             mem={} mem_available={} mem_buffers={} mem_cached={} \
-             swap_total={} swap_free={} \
-             load={},{},{} uptime={}",
+             runnable={} mem={} mem_available={} mem_free={} mem_shmem={} \
+             swap_total={} swap_free={}",
             wall_ns,
             self.num_cores,
             self.stat_user,
@@ -50,26 +53,41 @@ impl SystemStats {
             self.stat_irq,
             self.stat_softirq,
             self.stat_steal,
+            self.runnable,
             self.mem_total,
             self.mem_available,
-            self.mem_buffers,
-            self.mem_cached,
+            self.mem_free,
+            self.mem_shmem,
             self.swap_total,
             self.swap_free,
-            self.load[0],
-            self.load[1],
-            self.load[2],
-            self.uptime_secs,
         );
+        // The parser carries values across cycles, so absence is written explicitly: omitting
+        // a key would replay as "unchanged".
+        for (key, value) in [
+            ("psi_cpu", self.psi_cpu),
+            ("psi_memory", self.psi_memory),
+            ("psi_io", self.psi_io),
+            ("pswpin", self.pswpin),
+        ] {
+            match value {
+                Some(v) => {
+                    let _ = write!(out, " {key}={v}");
+                }
+                None => {
+                    let _ = write!(out, " {key}=none");
+                }
+            }
+        }
+        out.push('\n');
     }
 }
 
 impl RawProc {
-    pub(crate) fn write_full(&self, out: &mut String) {
+    pub(crate) fn write_full(&self, out: &mut String, was_wait_measured: bool) {
         let _ = write!(
             out,
             "  {} ppid={} uid={} state={} priority={} nice={} threads={} ticks={} mem={} \
-             start={} kthread={} comm=",
+             start={} kthread={}",
             self.pid,
             self.ppid,
             self.uid,
@@ -82,6 +100,14 @@ impl RawProc {
             self.start_time,
             self.is_kthread,
         );
+        match self.wait {
+            Some(w) => {
+                let _ = write!(out, " wait={w}");
+            }
+            None if was_wait_measured => out.push_str(" wait=none"),
+            None => {}
+        }
+        out.push_str(" comm=");
         write_value(out, &self.comm);
     }
 }

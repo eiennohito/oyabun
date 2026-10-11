@@ -1,42 +1,54 @@
 //! Application state for the single-threaded loop: it owns the [`Gatherer`] (which produces
-//! the live process buffer) plus the view state — collapse set, selection/scroll, and the
-//! cached flattened display list. [`App::gather`] runs one gather cycle then rebuilds the
-//! display list; render reads everything back through `&self`. The borrow checker proves the
-//! gather (`&mut`) and the render (`&`) never overlap, so there is no snapshot exchange.
+//! the live process buffer) plus the view state — collapse choices, selection/scroll, and the
+//! [`ViewTree`] of display rows. [`App::gather`] runs one gather cycle, rebuilds the tree only
+//! if the structure, grouping, or collapse choices moved, and refreshes the per-row numbers;
+//! render reads everything back through `&self`. The borrow checker proves the gather (`&mut`)
+//! and the render (`&`) never overlap, so there is no snapshot exchange.
 
 use crate::application::{
     AppGroup, AppGroupKey, ApplicationGroups, DesktopResolver, FoldPreferences, MemorySampler,
 };
-use crate::fxhash::{FxMap, PidMap};
-use crate::gather::Gatherer;
-use crate::procs::{GpuMetrics, NONE, ProcessEntry, Procs, SystemStats};
+use crate::fxhash::FxMap;
+use crate::gather::{CpuHistory, CpuSeries, Gatherer};
+use crate::header;
+use crate::procs::{ProcessEntry, Procs, SystemStats};
 use crate::sys::{self, ProcDir};
+use crate::view::{Collapse, RowKind, Totals, ViewRow, ViewTree};
 
-#[derive(Clone, Debug)]
-pub enum DisplayRowKind {
-    Process { proc_idx: usize },
-    Application { group_idx: usize },
+/// What the viewport shows: the candidate set of processes the view sums numbers for is a
+/// function of these alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ViewportKey {
+    layout: u64,
+    scroll: usize,
+    height: usize,
 }
 
-pub struct DisplayRow {
-    pub kind: DisplayRowKind,
-    pub depth: u16,
-    pub collapsed: bool,
-    pub has_children: bool,
-    pub has_next: bool,
+/// What the memory sampler's last pass looked at. The candidate set (what the viewport shows or
+/// hides) is a function of these alone, so an unchanged key means nothing new to sample and the
+/// per-frame call is free.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SampleKey {
+    generation: u64,
+    layout: u64,
+    scroll: usize,
+    height: usize,
 }
 
 pub struct App {
     /// Produces the live process buffer; owns the THP arena + per-PID stores + I/O backend.
     gatherer: Gatherer,
-    /// Flattened display list (tree order, collapsed subtrees skipped). A `Vec`, not an arena
-    /// buffer: it is walked **sequentially** in render, so it gains nothing from the huge-page
-    /// TLB win — the random walk that does is into `gatherer.procs()`, which *is* arena-backed.
-    /// Keeping it on the heap also means a rebuild's `push` can never relocate the arena and
-    /// dangle the `&[ProcessEntry]` it reads from.
-    rows: Vec<DisplayRow>,
-    collapse: PidMap<CollapseState>,
-    application_collapse: FxMap<AppGroupKey, AppCollapseState>,
+    /// The display rows and their per-cycle numbers.
+    view: ViewTree,
+    /// What the view was last built from: the structure/grouping epoch and the collapse
+    /// version. Equal ⇒ the rows are still right and only the numbers need refreshing.
+    built: Option<(u64, u64)>,
+    /// Bumped on every rebuild of the rows; part of what invalidates a sampling pass.
+    layout: u64,
+    sampled: Option<SampleKey>,
+    /// Visible body height as of the last [`App::prepare_visible_rows`]; 0 before the first.
+    viewport_height: usize,
+    collapse: Collapse,
     /// Persisted, per-identity fold overrides — a folded application returns folded next run.
     folds: FoldPreferences,
     applications: ApplicationGroups,
@@ -45,29 +57,53 @@ pub struct App {
     uid_names: FxMap<u32, Box<str>>,
     selected: usize,
     scroll: usize,
-    /// Reused DFS stack for flattening the tree into `rows`.
-    row_scratch: Vec<u32>,
-    /// Reused list of visible collapsed application group indices, refilled each frame for the
-    /// memory sampler — avoids a per-frame allocation on the render hot path.
-    visible_scratch: Vec<usize>,
+    /// The processes the viewport shows numbers for (visible rows and the hidden sets of visible
+    /// collapsed rows), and the viewport it was computed for. Kept so the sampler and the totals
+    /// pass share one candidate list, refilled only when the viewport or the rows move.
+    viewport_scratch: Vec<usize>,
+    viewport_for: Option<ViewportKey>,
+    /// Terminal width the header was last laid out for; sizes the CPU graph's history window.
+    header_width: u16,
+    /// Where every header widget goes at `header_width`: rebuilt only on a resize (or once the
+    /// first sample reveals the machine), so widgets never move with the data.
+    header_layout: header::HeaderLayout,
 }
 
 impl App {
     pub fn new(page_size: u64, proc_dir: ProcDir, uid_names: FxMap<u32, Box<str>>) -> Self {
+        Self::assemble(
+            Gatherer::new(page_size, proc_dir),
+            uid_names,
+            FoldPreferences::system(),
+            DesktopResolver::system(),
+        )
+    }
+
+    fn assemble(
+        gatherer: Gatherer,
+        uid_names: FxMap<u32, Box<str>>,
+        folds: FoldPreferences,
+        desktop: DesktopResolver,
+    ) -> Self {
         Self {
-            gatherer: Gatherer::new(page_size, proc_dir),
-            rows: Vec::new(),
-            collapse: PidMap::default(),
-            application_collapse: FxMap::default(),
-            folds: FoldPreferences::system(),
+            gatherer,
+            view: ViewTree::default(),
+            built: None,
+            layout: 0,
+            sampled: None,
+            viewport_height: 0,
+            collapse: Collapse::default(),
+            folds,
             applications: ApplicationGroups::default(),
-            desktop: DesktopResolver::system(),
+            desktop,
             memory: MemorySampler::system(),
             uid_names,
             selected: 0,
             scroll: 0,
-            row_scratch: Vec::new(),
-            visible_scratch: Vec::new(),
+            viewport_scratch: Vec::new(),
+            viewport_for: None,
+            header_width: 0,
+            header_layout: header::HeaderLayout::default(),
         }
     }
 
@@ -92,21 +128,7 @@ impl App {
         uid_names: FxMap<u32, Box<str>>,
         desktop: DesktopResolver,
     ) -> Self {
-        Self {
-            gatherer,
-            rows: Vec::new(),
-            collapse: PidMap::default(),
-            application_collapse: FxMap::default(),
-            folds: FoldPreferences::disabled(),
-            applications: ApplicationGroups::default(),
-            desktop,
-            memory: MemorySampler::system(),
-            uid_names,
-            selected: 0,
-            scroll: 0,
-            row_scratch: Vec::new(),
-            visible_scratch: Vec::new(),
-        }
+        Self::assemble(gatherer, uid_names, FoldPreferences::disabled(), desktop)
     }
 
     #[cfg(test)]
@@ -114,12 +136,58 @@ impl App {
         self.folds = folds;
     }
 
-    /// Run one gather cycle, then rebuild the display list (selection follows its PID).
+    /// Sample proportional memory from a fake `/proc` instead of the real one.
+    #[cfg(test)]
+    pub(crate) fn set_memory(&mut self, memory: MemorySampler) {
+        self.memory = memory;
+    }
+
+    /// Run one gather cycle, then bring the view up to date (selection follows its identity).
     pub fn gather(&mut self) {
         let keep = self.selected_key();
+        self.gatherer.set_wait_interest(&self.viewport_scratch);
         self.gatherer.cycle();
-        self.rebuild_application_groups();
-        self.rebuild_rows(keep.as_ref());
+        if !self.header_layout.is_informed() {
+            self.relayout_header();
+        }
+        // The one gate: grouping and rows are a function of the structure epoch and the collapse
+        // choices, so neither is rebuilt while both are what the view was built from.
+        let built = (self.gatherer.meta_epoch(), self.collapse.version());
+        let regroup = self.built.is_none_or(|(epoch, _)| epoch != built.0);
+        if regroup {
+            self.regroup_applications();
+        }
+        self.begin_memory_cycle();
+        if regroup || self.built != Some(built) {
+            self.relayout(keep.as_ref());
+        } else {
+            self.refresh_view();
+        }
+        self.sampled = None;
+    }
+
+    /// Tell the app the terminal width. The header is laid out for it here and nowhere else
+    /// (besides the first sample): a resize is the only thing that moves a widget. The CPU graph
+    /// takes one cell per refresh, so history depth follows the layout: the ring grows to the
+    /// widest width seen (never shrinks) and the graph's scale tracks exactly what is visible.
+    pub fn set_header_width(&mut self, width: u16) {
+        // Called every main-loop iteration.
+        if width == self.header_width {
+            return;
+        }
+        self.header_width = width;
+        self.relayout_header();
+    }
+
+    fn relayout_header(&mut self) {
+        let width = usize::from(self.header_width);
+        self.header_layout = header::HeaderLayout::new(self.gatherer.sys(), width);
+        self.gatherer
+            .fit_cpu_history(width, self.header_layout.cpu_cells());
+    }
+
+    pub fn header_layout(&self) -> &header::HeaderLayout {
+        &self.header_layout
     }
 
     // --- views for render ---
@@ -128,26 +196,53 @@ impl App {
         self.gatherer.sys()
     }
 
+    pub fn cpu_history(&self) -> &CpuHistory {
+        self.gatherer.cpu_history()
+    }
+
     pub fn procs(&self) -> &Procs {
         self.gatherer.procs()
     }
 
-    pub fn rows(&self) -> &[DisplayRow] {
-        &self.rows
+    pub fn rows(&self) -> &[ViewRow] {
+        self.view.rows()
+    }
+
+    /// The numbers a row shows: its own for a plain process, the sum over its hidden set for a
+    /// collapsed row.
+    pub(crate) fn row_totals(&self, row: usize) -> Totals {
+        self.view.totals(row)
+    }
+
+    /// The history series a row's sparkline draws, if it has one.
+    pub(crate) fn row_series(&self, row: usize) -> Option<CpuSeries> {
+        match self.view.rows().get(row)?.kind {
+            RowKind::Process { proc_idx } if !self.view.rows()[row].is_collapsed() => {
+                self.gatherer.cpu_series(self.entry(proc_idx).pid)
+            }
+            _ => self.view.series(row),
+        }
     }
 
     pub(crate) fn app_group(&self, group_idx: usize) -> &AppGroup {
         &self.applications.groups()[group_idx]
     }
 
+    /// The process a row is shown through: the process itself or a group's representative.
+    /// Test convenience.
     #[cfg(test)]
-    pub(crate) fn row_pid(&self, row: &DisplayRow) -> u32 {
+    pub(crate) fn row_pid(&self, row: &ViewRow) -> u32 {
         match row.kind {
-            DisplayRowKind::Process { proc_idx } => self.entry(proc_idx).pid,
-            DisplayRowKind::Application { group_idx } => {
+            RowKind::Process { proc_idx } => self.entry(proc_idx).pid,
+            RowKind::Group { group_idx } => {
                 self.entry(self.app_group(group_idx).representative).pid
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view_full_refreshes(&self) -> usize {
+        self.view.full_refreshes()
     }
 
     #[cfg(test)]
@@ -158,6 +253,12 @@ impl App {
     #[cfg(test)]
     pub(crate) fn meta_epoch(&self) -> u64 {
         self.gatherer.meta_epoch()
+    }
+
+    /// How many times the display rows have been rebuilt.
+    #[cfg(test)]
+    pub(crate) fn layout_count(&self) -> u64 {
+        self.layout
     }
 
     /// Live PIDs this cycle that overflowed the persistent-fd pool (0 in the common case).
@@ -189,12 +290,9 @@ impl App {
         self.gatherer.gpu_process_sample_available()
     }
 
-    pub fn gpu_for_pid(&self, pid: u32) -> Option<GpuMetrics> {
-        self.gatherer.gpu_for_pid(pid)
-    }
-
-    pub fn subtree_gpu_for_pid(&self, pid: u32) -> Option<GpuMetrics> {
-        self.gatherer.subtree_gpu_for_pid(pid)
+    #[cfg(test)]
+    pub(crate) fn cpu_series(&self, pid: u32) -> Option<CpuSeries> {
+        self.gatherer.cpu_series(pid)
     }
 
     pub fn empty_gpus(&self) -> Option<&[u32]> {
@@ -223,129 +321,129 @@ impl App {
     }
 
     fn selected_key(&self) -> Option<SelectionKey> {
-        match &self.rows.get(self.selected)?.kind {
-            DisplayRowKind::Process { proc_idx } => {
-                Some(SelectionKey::Process(self.entry(*proc_idx).pid))
+        let row = self.view.rows().get(self.selected)?;
+        Some(match row.kind {
+            RowKind::Process { proc_idx } => SelectionKey::Process(self.entry(proc_idx).pid),
+            RowKind::Group { group_idx } => {
+                let group = self.app_group(group_idx);
+                SelectionKey::Group(group.key.clone(), self.entry(group.representative).pid)
             }
-            DisplayRowKind::Application { group_idx } => Some(SelectionKey::Application(
-                self.app_group(*group_idx).key.clone(),
-            )),
-        }
+        })
     }
 
-    fn rebuild_application_groups(&mut self) {
+    fn regroup_applications(&mut self) {
         let App {
             gatherer,
             applications,
             desktop,
-            memory,
             ..
         } = self;
         let procs = gatherer.procs().as_slice();
         let identities = (0..procs.len())
             .filter_map(|idx| gatherer.identity(idx).map(|identity| (idx, identity)));
-        applications.rebuild(
-            procs,
-            identities,
-            desktop,
-            |pid| gatherer.gpu_for_pid(pid),
-            gatherer.meta_epoch(),
-        );
-        // Reset the per-cycle proportional-read budget and evict cached members of dead/reused
-        // PIDs. The resident-set check then reads only what actually moved, when a group is
-        // visible and collapsed (`prepare_visible_rows`).
-        memory.begin_cycle(gatherer.generation(), procs);
+        applications.rebuild(procs, identities, desktop);
     }
 
-    /// Flatten the tree into display order, skipping collapsed subtrees. Restores selection
-    /// onto `keep_pid` if present (selection-follow across refreshes), and anchors scroll so the
+    /// Reset the per-cycle proportional-read budget and evict cached entries of dead/reused
+    /// PIDs. The sampler then reads only what the viewport shows (`prepare_visible_rows`).
+    fn begin_memory_cycle(&mut self) {
+        let procs = self.gatherer.procs().as_slice();
+        self.memory.begin_cycle(self.gatherer.generation(), procs);
+    }
+
+    /// Rebuild the display rows from the native tree, grouping, and collapse state, restore the
+    /// selection onto `keep` (selection-follow across rebuilds), and anchor scroll so the
     /// selected row stays at the same screen line — minimizing visible row movement from
-    /// births/deaths outside the viewport. Reads the arena-backed process buffer; `rows` is a
-    /// heap `Vec`, so its growth never relocates that buffer.
-    fn rebuild_rows(&mut self, keep: Option<&SelectionKey>) {
+    /// births/deaths outside the viewport. If `keep` no longer has a row of its own (its process
+    /// was folded into a group, or hidden under a collapsed ancestor), the selection moves to
+    /// the row that now shows or contains that process rather than staying on a stale index.
+    fn relayout(&mut self, keep: Option<&SelectionKey>) {
         let anchor_offset = self.selected.saturating_sub(self.scroll);
-        let mut pid_survived = false;
+        let mut survived = false;
         {
             let App {
                 gatherer,
-                rows,
-                row_scratch,
+                view,
                 collapse,
-                application_collapse,
                 folds,
                 applications,
                 selected,
                 ..
             } = self;
             let procs = gatherer.procs().as_slice();
-            // Native collapse is transient UI state keyed by PID: manual per-process folds plus
-            // the one built-in auto-fold of the kernel-thread forest. Semantic grouping is handled
-            // separately by application rows (`application_collapse`), not here. If a PID is absent
-            // from a gathered frame its UI state is gone; PID reuse within one gather interval may
-            // inherit collapse state, which is acceptable for display state and signal-safe.
-            collapse.retain(|pid, _| procs.binary_search_by(|p| p.pid.cmp(pid)).is_ok());
-            collapse.retain(|_, state| *state != CollapseState::Auto);
-            if let Some(kthreadd) = procs
-                .iter()
-                .find(|proc| proc.comm() == b"kthreadd" && proc.first_child != NONE)
-            {
-                collapse.entry(kthreadd.pid).or_insert(CollapseState::Auto);
-            }
-
-            // Prune collapse state for vanished groups, then seed any new group's default. Both
-            // walk the (handful of) live groups directly rather than materializing a key set, and
-            // clone a key only on the miss path — so a steady cycle (groups unchanged) allocates
-            // nothing here.
-            application_collapse
-                .retain(|key, _| applications.groups().iter().any(|group| &group.key == key));
-            // A group starts folded (the default) unless the user has a persisted expansion
-            // override for its stable identity — then it returns expanded next run.
-            for group in applications.groups() {
-                if !application_collapse.contains_key(&group.key) {
-                    let expanded = group
-                        .persist_key
-                        .as_deref()
-                        .is_some_and(|key| folds.is_expanded(key));
-                    let state = if expanded {
-                        AppCollapseState::Suppressed
-                    } else {
-                        AppCollapseState::Auto
-                    };
-                    application_collapse.insert(group.key.clone(), state);
-                }
-            }
-
-            rows.clear();
-            row_scratch.clear();
-            push_children(procs, gatherer.first_root(), row_scratch);
-
-            let mut builder = RowBuilder::new(procs, applications, application_collapse, collapse);
-            while let Some(iu) = row_scratch.pop() {
-                builder.project_native(iu as usize, procs[iu as usize].depth, rows);
-            }
-            mark_next_siblings(rows);
-            if let Some(idx) = rows
+            collapse.sync(procs, applications, folds);
+            view.rebuild(gatherer, applications, collapse);
+            let found = view
+                .rows()
                 .iter()
                 .position(|row| row_matches(row, keep, procs, applications))
-            {
+                .or_else(|| {
+                    let pid = keep?.pid();
+                    let idx = procs.binary_search_by(|p| p.pid.cmp(&pid)).ok()?;
+                    view.row_covering(procs, idx)
+                });
+            if let Some(idx) = found {
                 *selected = idx;
-                pid_survived = true;
+                survived = true;
             }
         }
+        self.built = Some((self.gatherer.meta_epoch(), self.collapse.version()));
+        self.layout += 1;
         self.clamp_selection();
-        if pid_survived {
+        if survived {
             self.scroll = self.selected.saturating_sub(anchor_offset);
         }
+        // After scroll settles: the viewport (hence the estimates the totals use) depends on it.
+        self.refresh_view();
+    }
+
+    fn viewport_key(&self) -> ViewportKey {
+        ViewportKey {
+            layout: self.layout,
+            scroll: self.scroll,
+            height: self.viewport_height,
+        }
+    }
+
+    /// Refill the candidate list if the viewport or the rows moved since it was computed.
+    /// Returns whether it was refilled.
+    fn ensure_viewport(&mut self) -> bool {
+        let key = self.viewport_key();
+        if self.viewport_for == Some(key) {
+            return false;
+        }
+        let App {
+            gatherer,
+            view,
+            viewport_scratch,
+            ..
+        } = self;
+        let procs = gatherer.procs().as_slice();
+        view.viewport_procs(procs, key.scroll, key.height, viewport_scratch);
+        self.viewport_for = Some(key);
+        true
+    }
+
+    fn refresh_view(&mut self) {
+        self.ensure_viewport();
+        let App {
+            gatherer,
+            view,
+            memory,
+            viewport_scratch,
+            ..
+        } = self;
+        view.refresh(gatherer, memory, viewport_scratch);
     }
 
     // --- navigation ---
 
     fn clamp_selection(&mut self) {
-        if self.rows.is_empty() {
+        if self.view.rows().is_empty() {
             self.selected = 0;
             self.scroll = 0;
         } else {
-            self.selected = self.selected.min(self.rows.len() - 1);
+            self.selected = self.selected.min(self.view.rows().len() - 1);
         }
     }
 
@@ -354,8 +452,8 @@ impl App {
     }
 
     pub fn move_down(&mut self) {
-        if !self.rows.is_empty() {
-            self.selected = (self.selected + 1).min(self.rows.len() - 1);
+        if !self.view.rows().is_empty() {
+            self.selected = (self.selected + 1).min(self.view.rows().len() - 1);
         }
     }
 
@@ -364,8 +462,8 @@ impl App {
     }
 
     pub fn page_down(&mut self, page: usize) {
-        if !self.rows.is_empty() {
-            self.selected = (self.selected + page).min(self.rows.len() - 1);
+        if !self.view.rows().is_empty() {
+            self.selected = (self.selected + page).min(self.view.rows().len() - 1);
         }
     }
 
@@ -374,13 +472,13 @@ impl App {
     }
 
     pub fn select_last(&mut self) {
-        self.selected = self.rows.len().saturating_sub(1);
+        self.selected = self.view.rows().len().saturating_sub(1);
     }
 
     #[cfg(test)]
     pub(crate) fn select_row(&mut self, row: usize) {
-        if !self.rows.is_empty() {
-            self.selected = row.min(self.rows.len() - 1);
+        if !self.view.rows().is_empty() {
+            self.selected = row.min(self.view.rows().len() - 1);
         }
     }
 
@@ -399,130 +497,173 @@ impl App {
     }
 
     /// Perform bounded proportional-memory sampling after the viewport is known, so rendering
-    /// stays pure I/O. Only collapsed application rows in the viewport are candidates; the sampler
-    /// estimates each member's proportional set size from a cached split and the free resident
-    /// reading, walking the address space only to bootstrap a member or on a staggered backstop
-    /// under a per-cycle budget, so this is cheap to call every render frame (a settled desktop
-    /// walks nothing).
-    pub fn prepare_visible_rows(&mut self, visible_height: usize) {
-        let mut visible = std::mem::take(&mut self.visible_scratch);
-        visible.clear();
-        visible.extend(
-            self.rows
-                .iter()
-                .skip(self.scroll)
-                .take(visible_height)
-                .filter_map(|row| match row.kind {
-                    DisplayRowKind::Application { group_idx } if row.collapsed => Some(group_idx),
-                    _ => None,
-                }),
-        );
-        if !visible.is_empty() {
+    /// stays pure I/O. The candidates are the processes the viewport shows a number for: plain
+    /// rows and everything hidden inside visible collapsed rows. The sampler estimates each
+    /// one's proportional set size from a cached split and the free resident reading, walking
+    /// the address space only to bootstrap a process or on a staggered backstop under a
+    /// per-cycle budget. The whole pass is skipped unless the generation, layout, scroll, or
+    /// viewport height moved, so calling it every loop iteration costs nothing on a settled
+    /// screen. Returns whether the numbers may have changed (new readings, or a viewport showing
+    /// different estimates): the frame must repaint.
+    pub fn prepare_visible_rows(&mut self, visible_height: usize) -> bool {
+        let key = SampleKey {
+            generation: self.gatherer.generation(),
+            layout: self.layout,
+            scroll: self.scroll,
+            height: visible_height,
+        };
+        if self.sampled == Some(key) {
+            return false;
+        }
+        self.sampled = Some(key);
+        self.viewport_height = visible_height;
+        // A moved viewport can show already-cached estimates, so it refreshes the numbers even
+        // when nothing is read.
+        let moved = self.ensure_viewport();
+        let read = {
             let App {
                 gatherer,
-                applications,
                 memory,
+                viewport_scratch,
                 ..
             } = self;
-            let procs = gatherer.procs().as_slice();
-            memory.sample_visible(applications.groups_mut(), &visible, procs);
+            memory.sample(viewport_scratch, gatherer.procs().as_slice())
+        };
+        if read || moved {
+            // Only estimates or the viewport changed (the gather's full pass already ran for
+            // this cycle's data): recompute just the visible rows, not every process.
+            let App {
+                gatherer,
+                view,
+                memory,
+                viewport_scratch,
+                scroll,
+                ..
+            } = self;
+            view.refresh_visible(gatherer, memory, viewport_scratch, *scroll, visible_height);
         }
-        self.visible_scratch = visible;
+        read || moved
     }
 
     // --- actions ---
 
-    fn selected_has_children(&self) -> Option<(SelectionKey, bool)> {
-        let row = self.rows.get(self.selected)?;
-        let selected = match row.kind {
-            DisplayRowKind::Process { proc_idx } => SelectionKey::Process(self.entry(proc_idx).pid),
-            DisplayRowKind::Application { group_idx } => {
-                SelectionKey::Application(self.app_group(group_idx).key.clone())
-            }
-        };
-        Some((selected, row.has_children))
+    fn selected_row(&self) -> Option<&ViewRow> {
+        self.view.rows().get(self.selected)
     }
 
+    /// Fold or expand a group by identity, persisting the choice where the identity is stable.
+    /// Selection stays on the group row when folding, and lands on the representative when
+    /// expanding (the group row no longer exists).
+    fn set_group_folded(&mut self, group_idx: usize, folded: bool) {
+        let group = self.app_group(group_idx);
+        let key = group.key.clone();
+        let persist_key = group.persist_key.clone();
+        let representative_pid = self.entry(group.representative).pid;
+        self.collapse.set_group_folded(&key, folded);
+        // A group with no persistable identity (container/pod/structural) is session-only.
+        if let Some(persist_key) = persist_key {
+            self.folds.set_expanded(&persist_key, !folded);
+        }
+        let keep = if folded {
+            SelectionKey::Group(key, representative_pid)
+        } else {
+            SelectionKey::Process(representative_pid)
+        };
+        self.relayout(Some(&keep));
+    }
+
+    fn group_is_folded(&self, group_idx: usize) -> bool {
+        self.collapse.group_folded(&self.app_group(group_idx).key)
+    }
+
+    /// The group the selected row belongs to: its own group row, or a member
+    /// process row of an expanded group.
+    fn selected_group(&self) -> Option<usize> {
+        match self.selected_row()?.kind {
+            RowKind::Group { group_idx } => Some(group_idx),
+            RowKind::Process { proc_idx } => self.applications.member_group(proc_idx),
+        }
+    }
+
+    /// The group the selected process row is a *top* member of, if any: collapsing the top of an
+    /// application's process tree means collapsing the application.
+    fn selected_top_group(&self) -> Option<usize> {
+        match self.selected_row()?.kind {
+            RowKind::Process { proc_idx } => self.applications.top_group(proc_idx),
+            RowKind::Group { .. } => None,
+        }
+    }
+
+    /// Enter / →: expand-or-collapse the selected row. A group row toggles its fold; a top
+    /// member of an expanded group folds the group; any other process toggles its native collapse.
     pub fn toggle_collapse(&mut self) {
-        let Some((selected, has_children)) = self.selected_has_children() else {
+        let Some(row) = self.selected_row() else {
             return;
         };
-        if !has_children {
-            return;
-        }
-        match selected {
-            SelectionKey::Application(key) => {
-                let expanded = {
-                    let state = self
-                        .application_collapse
-                        .entry(key.clone())
-                        .or_insert(AppCollapseState::Auto);
-                    *state = match *state {
-                        AppCollapseState::Auto => AppCollapseState::Suppressed,
-                        AppCollapseState::Suppressed => AppCollapseState::Auto,
-                    };
-                    *state == AppCollapseState::Suppressed
-                };
-                self.persist_fold(&key, expanded);
+        let (kind, has_children) = (row.kind, row.has_children());
+        match kind {
+            RowKind::Group { group_idx } => {
+                let folded = self.group_is_folded(group_idx);
+                self.set_group_folded(group_idx, !folded);
             }
-            SelectionKey::Process(pid) => match self.collapse.get(&pid).copied() {
-                Some(CollapseState::Auto) => {
-                    self.collapse.insert(pid, CollapseState::AutoSuppressed);
+            RowKind::Process { proc_idx } => {
+                let pid = self.entry(proc_idx).pid;
+                if self.collapse.proc_collapsed(pid) {
+                    self.toggle_native(pid);
+                } else if let Some(group_idx) = self.selected_top_group() {
+                    self.set_group_folded(group_idx, true);
+                } else if has_children {
+                    self.toggle_native(pid);
                 }
-                Some(CollapseState::Manual) => {
-                    self.collapse.remove(&pid);
-                }
-                _ => {
-                    self.collapse.insert(pid, CollapseState::Manual);
-                }
-            },
+            }
         }
-        let keep = self.selected_key();
-        self.rebuild_rows(keep.as_ref());
     }
 
+    /// ←: collapse the selected row. A top member of an expanded group folds the whole group;
+    /// any other process with children collapses natively.
     pub fn collapse_selected(&mut self) {
-        let Some((selected, has_children)) = self.selected_has_children() else {
+        let Some(row) = self.selected_row() else {
             return;
         };
-        if has_children {
-            match selected {
-                SelectionKey::Process(pid) => {
-                    self.collapse.insert(pid, CollapseState::Manual);
-                }
-                SelectionKey::Application(key) => {
-                    self.application_collapse
-                        .insert(key.clone(), AppCollapseState::Auto);
-                    self.persist_fold(&key, false);
+        let (kind, has_children) = (row.kind, row.has_children());
+        match kind {
+            RowKind::Group { group_idx } => self.set_group_folded(group_idx, true),
+            RowKind::Process { proc_idx } => {
+                if let Some(group_idx) = self.selected_top_group() {
+                    self.set_group_folded(group_idx, true);
+                } else if has_children {
+                    let pid = self.entry(proc_idx).pid;
+                    self.collapse.set_proc_collapsed(pid, true);
+                    let keep = self.selected_key();
+                    self.relayout(keep.as_ref());
                 }
             }
-            let keep = self.selected_key();
-            self.rebuild_rows(keep.as_ref());
         }
     }
 
-    /// Record the user's fold choice for a group whose identity is stable enough to persist. A
-    /// group with no persistable identity (container/pod/structural) is silently session-only.
-    fn persist_fold(&mut self, key: &AppGroupKey, expanded: bool) {
-        if let Some(persist_key) = self
-            .applications
-            .groups()
-            .iter()
-            .find(|group| &group.key == key)
-            .and_then(|group| group.persist_key.clone())
-        {
-            self.folds.set_expanded(&persist_key, expanded);
+    /// `g`: toggle the fold of the selected row's group, from the group row or any
+    /// member process row of an expanded group.
+    pub fn toggle_group_fold(&mut self) {
+        if let Some(group_idx) = self.selected_group() {
+            let folded = self.group_is_folded(group_idx);
+            self.set_group_folded(group_idx, !folded);
         }
+    }
+
+    fn toggle_native(&mut self, pid: u32) {
+        self.collapse.toggle_proc(pid);
+        let keep = self.selected_key();
+        self.relayout(keep.as_ref());
     }
 
     /// Signal the selected process, race-safely. Returns whether a signal was sent — the loop
     /// uses that to gather immediately so the change shows without waiting a full interval.
     #[must_use]
     pub fn kill_selected(&self) -> bool {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(row) = self.selected_row() else {
             return false;
         };
-        let DisplayRowKind::Process { proc_idx } = row.kind else {
+        let RowKind::Process { proc_idx } = row.kind else {
             return false;
         };
         let e = self.entry(proc_idx);
@@ -532,206 +673,37 @@ impl App {
     }
 }
 
-/// A row identified independently of its position — a process by PID, or an application group by
-/// its key. Used both to follow the selection across a refresh and to name the row an action
-/// targets.
+/// A row identified independently of its position — a process by PID, a group by its key.
+/// Used both to follow the selection across a rebuild and to name the row an action targets.
 #[derive(Clone)]
 enum SelectionKey {
     Process(u32),
-    Application(AppGroupKey),
+    /// A group by key, plus its representative: where the selection goes if the group dissolves.
+    Group(AppGroupKey, u32),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AppCollapseState {
-    Auto,
-    Suppressed,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CollapseState {
-    Manual,
-    Auto,
-    AutoSuppressed,
-}
-
-impl CollapseState {
-    fn is_collapsed(self) -> bool {
-        matches!(self, Self::Manual | Self::Auto)
-    }
-}
-
-/// The shared context for projecting the process tree into the flattened display list — the read
-/// views (processes, groups, both collapse maps) plus the per-group "already emitted" marks. The
-/// mutually recursive projection walks are methods on it so the context is named once, not
-/// threaded through every call; the output `rows` is passed per call so its `&mut` never outlives
-/// the walk.
-struct RowBuilder<'a> {
-    procs: &'a [ProcessEntry],
-    groups: &'a ApplicationGroups,
-    app_collapse: &'a FxMap<AppGroupKey, AppCollapseState>,
-    collapse: &'a PidMap<CollapseState>,
-    /// One flag per group: an application row is emitted once, at its representative.
-    inserted: Vec<bool>,
-}
-
-impl<'a> RowBuilder<'a> {
-    fn new(
-        procs: &'a [ProcessEntry],
-        groups: &'a ApplicationGroups,
-        app_collapse: &'a FxMap<AppGroupKey, AppCollapseState>,
-        collapse: &'a PidMap<CollapseState>,
-    ) -> Self {
-        Self {
-            procs,
-            groups,
-            app_collapse,
-            collapse,
-            inserted: vec![false; groups.groups().len()],
+impl SelectionKey {
+    /// The process this row is shown through, for finding the row that now covers it.
+    fn pid(&self) -> u32 {
+        match *self {
+            Self::Process(pid) | Self::Group(_, pid) => pid,
         }
-    }
-
-    /// Project a native tree node (and its subtree) into `rows`. A member of an application group
-    /// emits the group's row once, at its representative, then descends into native children;
-    /// everything else emits a process row honouring its manual/auto collapse.
-    fn project_native(&mut self, proc_idx: usize, depth: u16, rows: &mut Vec<DisplayRow>) {
-        if let Some(group_idx) = self.groups.member_group(proc_idx) {
-            let group = &self.groups.groups()[group_idx];
-            if proc_idx == group.representative && !self.inserted[group_idx] {
-                self.inserted[group_idx] = true;
-                let collapsed = self
-                    .app_collapse
-                    .get(&group.key)
-                    .is_none_or(|state| *state == AppCollapseState::Auto);
-                rows.push(DisplayRow {
-                    kind: DisplayRowKind::Application { group_idx },
-                    depth,
-                    collapsed,
-                    has_children: true,
-                    has_next: false,
-                });
-                if !collapsed {
-                    self.append_member_forest(group_idx, depth.saturating_add(1), rows);
-                }
-            }
-            let mut child = self.procs[proc_idx].first_child;
-            while child != NONE {
-                self.project_native(child as usize, depth, rows);
-                child = self.procs[child as usize].next_sibling;
-            }
-            return;
-        }
-
-        let proc = &self.procs[proc_idx];
-        let collapsed = self
-            .collapse
-            .get(&proc.pid)
-            .is_some_and(|state| state.is_collapsed());
-        rows.push(DisplayRow {
-            kind: DisplayRowKind::Process { proc_idx },
-            depth,
-            collapsed,
-            has_children: proc.first_child != NONE,
-            has_next: false,
-        });
-        if collapsed {
-            return;
-        }
-        let mut child = proc.first_child;
-        while child != NONE {
-            self.project_native(child as usize, depth.saturating_add(1), rows);
-            child = self.procs[child as usize].next_sibling;
-        }
-    }
-
-    /// Emit an expanded group's members, starting each subtree whose parent is outside the group
-    /// (a member whose parent is also in the group is reached by recursion instead).
-    fn append_member_forest(&self, group_idx: usize, depth: u16, rows: &mut Vec<DisplayRow>) {
-        let group = &self.groups.groups()[group_idx];
-        for &member in &group.members {
-            let parent_in_group = self.procs[member].parent_idx != NONE
-                && self
-                    .groups
-                    .member_group(self.procs[member].parent_idx as usize)
-                    == Some(group_idx);
-            if !parent_in_group {
-                self.append_member(member, group_idx, depth, rows);
-            }
-        }
-    }
-
-    fn append_member(
-        &self,
-        proc_idx: usize,
-        group_idx: usize,
-        depth: u16,
-        rows: &mut Vec<DisplayRow>,
-    ) {
-        let proc = &self.procs[proc_idx];
-        let mut member_children = Vec::new();
-        let mut child = proc.first_child;
-        while child != NONE {
-            if self.groups.member_group(child as usize) == Some(group_idx) {
-                member_children.push(child as usize);
-            }
-            child = self.procs[child as usize].next_sibling;
-        }
-        // A virtual application is already the outer automatic boundary. Inside its expanded
-        // member forest only an explicit manual collapse is meaningful; nested auto-groups would
-        // make expansion reveal another hidden layer.
-        let collapsed = self.collapse.get(&proc.pid) == Some(&CollapseState::Manual);
-        rows.push(DisplayRow {
-            kind: DisplayRowKind::Process { proc_idx },
-            depth,
-            collapsed,
-            has_children: !member_children.is_empty(),
-            has_next: false,
-        });
-        if !collapsed {
-            for child in member_children {
-                self.append_member(child, group_idx, depth.saturating_add(1), rows);
-            }
-        }
-    }
-}
-
-fn mark_next_siblings(rows: &mut [DisplayRow]) {
-    let mut open: Vec<Option<usize>> = Vec::new();
-    for idx in 0..rows.len() {
-        let depth = rows[idx].depth as usize;
-        if open.len() <= depth {
-            open.resize(depth + 1, None);
-        }
-        if let Some(previous) = open[depth].replace(idx) {
-            rows[previous].has_next = true;
-        }
-        open.truncate(depth + 1);
     }
 }
 
 fn row_matches(
-    row: &DisplayRow,
+    row: &ViewRow,
     keep: Option<&SelectionKey>,
     procs: &[ProcessEntry],
     groups: &ApplicationGroups,
 ) -> bool {
-    match (&row.kind, keep) {
-        (DisplayRowKind::Process { proc_idx }, Some(SelectionKey::Process(pid))) => {
-            procs[*proc_idx].pid == *pid
+    match (row.kind, keep) {
+        (RowKind::Process { proc_idx }, Some(SelectionKey::Process(pid))) => {
+            procs[proc_idx].pid == *pid
         }
-        (DisplayRowKind::Application { group_idx }, Some(SelectionKey::Application(key))) => {
-            groups.groups()[*group_idx].key == *key
+        (RowKind::Group { group_idx }, Some(SelectionKey::Group(key, _))) => {
+            groups.groups()[group_idx].key == *key
         }
         _ => false,
     }
-}
-
-/// Push a sibling chain reversed, so a LIFO stack pops it in PID-ascending order.
-fn push_children(procs: &[ProcessEntry], head: u32, stack: &mut Vec<u32>) {
-    let base = stack.len();
-    let mut c = head;
-    while c != NONE {
-        stack.push(c);
-        c = procs[c as usize].next_sibling;
-    }
-    stack[base..].reverse();
 }

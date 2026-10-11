@@ -5,7 +5,7 @@
 //! lists are prepend-linked, and depth/subtree sizes come from one pre-order pass
 //! plus its reverse. Scratch buffers are caller-owned and reused.
 
-use crate::procs::{GpuProcessStats, NONE, ProcessEntry};
+use crate::procs::{NONE, ProcessEntry};
 
 /// Build the structural tree. `procs` MUST be sorted ascending by `pid`.
 ///
@@ -76,41 +76,6 @@ pub fn build(procs: &mut [ProcessEntry], stack: &mut Vec<u32>, order: &mut Vec<u
     }
 
     first_root
-}
-
-/// Compute inclusive subtree aggregates (`subtree_cpu`, `subtree_mem`, GPU, and VRAM) via the same
-/// reverse-pre-order pass. Must be called after `build` and after CPU% /
-/// `mem_bytes` are finalized. `order` is the pre-order from `build`.
-pub fn aggregate(procs: &mut [ProcessEntry], order: &[u32], gpu: &mut GpuProcessStats) {
-    gpu.clear_subtree();
-    // Initialize to self, then accumulate children bottom-up.
-    for &iu in order {
-        let i = iu as usize;
-        procs[i].subtree_cpu = procs[i].cpu_pct;
-        procs[i].subtree_mem = procs[i].mem_bytes;
-        if let Some(metrics) = gpu.live(procs[i].pid) {
-            gpu.set_subtree(procs[i].pid, metrics);
-        }
-    }
-    for &iu in order.iter().rev() {
-        let i = iu as usize;
-        if procs[i].parent_idx != NONE {
-            let p = procs[i].parent_idx as usize;
-            procs[p].subtree_cpu = procs[p].subtree_cpu.saturating_add(procs[i].subtree_cpu);
-            procs[p].subtree_mem = procs[p].subtree_mem.saturating_add(procs[i].subtree_mem);
-            let child_gpu = gpu.subtree(procs[i].pid);
-            let parent_gpu = gpu.subtree(procs[p].pid);
-            let combined = match (parent_gpu, child_gpu) {
-                (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            if let Some(metrics) = combined {
-                gpu.set_subtree(procs[p].pid, metrics);
-            }
-        }
-    }
 }
 
 /// Push a sibling chain (head + its `next_sibling`s) onto the DFS stack.
@@ -217,84 +182,5 @@ mod tests {
         assert_eq!(order, vec![1, 50]);
         let by_pid = |pid: u32| procs.iter().find(|p| p.pid == pid).unwrap();
         assert_eq!(by_pid(50).parent_idx, NONE);
-    }
-
-    #[test]
-    fn aggregate_sums_subtree() {
-        // 1 → {10 → {100}, 11}
-        // Set cpu/mem values on each node.
-        let mut procs = vec![proc(1, 0), proc(10, 1), proc(11, 1), proc(100, 10)];
-        procs[0].cpu_pct = 100;
-        procs[0].mem_bytes = 1000;
-        procs[1].cpu_pct = 200;
-        procs[1].mem_bytes = 2000;
-        procs[2].cpu_pct = 300;
-        procs[2].mem_bytes = 3000;
-        procs[3].cpu_pct = 400;
-        procs[3].mem_bytes = 4000;
-        let mut gpu = GpuProcessStats::default();
-        gpu.clear_available();
-        for (i, p) in procs.iter().enumerate() {
-            gpu.add_live(
-                p.pid,
-                crate::procs::GpuMetrics {
-                    pct: crate::procs::GpuMetric::Value((u32::try_from(i).unwrap() + 1) * 10),
-                    mem_bytes: crate::procs::GpuMetric::Value((i as u64 + 1) * 100),
-                },
-            );
-        }
-
-        let (mut s, mut o) = (Vec::new(), Vec::new());
-        build(&mut procs, &mut s, &mut o);
-        aggregate(&mut procs, &o, &mut gpu);
-
-        let by_pid = |pid: u32| procs.iter().find(|p| p.pid == pid).unwrap();
-        // Root: 100 + 200 + 300 + 400 = 1000
-        assert_eq!(by_pid(1).subtree_cpu, 1000);
-        assert_eq!(by_pid(1).subtree_mem, 10000);
-        assert_eq!(
-            gpu.subtree(1),
-            Some(crate::procs::GpuMetrics {
-                pct: crate::procs::GpuMetric::Value(100),
-                mem_bytes: crate::procs::GpuMetric::Value(1000),
-            })
-        );
-        // PID 10: 200 + 400 = 600
-        assert_eq!(by_pid(10).subtree_cpu, 600);
-        assert_eq!(by_pid(10).subtree_mem, 6000);
-        // Leaves: just themselves.
-        assert_eq!(by_pid(11).subtree_cpu, 300);
-        assert_eq!(by_pid(100).subtree_cpu, 400);
-    }
-
-    #[test]
-    fn aggregate_propagates_unknown_gpu_values() {
-        let mut procs = vec![proc(1, 0), proc(10, 1)];
-        let mut gpu = GpuProcessStats::default();
-        gpu.clear_available();
-        gpu.add_live(
-            1,
-            crate::procs::GpuMetrics {
-                pct: crate::procs::GpuMetric::Value(10),
-                mem_bytes: crate::procs::GpuMetric::Value(100),
-            },
-        );
-        gpu.add_live(
-            10,
-            crate::procs::GpuMetrics {
-                pct: crate::procs::GpuMetric::Unknown,
-                mem_bytes: crate::procs::GpuMetric::Unknown,
-            },
-        );
-        let (mut stack, mut order) = (Vec::new(), Vec::new());
-        build(&mut procs, &mut stack, &mut order);
-        aggregate(&mut procs, &order, &mut gpu);
-        assert_eq!(
-            gpu.subtree(1),
-            Some(crate::procs::GpuMetrics {
-                pct: crate::procs::GpuMetric::Unknown,
-                mem_bytes: crate::procs::GpuMetric::Unknown,
-            })
-        );
     }
 }

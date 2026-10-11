@@ -1,6 +1,6 @@
 //! The color vocabulary: what each column's color *means*, in one place.
 //!
-//! Two kinds of color. **Magnitude** columns (CPU%, PEAK, RSS, NI) map a value through a
+//! Two kinds of color. **Magnitude** columns (CPU%, PSS, NI) map a value through a
 //! continuous semantic gradient — the gradient's *shape* encodes what the magnitude means:
 //! near-zero recedes, a meaningful level is calm, an alarming level is hot. Discrete bands
 //! would lie about where "notable" begins. The one deliberate exception is **exactly-zero
@@ -22,7 +22,7 @@ use crate::procs::CapLevel;
 
 // --- neutral tones -------------------------------------------------------------------
 
-/// Near-zero magnitude: barely visible, so an idle process's CPU/RSS recedes.
+/// Near-zero magnitude: barely visible, so an idle process's CPU/memory recedes.
 const FAINT: Rgb = Rgb(72, 76, 88);
 /// Muted text: path prefixes, sleeping state, non-own users, kthread names, single threads.
 const DIM: Rgb = Rgb(124, 128, 140);
@@ -53,18 +53,27 @@ pub const LIB_DELETED: Rgb = Rgb(225, 200, 92);
 
 // --- chrome (system header + footer) -------------------------------------------------
 
-/// Bracket labels and column titles (`CPU[`, `Mem[`, the header row).
+/// Header labels and column titles (`CPU`, `Mem`, the table header row).
 pub const LABEL: Rgb = Rgb(92, 182, 202);
-/// CPU-bar user share / memory used.
+/// GPU / VRAM bar fill (and the footer's source tag).
 pub const BAR_BUSY: Rgb = Rgb(112, 190, 112);
-/// CPU-bar system share / swap used.
+/// VRAM bar fill.
 pub const BAR_SYS: Rgb = Rgb(216, 96, 82);
-/// CPU-bar iowait share.
-pub const BAR_IO: Rgb = Rgb(92, 142, 220);
-/// Reclaimable page cache in the memory bar.
-pub const BAR_CACHE: Rgb = Rgb(212, 192, 102);
-/// The Load/Tasks/Uptime info line.
+/// A sparkline cell whose scheduler wait was not measured: neutral, because painting it from
+/// the calm end of the pressure ramp would claim "no waiting" that nobody observed.
+pub const WAIT_UNKNOWN: Rgb = DIM;
+/// Header values (the numbers beside their labels) and the GPU empty-device note.
 pub const INFO: Rgb = Rgb(198, 204, 214);
+/// Memory bar, used non-reclaimable memory when the kernel has no PSI to color it by. Neutral
+/// on purpose: with PSI the segment's color is memory pressure (as in the CPU graph), and
+/// without it any alarming hue would be a claim we cannot back.
+pub const MEM_USED: Rgb = Rgb(150, 160, 180);
+/// Memory bar, shmem (tmpfs, SysV/POSIX shm). Its own hue because it is the odd one out: held
+/// by no process and not reclaimable without swap, so the reader should not mistake it for
+/// either owned memory or cache.
+pub const MEM_SHMEM: Rgb = Rgb(188, 132, 204);
+/// Memory bar, reclaimable cache. Dim steel so it recedes: it costs nothing to take back.
+pub const MEM_CACHE: Rgb = Rgb(72, 98, 124);
 /// Footer chrome (keybind hints, brackets).
 pub const FOOTER: Rgb = DIM;
 /// Footer warning (fd-overflow).
@@ -114,7 +123,7 @@ pub fn nice(ni: i8) -> Rgb {
     interp(NICE_STOPS, i64::from(ni))
 }
 
-/// CPU% / PEAK (basis points, 10000 = one full core). Exactly zero (a genuinely idle process)
+/// CPU% (basis points, 10000 = one full core). Exactly zero (a genuinely idle process)
 /// recedes to a dim tone; **any** nonzero value — however tiny — steps hard to a clearly-visible
 /// floor, then the gradient warms cool→hot as it climbs (one full core is hot, multi-core is
 /// alarm). The zero↔nonzero boundary is a discrete step, *not* a gradient endpoint: "used a
@@ -128,16 +137,34 @@ pub fn cpu(bp: u32) -> Rgb {
     }
 }
 
-/// RSS (bytes): log-scale, so each perceptual step is roughly a doubling. KB is nothing,
+/// A memory size in bytes (PSS, VRAM, …): log-scale, so each perceptual step is roughly a doubling. KB is nothing,
 /// MB normal, GB notable, tens of GB heavy — a linear ramp would make MB and GB
 /// indistinguishable.
 #[must_use]
-pub fn rss(bytes: u64) -> Rgb {
+pub fn bytes(bytes: u64) -> Rgb {
     // Position = floor(log2(bytes)); the gradient stops are expressed in the same bit units.
-    interp(RSS_STOPS, i64::from(bytes.max(1).ilog2()))
+    interp(BYTES_STOPS, i64::from(bytes.max(1).ilog2()))
+}
+
+/// Resource pressure (basis points of time some task was stalled; also the run-queue overload
+/// fallback). Unlike usage, *any* stall is bad news, so the gradient starts calm at zero and
+/// turns hot quickly: a few percent is already worth a glance, a quarter of the time stalled
+/// is an alarm. Continuous, because 4% and 6% are neighbours, not categories.
+#[must_use]
+pub fn pressure(bp: u32) -> Rgb {
+    interp(PRESSURE_STOPS, i64::from(bp))
 }
 
 // --- gradient machinery --------------------------------------------------------------
+
+/// Pressure stops in basis points: calm teal-green → yellow → orange → red alarm.
+const PRESSURE_STOPS: &[(i64, Rgb)] = &[
+    (0, Rgb(96, 170, 130)),
+    (300, Rgb(170, 205, 112)),
+    (1000, Rgb(226, 196, 98)),
+    (2500, Rgb(238, 130, 72)),
+    (5000, Rgb(240, 78, 66)),
+];
 
 /// NI diverging stops (domain −20…19).
 const NICE_STOPS: &[(i64, Rgb)] = &[
@@ -164,7 +191,7 @@ const CPU_STOPS: &[(i64, Rgb)] = &[
 ];
 
 /// RSS stops in log2(bytes) positions (bit index of the high bit).
-const RSS_STOPS: &[(i64, Rgb)] = &[
+const BYTES_STOPS: &[(i64, Rgb)] = &[
     (0, FAINT),
     (18, FAINT),              // ≤256 KiB recedes
     (20, Rgb(96, 136, 110)),  // 1 MiB muted green
@@ -250,6 +277,15 @@ mod tests {
     }
 
     #[test]
+    fn pressure_is_calm_at_zero_and_red_when_saturated() {
+        assert_eq!(pressure(0), Rgb(96, 170, 130));
+        assert_eq!(pressure(u32::MAX), Rgb(240, 78, 66));
+        let (calm, hot) = (pressure(0), pressure(5000));
+        assert!(hot.0 > calm.0 && hot.1 < calm.1, "red up, green down");
+        assert!(pressure(1000).0 < pressure(2500).0, "warming is monotone");
+    }
+
+    #[test]
     fn nice_diverges_from_zero() {
         assert_eq!(nice(0), Rgb(96, 100, 112), "zero is neutral");
         assert!(
@@ -263,11 +299,11 @@ mod tests {
     }
 
     #[test]
-    fn rss_is_log_scale() {
-        assert_eq!(rss(0), FAINT);
-        assert_eq!(rss(4096), FAINT, "a few pages still recede");
+    fn bytes_are_log_scale() {
+        assert_eq!(bytes(0), FAINT);
+        assert_eq!(bytes(4096), FAINT, "a few pages still recede");
         // 1 GiB must be visibly warmer than 1 MiB (yellow vs muted green).
-        assert!(rss(1 << 30).0 > rss(1 << 20).0);
+        assert!(bytes(1 << 30).0 > bytes(1 << 20).0);
     }
 
     #[test]

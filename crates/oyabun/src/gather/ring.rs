@@ -3,11 +3,10 @@
 //! bookkeeping is written (and tested) once instead of open-coded twice.
 //!
 //! It is deliberately just storage: it holds no notion of *what* the samples mean. Each user
-//! layers its own aggregation on top — [`CpuRing`](super::cpu) keeps running sums plus an
-//! incremental peak, [`SystemSampler`](super::sysstat) differences the two window endpoints.
-//! Physical slot indices (`0..N`) are exposed on purpose: `CpuRing` caches the index of its
-//! peak sample, and that must stay stable as the head advances, so the ring never renumbers
-//! live slots — a push overwrites exactly the slot the previous `head` pointed at.
+//! layers its own aggregation on top — [`CpuRing`](super::cpu) keeps running sums over
+//! two tail windows, [`SystemSampler`](super::sysstat) differences the two window endpoints.
+//! Physical slot indices (`0..N`) are exposed on purpose; the ring never renumbers live
+//! slots — a push overwrites exactly the slot the previous `head` pointed at.
 
 /// A ring of at most `N` `T`s. `Copy` so it embeds in a `Copy` owner (e.g. a huge-page-resident
 /// `CpuRing`); `T: Default` seeds the unused slots.
@@ -33,14 +32,8 @@ impl<T: Copy + Default, const N: usize> Ring<T, N> {
         self.len
     }
 
-    /// The physical slot the next [`push`](Self::push) will overwrite. `CpuRing` reads this
-    /// *before* pushing to decide whether the sample being evicted was its cached peak.
-    pub(super) fn write_pos(&self) -> usize {
-        self.head
-    }
-
     /// Value at a physical slot index (`0..N`). Callers pass indices obtained from
-    /// [`write_pos`](Self::write_pos), [`recent_index`](Self::recent_index), or a `0..len` scan.
+    /// [`recent_index`](Self::recent_index) or a `0..len` scan.
     pub(super) fn slot(&self, i: usize) -> T {
         self.slots[i]
     }
@@ -102,18 +95,5 @@ mod tests {
         assert_eq!(r.recent_index(2).map(|i| r.slot(i)), Some(2));
         assert_eq!(r.recent_index(3).map(|i| r.slot(i)), Some(1));
         assert_eq!(r.recent_index(4), None);
-    }
-
-    #[test]
-    fn write_pos_is_the_slot_push_overwrites() {
-        let mut r: Ring<u32, 2> = Ring::new();
-        let p0 = r.write_pos();
-        r.push(7);
-        assert_eq!(r.slot(p0), 7, "push wrote exactly the reported slot");
-        let p1 = r.write_pos();
-        r.push(8);
-        assert_eq!(r.slot(p1), 8);
-        // Full now; the next write_pos wraps back to p0 (the oldest).
-        assert_eq!(r.write_pos(), p0);
     }
 }

@@ -14,6 +14,10 @@ pub struct RawProc {
     pub nice: i8,
     pub num_threads: u32,
     pub ticks: u64,
+    /// Cumulative time spent runnable but queued for a CPU (same jiffies as `ticks`), summed over
+    /// the process's threads; `None` = not measured (the unprivileged source measures it only
+    /// for processes on screen).
+    pub wait: Option<u64>,
     pub mem_bytes: u64,
     pub start_time: u64,
     pub comm: Vec<u8>,
@@ -32,6 +36,7 @@ impl RawProc {
             nice: 0,
             num_threads: 1,
             ticks: 0,
+            wait: None,
             mem_bytes: 0,
             start_time: u64::from(pid),
             comm: format!("p{pid}").into_bytes(),
@@ -106,13 +111,21 @@ pub struct SystemStats {
     // Raw /proc/meminfo fields (bytes)
     pub mem_total: u64,
     pub mem_available: u64,
-    pub mem_buffers: u64,
-    pub mem_cached: u64,
+    /// `MemFree`. Absent in older recordings, where it replays as 0 (all available memory
+    /// then reads as reclaimable cache).
+    pub mem_free: u64,
+    /// tmpfs + shared memory (`Shmem`).
+    pub mem_shmem: u64,
     pub swap_total: u64,
     pub swap_free: u64,
-    // Other raw reads
-    pub load: [u32; 3],
-    pub uptime_secs: u64,
+    /// Runnable entities at the instant of the read.
+    pub runnable: u32,
+    /// Cumulative `some` stall microseconds per pressure resource; `None` = PSI absent.
+    pub psi_cpu: Option<u64>,
+    pub psi_memory: Option<u64>,
+    pub psi_io: Option<u64>,
+    /// Cumulative pages swapped in (`pswpin`); `None` = counter unreadable.
+    pub pswpin: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

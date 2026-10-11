@@ -11,6 +11,7 @@
 use thoop::{Arena, StringRef, TypedBuf};
 
 use crate::fxhash::PidMap;
+use crate::gather::Waiting;
 
 /// Sentinel index meaning "none" for tree links and roots.
 pub const NONE: u32 = u32::MAX;
@@ -40,31 +41,54 @@ pub enum CapLevel {
     Full,
 }
 
-/// System-wide resource snapshot, computed once per gather cycle.
+/// How badly runnable work is being delayed for CPU. PSI measures the delay directly; the
+/// run-queue length is the fallback when the kernel has no PSI, so which one a reading is
+/// travels with the value.
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+pub enum CpuWait {
+    /// Share of the window in which at least one task waited for a CPU, basis points.
+    Pressure(u32),
+    /// Runnable entities right now (no PSI available).
+    RunQueue(u32),
+}
+
+impl Default for CpuWait {
+    fn default() -> Self {
+        Self::RunQueue(0)
+    }
+}
+
+/// System-wide resource snapshot, computed once per gather cycle. Hashed as the header's
+/// change key, so it carries exactly what the header shows.
 #[derive(Clone, Copy, Default, Hash)]
 pub struct SystemStats {
-    /// CPU user+nice as fraction of total, basis points (10000 = 100%).
-    pub cpu_user_bp: u32,
-    /// CPU system+irq+softirq, basis points.
-    pub cpu_sys_bp: u32,
-    /// CPU iowait, basis points.
-    pub cpu_iowait_bp: u32,
+    pub num_cores: u32,
+    /// Busy CPU over the short window, in millicores (1000 = one core fully busy).
+    pub cpu_busy_mc: u32,
+    /// Kernel share (system + irq + softirq) of `cpu_busy_mc`'s window, millicores.
+    pub cpu_kernel_mc: u32,
+    /// CPU time the hypervisor withheld, millicores.
+    pub cpu_steal_mc: u32,
+    /// Whether this machine accounts steal at all (its cumulative counter is nonzero).
+    /// Structural: it decides whether the header reserves a steal slot.
+    pub cpu_has_steal: bool,
+    pub cpu_wait: CpuWait,
     pub mem_total: u64,
-    /// `total - available` (what's actively used by processes).
-    pub mem_used: u64,
-    /// Buffers + Cached (reclaimable page cache).
-    pub mem_cached: u64,
+    pub mem_available: u64,
+    /// `MemFree`: of the available memory, the part that is not even cache.
+    pub mem_free: u64,
+    /// tmpfs + shared memory.
+    pub mem_shmem: u64,
+    /// Memory / IO pressure (`some`, basis points); `None` when the kernel has no PSI.
+    pub mem_wait_bp: Option<u32>,
+    pub io_wait_bp: Option<u32>,
     pub swap_total: u64,
     pub swap_used: u64,
-    /// Load averages × 100 (e.g. 215 = 2.15). Index 0/1/2 = 1/5/15 min.
-    pub load: [u32; 3],
-    pub uptime_secs: u64,
-    pub num_cores: u32,
-    pub tasks_running: u32,
-    pub tasks_sleeping: u32,
-    pub tasks_stopped: u32,
+    /// Bytes per second swapped in over the short window.
+    pub swap_in_bps: u64,
+    /// Tasks in uninterruptible sleep (`D`) — stuck on IO or a lock.
+    pub tasks_blocked: u32,
     pub tasks_zombie: u32,
-    pub tasks_idle: u32,
     /// NVIDIA devices fixed at startup. Zero means the GPU UI is disabled.
     pub gpu_count: u32,
     /// Sum of per-device SM utilization, in basis points (may exceed 10000).
@@ -76,11 +100,8 @@ pub struct SystemStats {
 impl SystemStats {
     /// Fold per-state tallies from [`Procs::count_tasks`] into the `tasks_*` fields.
     pub fn set_task_counts(&mut self, c: TaskCounts) {
-        self.tasks_running = c.running;
-        self.tasks_sleeping = c.sleeping;
-        self.tasks_stopped = c.stopped;
+        self.tasks_blocked = c.blocked;
         self.tasks_zombie = c.zombie;
-        self.tasks_idle = c.idle;
     }
 }
 
@@ -138,34 +159,23 @@ impl GpuMetrics {
     }
 }
 
-#[derive(Clone, Copy, Default, Hash)]
-pub struct RowMetrics {
-    pub cpu_pct: u32,
-    pub cpu_peak: u32,
-    pub mem_bytes: u64,
-    pub gpu: Option<GpuMetrics>,
-}
-
 /// Sparse process GPU telemetry. Missing PID means "no GPU context"; present values may still
 /// carry per-metric unknowns for process/device-specific NVML failures.
 #[derive(Default)]
 pub struct GpuProcessStats {
     available: bool,
     live: PidMap<GpuMetrics>,
-    subtree: PidMap<GpuMetrics>,
 }
 
 impl GpuProcessStats {
     pub fn clear_available(&mut self) {
         self.available = true;
         self.live.clear();
-        self.subtree.clear();
     }
 
     pub fn clear_unavailable(&mut self) {
         self.available = false;
         self.live.clear();
-        self.subtree.clear();
     }
 
     #[must_use]
@@ -183,19 +193,6 @@ impl GpuProcessStats {
     #[must_use]
     pub fn live(&self, pid: u32) -> Option<GpuMetrics> {
         self.live.get(&pid).copied()
-    }
-
-    pub fn clear_subtree(&mut self) {
-        self.subtree.clear();
-    }
-
-    pub fn set_subtree(&mut self, pid: u32, metrics: GpuMetrics) {
-        self.subtree.insert(pid, metrics);
-    }
-
-    #[must_use]
-    pub fn subtree(&self, pid: u32) -> Option<GpuMetrics> {
-        self.subtree.get(&pid).copied()
     }
 }
 
@@ -258,16 +255,24 @@ pub struct ProcessEntry {
     pub nice: i8,
     /// Thread count (`num_threads` from `/proc/<pid>/stat`).
     pub num_threads: u32,
-    /// Moving-average CPU% in basis points (hundredths of a percent); 10000 = one
-    /// full core. Stable reading over the recent sample window.
+    /// Short box-average CPU% in basis points (hundredths of a percent); 10000 = one
+    /// full core. The window only cancels quantization noise; history is the sparkline's.
     pub cpu_pct: u32,
-    /// Peak single-interval CPU% (basis points) still within the sample window —
-    /// captures spikes the average damps out.
-    pub cpu_peak: u32,
+    /// Rate (basis points) of this cycle's sample interval alone; 0 when none was
+    /// measured or the PID was quiescent. Feeds the collapsed-row series.
+    pub cpu_now: u32,
+    /// This cycle's scheduler wait against the run it is compared with; empty when the source
+    /// did not measure wait for the process (or nothing was measured). Feeds the row's
+    /// sparkline color, and the collapsed-row series.
+    pub wait_now: Waiting,
     /// Resident memory in bytes.
     pub mem_bytes: u64,
     /// Raw cumulative `utime + stime` (jiffies) — input to the CPU% delta.
     pub ticks: u64,
+    /// Raw cumulative time spent runnable but queued for a CPU, in the same jiffies as
+    /// [`ticks`](Self::ticks), summed over the process's threads; `None` when the source did
+    /// not measure it this cycle.
+    pub wait_ticks: Option<u64>,
     /// Process start time (jiffies since boot). With `pid`, identifies a unique
     /// process incarnation — used to make `kill` safe against PID reuse.
     pub start_time: u64,
@@ -303,16 +308,10 @@ pub struct ProcessEntry {
     pub parent_idx: u32,
     pub first_child: u32,
     pub next_sibling: u32,
-    /// Total descendants (shown as `[+N]` when collapsed).
+    /// Total native descendants (structural-identity heuristics read it).
     pub subtree_size: u32,
     /// Distance from a root (0 = root).
     pub depth: u16,
-
-    // --- subtree aggregates (filled by `tree::aggregate`) ---
-    /// `cpu_pct` of self + all descendants (for collapsed-group display).
-    pub subtree_cpu: u32,
-    /// `mem_bytes` of self + all descendants.
-    pub subtree_mem: u64,
 }
 
 impl ProcessEntry {
@@ -327,9 +326,11 @@ impl ProcessEntry {
         nice: 0,
         num_threads: 0,
         cpu_pct: 0,
-        cpu_peak: 0,
+        cpu_now: 0,
+        wait_now: Waiting { wait: 0, run: 0 },
         mem_bytes: 0,
         ticks: 0,
+        wait_ticks: None,
         start_time: 0,
         comm: InlineComm::EMPTY,
         cmdline: StringRef::EMPTY,
@@ -343,8 +344,6 @@ impl ProcessEntry {
         next_sibling: NONE,
         subtree_size: 0,
         depth: 0,
-        subtree_cpu: 0,
-        subtree_mem: 0,
     };
 
     /// The `comm` (process name) bytes.
@@ -356,30 +355,6 @@ impl ProcessEntry {
     /// Copy `comm` in from a parsed `stat` slice, truncating to [`COMM_CAP`].
     pub fn set_comm(&mut self, comm: &[u8]) {
         self.comm.set(comm);
-    }
-
-    #[must_use]
-    pub fn effective_metrics(
-        &self,
-        collapsed: bool,
-        live_gpu: Option<GpuMetrics>,
-        subtree_gpu: Option<GpuMetrics>,
-    ) -> RowMetrics {
-        if collapsed && self.subtree_size > 0 {
-            RowMetrics {
-                cpu_pct: self.subtree_cpu,
-                cpu_peak: self.cpu_peak,
-                mem_bytes: self.subtree_mem,
-                gpu: subtree_gpu,
-            }
-        } else {
-            RowMetrics {
-                cpu_pct: self.cpu_pct,
-                cpu_peak: self.cpu_peak,
-                mem_bytes: self.mem_bytes,
-                gpu: live_gpu,
-            }
-        }
     }
 
     /// A slot is a tombstone (read failed / PID vanished) iff `pid == 0`. Linux never
@@ -506,11 +481,9 @@ impl Procs {
         let mut c = TaskCounts::default();
         for p in self.rows.as_slice() {
             match p.state {
-                b'R' => c.running += 1,
-                b'T' | b't' => c.stopped += 1,
+                b'D' => c.blocked += 1,
                 b'Z' | b'X' => c.zombie += 1,
-                b'I' | b'D' => c.idle += 1,
-                _ => c.sleeping += 1,
+                _ => {}
             }
         }
         c
@@ -521,9 +494,7 @@ impl Procs {
 /// [`SystemStats`] by [`SystemStats::set_task_counts`].
 #[derive(Clone, Copy, Default)]
 pub struct TaskCounts {
-    pub running: u32,
-    pub sleeping: u32,
-    pub stopped: u32,
+    /// Uninterruptible sleep (`D`), split from the benign idle kernel threads (`I`).
+    pub blocked: u32,
     pub zombie: u32,
-    pub idle: u32,
 }

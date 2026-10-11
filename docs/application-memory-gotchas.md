@@ -23,11 +23,12 @@ sampling. It requires elevated access, scanning every resident mapping, and full
 to each application that maps it. Proportional accounting tracks that baseline closely while
 remaining meaningful when comparing or summing applications.
 
-If one live member cannot provide proportional accounting, the entire application total must
-fall back to resident-set addition; mixing the two units would make the result incoherent. A
-member with no resident memory is the exception: a zombie or concurrently disappearing process
-has no address-space contribution, so its unreadable proportional record safely contributes
-zero.
+If one live process cannot provide proportional accounting, only that process falls back to its
+resident set, and every row whose total includes it is marked so. The marker is what keeps the
+mixed sum honest: the alternative, dropping a whole row to resident addition, makes one
+unreadable helper distort an entire application. A process with no resident memory contributes
+zero and needs no marker: a zombie or concurrently disappearing process has no address-space
+contribution.
 
 ## Cgroup memory is charged memory, not resident footprint
 
@@ -44,11 +45,12 @@ presented as application resident memory.
 
 ## Sampling policy
 
-Collapsed application rows use proportional-set-size addition, with whole-group resident-set
-addition only when a live non-empty member cannot be read. Sampling is limited to collapsed rows
-in the visible viewport, and stays outside rendering.
+Every row uses proportional set size (a collapsed row sums it over what it hides), with a
+per-process resident-set fallback when a live non-empty process cannot be read. One column must
+not mix measures under one header, and a collapsed process row and a folded group over the same
+set must agree.
 
-Reading proportional data for every member of every visible folded group every cycle is the
+Reading proportional data for every process shown or hidden under the viewport every cycle is the
 dominant interactive cost on a real desktop — a browser is exactly the large, many-mapping
 process this walk is most expensive on. The value is therefore estimated, not recomputed, and the
 enabling observation is that a member's shared-vs-private *split* changes far more slowly than its
@@ -60,11 +62,13 @@ inaccurate only while the *shared mapping set* itself has changed since the last
 
 The expensive walk then runs only in two situations: to bootstrap a member with no cached split
 yet, and, on a slow staggered refresh, to re-establish the split and so catch shared-set drift —
-the one thing the free resident reading cannot reveal. The earlier "re-walk whenever the resident
-set moved enough" trigger is gone, because a moving resident set is exactly what the estimate
-handles for free; that trigger was what made a busy application re-walk every cycle. Walks are bounded
-by a fixed per-cycle budget and prioritized largest-member-first, so newly folding a large
-application settles over a few cycles instead of spiking one, and a settled desktop walks
-essentially nothing. The staggered refresh is spread by PID rather than by a fixed age, so the
-members of a group folded together do not all come due on the same later cycle and walk as one
-herd.
+the one thing the free resident reading cannot reveal. Resident movement is deliberately not a
+re-walk trigger: a moving resident set is exactly what the estimate handles for free, and
+triggering on it would make a busy application re-walk every cycle. Walks are bounded by a fixed
+per-cycle budget and prioritized largest-member-first, so newly folding a large application
+settles over a few cycles instead of spiking one, and a settled desktop walks essentially
+nothing. The staggered refresh is spread by PID rather than by a fixed age, so the members of a
+group folded together do not all come due on the same later cycle and walk as one herd.
+
+Which processes get walked is a view concern (viewport-only candidates, gated on change, charged
+to the UI's frame budget); see *Memory: proportional set size everywhere* in `ARCHITECTURE.md`.

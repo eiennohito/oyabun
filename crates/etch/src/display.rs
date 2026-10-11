@@ -205,6 +205,38 @@ impl<W: Write> Display<W> {
         paint_fixed(&mut self.batch, slot.row, geom, style, &self.scratch);
     }
 
+    /// Bind a fixed-width multi-color cell. Like [`paint_fill`](Self::paint_fill) but the
+    /// content is capped at, and aligned within, the column body. The change key hashes
+    /// `(key, style)` so a base-style change repaints.
+    fn paint_cell<G: Hash>(
+        &mut self,
+        slot: Slot,
+        style: Style,
+        geom: Geom,
+        key: &G,
+        render: impl FnOnce(&mut Cell),
+    ) {
+        if !self.cell_changed(slot, hash_value(&(key, style))) {
+            return;
+        }
+        self.scratch.clear();
+        self.fill_runs.clear();
+        let width = {
+            let mut cell = Cell::new(&mut self.scratch, &mut self.fill_runs, geom.body as usize);
+            render(&mut cell);
+            cell.width()
+        };
+        paint_cell_emit(
+            &mut self.batch,
+            slot.row,
+            geom,
+            style,
+            width,
+            &self.scratch,
+            &self.fill_runs,
+        );
+    }
+
     /// Bind the fill column. The render closure runs only when changed / forced
     /// repaint; otherwise no formatting happens. The cell records color runs the fill
     /// painter emits with per-run SGR.
@@ -447,6 +479,22 @@ impl<W: Write> Row<'_, '_, W> {
         self.d.paint_field(slot, style, geom, &value);
     }
 
+    /// Bind a fixed-width column with multi-color content: an explicit change key plus a
+    /// render closure (run only when changed) writing into a [`Cell`] capped at the column
+    /// body. The cell is aligned like any fixed column and each color run is emitted with
+    /// its own foreground over the row style (sparklines, per-glyph magnitude colors).
+    pub fn cell<G: Hash>(&mut self, key: G, render: impl FnOnce(&mut Cell)) {
+        let i = self.idx;
+        self.idx += 1;
+        let geom = self.schema.geom(i);
+        let slot = Slot {
+            row: self.y,
+            idx: i,
+            full: self.full,
+        };
+        self.d.paint_cell(slot, self.style, geom, &key, render);
+    }
+
     /// Bind the fill column: an explicit change key plus a render closure (run
     /// only when changed) for content too complex for a single `Display`.
     pub fn fill<G: Hash>(&mut self, key: G, render: impl FnOnce(&mut Cell)) {
@@ -525,6 +573,38 @@ fn paint_fixed(out: &mut Vec<u8>, row: u16, geom: Geom, style: Style, content: &
     if styled {
         style::reset(out);
     }
+}
+
+/// Emit a fixed column whose content is color runs: separator + alignment padding in the
+/// base style, each run with its own foreground (a `None` run falls back to the style's fg).
+fn paint_cell_emit(
+    out: &mut Vec<u8>,
+    row: u16,
+    geom: Geom,
+    style: Style,
+    width: usize,
+    content: &str,
+    runs: &[Run],
+) {
+    let _ = queue!(out, MoveTo(geom.x, row));
+    style.enter(out);
+    let pad = (geom.body as usize).saturating_sub(width);
+    let (lead, trail) = match geom.align {
+        Align::Right => (geom.sep as usize + pad, 0),
+        Align::Left => (geom.sep as usize, pad),
+    };
+    write_spaces(out, lead);
+    let mut cur: Option<Option<Rgb>> = None;
+    for run in runs {
+        let fg = run.fg.or(style.fg);
+        if cur != Some(fg) {
+            style::set_fg(out, fg);
+            cur = Some(fg);
+        }
+        let _ = queue!(out, Print(&content[run.start..run.start + run.len]));
+    }
+    write_spaces(out, trail);
+    style::reset(out);
 }
 
 fn paint_fill_emit(

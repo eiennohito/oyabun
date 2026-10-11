@@ -184,6 +184,9 @@ impl ResolvedProc {
                     self.raw.ticks = parse_u64(value, line_no)?;
                 }
             }
+            // Naming a wait makes it measured (counting from zero); `none` makes it unmeasured
+            // again (values carry across cycles, so omission alone could not say so).
+            "wait" => self.raw.wait = apply_delta_present(self.raw.wait, value, line_no)?,
             "mem" | "mem_bytes" => self.raw.mem_bytes = parse_bytes(value, line_no)?,
             "start" | "start_time" => self.raw.start_time = parse_u64(value, line_no)?,
             "comm" => self.raw.comm = value.as_bytes().to_vec(),
@@ -224,15 +227,20 @@ impl SystemStats {
             // Raw /proc/meminfo fields (bytes).
             "mem" | "mem_total" => self.mem_total = parse_bytes(value, line_no)?,
             "mem_available" => self.mem_available = parse_bytes(value, line_no)?,
-            "mem_buffers" => self.mem_buffers = parse_bytes(value, line_no)?,
-            "mem_cached" => self.mem_cached = parse_bytes(value, line_no)?,
+            "mem_free" => self.mem_free = parse_bytes(value, line_no)?,
+            "mem_shmem" => self.mem_shmem = parse_bytes(value, line_no)?,
             "swap_total" => self.swap_total = parse_bytes(value, line_no)?,
             "swap_free" => self.swap_free = parse_bytes(value, line_no)?,
-            "load" => self.load = parse_load(value, line_no)?,
-            "load1" => self.load[0] = parse_u32(value, line_no)?,
-            "load5" => self.load[1] = parse_u32(value, line_no)?,
-            "load15" => self.load[2] = parse_u32(value, line_no)?,
-            "uptime" | "uptime_secs" => self.uptime_secs = parse_u64(value, line_no)?,
+            "runnable" => self.runnable = parse_u32(value, line_no)?,
+            // Naming a pressure file makes it present (counting from zero); unnamed = absent.
+            "psi_cpu" => self.psi_cpu = apply_delta_present(self.psi_cpu, value, line_no)?,
+            "psi_memory" => self.psi_memory = apply_delta_present(self.psi_memory, value, line_no)?,
+            "psi_io" => self.psi_io = apply_delta_present(self.psi_io, value, line_no)?,
+            "pswpin" => self.pswpin = apply_delta_present(self.pswpin, value, line_no)?,
+            // Fields older recordings carried and the header no longer shows: accepted so those
+            // recordings still replay, and ignored.
+            "mem_buffers" | "mem_cached" | "load" | "load1" | "load5" | "load15" | "uptime"
+            | "uptime_secs" => {}
             _ => {
                 return Err(ParseError::new(
                     line_no,
@@ -242,6 +250,20 @@ impl SystemStats {
         }
         Ok(())
     }
+}
+
+/// [`apply_delta_u64`] for a counter that may be absent: naming it makes it present, and the
+/// literal `none` makes it absent again (values carry across cycles, so omission alone could
+/// not express "present before, gone now").
+fn apply_delta_present(
+    current: Option<u64>,
+    value: &str,
+    line_no: usize,
+) -> Result<Option<u64>, ParseError> {
+    if value == "none" {
+        return Ok(None);
+    }
+    apply_delta_u64(current.unwrap_or(0), value, line_no).map(Some)
 }
 
 /// Parse `value` as either an absolute u64 or `+delta` added to `current`.
@@ -370,21 +392,6 @@ fn parse_bool(value: &str, line_no: usize) -> Result<bool, ParseError> {
     }
 }
 
-fn parse_load(value: &str, line_no: usize) -> Result<[u32; 3], ParseError> {
-    let mut out = [0; 3];
-    let parts = value.split(',').collect::<Vec<_>>();
-    if parts.len() != 3 {
-        return Err(ParseError::new(
-            line_no,
-            "load requires three comma-separated values",
-        ));
-    }
-    for (dst, part) in out.iter_mut().zip(parts) {
-        *dst = parse_u32(part, line_no)?;
-    }
-    Ok(out)
-}
-
 fn parse_duration_ns(value: &str, line_no: usize) -> Result<u64, ParseError> {
     let (num, scale) = split_unit(value);
     let n = parse_u64(num, line_no)?;
@@ -483,7 +490,7 @@ mod tests {
     fn parses_quoted_values_and_writer_round_trips_verbose_state() {
         let stream = Stream::parse(
             r#"
-            cycle 0 load=125,75,50 uptime=3600
+            cycle 0 runnable=3 psi_cpu=100
               7 comm="space name" cmd="/usr/bin/space name --flag" mem=1K
             "#,
         )
@@ -493,6 +500,57 @@ mod tests {
         assert!(text.contains("cmd=\"/usr/bin/space name --flag\""));
         let reparsed = Stream::parse(&text).expect("reparse");
         assert_eq!(stream, reparsed);
+    }
+
+    #[test]
+    fn legacy_system_fields_are_accepted_and_ignored() {
+        let stream = Stream::parse(
+            "cycle 0 mem=8G mem_buffers=1M mem_cached=2M load=125,75,50 load1=1 load5=2 \
+             load15=3 uptime=3600 uptime_secs=1\n",
+        )
+        .expect("old recordings still parse");
+        assert_eq!(stream.cycles[0].sys.mem_total, 8 << 30);
+    }
+
+    #[test]
+    fn absence_replays_as_absence() {
+        let mut stream = Stream::parse("cycle 0 psi_cpu=5 pswpin=9\ncycle +1s\n").unwrap();
+        assert_eq!(stream.cycles[1].sys.psi_cpu, Some(5), "omitted = carried");
+        stream.cycles[1].sys.psi_cpu = None;
+        stream.cycles[1].sys.pswpin = None;
+        let again = Stream::parse(&stream.to_verbose_dsl()).unwrap();
+        assert_eq!(again, stream, "a value that disappears stays gone");
+        assert_eq!(again.cycles[1].sys.pswpin, None);
+    }
+
+    #[test]
+    fn wait_is_cumulative_carried_and_can_become_unmeasured() {
+        let mut stream = Stream::parse(
+            "cycle 0\n  7 ticks=10 wait=5\n  8 ticks=1\ncycle +1s\n  7 wait=+3\n  8 wait=+2\n\
+             cycle +1s\n  7 wait=none\n",
+        )
+        .unwrap();
+        let wait = |c: usize, i: usize| stream.cycles[c].procs[i].raw.wait;
+        assert_eq!(
+            (wait(0, 0), wait(0, 1)),
+            (Some(5), None),
+            "unnamed = unmeasured"
+        );
+        assert_eq!(
+            (wait(1, 0), wait(1, 1)),
+            (Some(8), Some(2)),
+            "+delta; naming starts at 0"
+        );
+        assert_eq!(wait(2, 0), None, "`none` ends measurement");
+        assert_eq!(wait(2, 1), Some(2), "carried when omitted");
+        let again = Stream::parse(&stream.to_verbose_dsl()).unwrap();
+        assert_eq!(
+            again, stream,
+            "a wait that stops being measured stays unmeasured"
+        );
+        stream.cycles[2].procs[1].raw.wait = None;
+        let again = Stream::parse(&stream.to_verbose_dsl()).unwrap();
+        assert_eq!(again, stream);
     }
 
     #[test]

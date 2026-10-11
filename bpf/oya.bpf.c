@@ -25,6 +25,14 @@
 // would miss non-leader-thread activity in both the hash and the emitted value. The group walk
 // via `bpf_loop` costs O(nr_threads) per leader; single-threaded processes take a fast path.
 //
+// The same walk sums `sched_info.run_delay` (time runnable but queued for a CPU) over live
+// threads. The kernel keeps no dead-thread accumulator for it, so the sum can drop when a thread
+// exits; userspace treats a backwards step as zero. The *emitted* value is the exact sum, but the
+// change hash mixes only whole clock ticks of it: wait grows by a few ns whenever a task is
+// merely woken, so hashing raw ns would re-emit every such process every cycle and break the
+// near-empty idle stream. Sub-tick wait still accumulates in the emitted value and lands on the
+// next emit — userspace converts the cumulative ns to ticks, so nothing is dropped.
+//
 // Leader filter: the iterator and both tracepoints fire per *thread*; we act only on
 // thread-group leaders (kernel pid == tgid) so the output is processes, matching the /proc
 // enumeration the unprivileged path produces.
@@ -57,6 +65,10 @@ char LICENSE[] SEC("license") = "GPL";
 #define OYA_CTRL_EMIT_ALL 0 // userspace→bpf: force a full snapshot this cycle (resync)
 #define OYA_CTRL_DROPS    1 // bpf→userspace: count of dropped event records (ringbuf full)
 #define OYA_CTRL_LEN      2
+
+// ns per clock tick (1e9 / CLK_TCK), set by userspace before load. Only the change hash uses it
+// (to coarsen wait); the default is the usual CLK_TCK of 100.
+const volatile __u64 oya_ns_per_tick = 10000000;
 
 // FNV-1a 64-bit — fast, good mixing, straight-line (the verifier accepts it without loops).
 #define OYA_FNV_OFFSET 0xcbf29ce484222325ULL
@@ -100,6 +112,7 @@ static __always_inline __u64 hmix(__u64 h, __u64 x)
 struct group_walk_ctx {
 	__u64 utime;
 	__u64 stime;
+	__u64 wait;
 	struct list_head *pos;
 	struct list_head *sentinel; // &sig->thread_head — stop when we loop back here
 	unsigned long off;          // CO-RE byte offset of thread_node in task_struct
@@ -118,6 +131,7 @@ static int sum_thread_cputime(unsigned int idx, void *data)
 		(struct task_struct *)((unsigned long)ctx->pos - ctx->off);
 	ctx->utime += BPF_CORE_READ(t, utime);
 	ctx->stime += BPF_CORE_READ(t, stime);
+	ctx->wait += BPF_CORE_READ(t, sched_info.run_delay);
 	struct list_head *next;
 	bpf_probe_read_kernel(&next, sizeof(next), ctx->pos);
 	ctx->pos = next;
@@ -131,7 +145,7 @@ static int sum_thread_cputime(unsigned int idx, void *data)
 // (accumulated unconditionally in __exit_signal for every exiting thread) must always be
 // added, even for single-threaded processes.
 static __always_inline void group_cputime(struct task_struct *leader,
-					  __u64 *out_ut, __u64 *out_st)
+					  __u64 *out_ut, __u64 *out_st, __u64 *out_wait)
 {
 	struct signal_struct *sig = BPF_CORE_READ(leader, signal);
 
@@ -139,12 +153,15 @@ static __always_inline void group_cputime(struct task_struct *leader,
 	// dropped back to nr_threads=1 still has exited threads' time here).
 	*out_ut = BPF_CORE_READ(sig, utime);
 	*out_st = BPF_CORE_READ(sig, stime);
+	// No dead-thread accumulator exists for run_delay: live threads only.
+	*out_wait = 0;
 
 	__u32 nr = BPF_CORE_READ(sig, nr_threads);
 	if (nr <= 1) {
 		// Single-threaded fast path: only the leader's own time to add.
 		*out_ut += BPF_CORE_READ(leader, utime);
 		*out_st += BPF_CORE_READ(leader, stime);
+		*out_wait = BPF_CORE_READ(leader, sched_info.run_delay);
 		return;
 	}
 
@@ -157,6 +174,7 @@ static __always_inline void group_cputime(struct task_struct *leader,
 	struct group_walk_ctx ctx = {
 		.utime    = *out_ut,
 		.stime    = *out_st,
+		.wait     = 0,
 		.pos      = BPF_CORE_READ(sig, thread_head.next),
 		.sentinel = sentinel,
 		.off      = __CORE_RELO(leader, thread_node, BYTE_OFFSET),
@@ -166,6 +184,7 @@ static __always_inline void group_cputime(struct task_struct *leader,
 	bpf_loop(nr, sum_thread_cputime, &ctx, 0);
 	*out_ut = ctx.utime;
 	*out_st = ctx.stime;
+	*out_wait = ctx.wait;
 }
 
 static __always_inline __s64 read_rss(struct mm_struct *mm)
@@ -199,9 +218,9 @@ int oya_task_iter(struct bpf_iter__task *ctx)
 	if (pid != tgid)
 		return 0; // non-leader thread — emit processes only
 
-	// Hot fields (thread-group CPU time, state, rss, ppid): hash for emit-on-change.
-	__u64 utime, stime;
-	group_cputime(task, &utime, &stime);
+	// Hot fields (thread-group CPU time + wait, state, rss, ppid): hash for emit-on-change.
+	__u64 utime, stime, wait;
+	group_cputime(task, &utime, &stime, &wait);
 	__u32 state = BPF_CORE_READ(task, __state);
 	__u32 exit_state = BPF_CORE_READ(task, exit_state);
 	__u32 ppid = BPF_CORE_READ(task, real_parent, tgid);
@@ -210,6 +229,7 @@ int oya_task_iter(struct bpf_iter__task *ctx)
 	__u64 h = OYA_FNV_OFFSET;
 	h = hmix(h, utime);
 	h = hmix(h, stime);
+	h = hmix(h, wait / (oya_ns_per_tick ? oya_ns_per_tick : 1)); // whole ticks only
 	h = hmix(h, (__u64)rss);
 	h = hmix(h, ((__u64)state << 32) | exit_state);
 	h = hmix(h, (__u64)ppid);
@@ -225,6 +245,7 @@ int oya_task_iter(struct bpf_iter__task *ctx)
 	info.ppid = ppid;
 	info.utime_ns = utime;
 	info.stime_ns = stime;
+	info.wait_ns = wait;
 	info.state = state;
 	info.exit_state = exit_state;
 	info.rss_pages = rss;

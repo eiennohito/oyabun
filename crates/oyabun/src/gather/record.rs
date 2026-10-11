@@ -109,6 +109,7 @@ fn convert_proc(proc: &ProcessEntry) -> RawProc {
         nice: proc.nice,
         num_threads: proc.num_threads,
         ticks: proc.ticks,
+        wait: proc.wait_ticks,
         mem_bytes: proc.mem_bytes,
         start_time: proc.start_time,
         comm: proc.comm().to_vec(),

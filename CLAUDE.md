@@ -69,10 +69,12 @@ a grab-bag. A module small enough for one file uses `foo.rs`, not `foo/mod.rs`.
 ```
 crates/
   oyabun/   process-manager TUI: one thread, serialized gather→render loop
-    gather/ source (/proc or BPF) fills rows; CPU%, tree; common tail
+    gather/ /proc or BPF source fills rows; CPU%, tree, sys stats
     gather/bpf/ privileged source: emit-on-change iter + fork/free (feature "bpf")
     identity/ per-process group identity + trust (cgroup + structural)
-    application/ view-side grouping: fold, label, aggregate, PSS memory
+    header/   system header: fixed-slot CPU + memory lines
+    application/ view-side grouping: form, label, fold prefs, PSS
+    view/ display tree: collapse model, row totals, collapsed series
   etch/     retained-mode, value-gated terminal renderer
   thoop/    THP storage primitives (MmapRegion, Arena, GenStore, TypedBuf, ThpMap, …)
 bpf/        BPF C sources + committed .o (clang/bpftool dev-only; `just bpf`)
@@ -89,4 +91,6 @@ Linux (io_uring + syscall fallback) and macOS (`sysctl`/`libproc`). Windows is n
 Core invariants: 
 - near-zero idle CPU, theoretical minimum, useless copies/allocation churn are forbidden
 - O(changes) on process/core count when possible
+- stable layout: widget positions change only on terminal resize, never on value changes
+  (moving widgets read as data changes); conditional values get fixed, blank-when-idle slots
 - safe sudo escalation

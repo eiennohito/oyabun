@@ -12,7 +12,7 @@ use std::time::Instant;
 use thoop::{Arena, Gen, GenStore, Ref, StrStore, StringRef, ThpMap};
 
 use super::config::{CMD_SLOT, env_u32};
-use super::cpu::{ACTIVE_SAMPLES, CpuRing, MIN_SAMPLE, elapsed_jiffies};
+use super::cpu::{AVG_SAMPLES, CpuBaseline, CpuRing, CpuSeries, MIN_SAMPLE, elapsed_jiffies};
 use super::parse;
 use crate::identity::ProcMeta;
 use crate::procs::{CapLevel, Cmd, ProcessEntry, Procs};
@@ -157,6 +157,9 @@ pub(crate) struct PidSlot {
     meta: Ref<PidMeta>,
     /// Incarnation discriminator: `start_time` from stat. A change ⇒ PID reuse.
     start_time: u64,
+    /// Parent PID at the last sighting. A change is a reparenting: the tree shape moved without
+    /// any birth or death.
+    ppid: u32,
     /// Generation first seen — drives the age-adaptive cmdline interval (settling window).
     first_seen_gen: u64,
     /// Generation last seen — evicts vanished PIDs.
@@ -204,6 +207,10 @@ pub(crate) struct ProcTable {
     flatpak_store: FlatpakStore,
     /// Last real CPU-sample instant (the window origin); `None` until the first sample.
     last: Option<Instant>,
+    /// Count of real CPU-sample cycles so far (cycles with a measured window). The index every
+    /// [`CpuRing`] is aligned to; a too-soon refresh does not advance it, so a ring never
+    /// zero-fills time that was folded into the next delta instead.
+    sample_cycle: u64,
     clk_tck: u64,
     refresh_n: u32,
     /// Full effective-capability mask for this kernel (`cap_last_cap`), read once at startup —
@@ -236,12 +243,18 @@ impl ProcTable {
             cgroup_store: CgroupStore::new(arena, CMD_STORE_MIN_SLOTS),
             flatpak_store: FlatpakStore::new(arena, CMD_STORE_MIN_SLOTS),
             last: None,
+            sample_cycle: 0,
             clk_tck,
             refresh_n,
             cap_full_mask: sys::cap_full_mask(),
             source_provides_uid,
             meta_epoch: 0,
         }
+    }
+
+    /// Count of measured CPU-sample cycles; see the field.
+    pub(crate) fn sample_cycle(&self) -> u64 {
+        self.sample_cycle
     }
 
     /// Monotonic version of the identity-relevant per-PID inputs — see [`Self::meta_epoch`]. The
@@ -272,6 +285,21 @@ impl ProcTable {
     #[cfg(test)]
     pub(crate) fn cmd_slot_count(&self) -> usize {
         self.cmd_store.slot_count()
+    }
+
+    /// The PID's recent per-interval CPU rates as of the latest sample cycle (`None` for an
+    /// unknown PID). Accounts for cycles a quiescent ring skipped, so it never shows stale bars.
+    pub(crate) fn cpu_series(&self, pid: u32) -> Option<CpuSeries> {
+        let slot = self.index.get(pid)?;
+        Some(self.cpu.get(slot.cpu).series(self.sample_cycle))
+    }
+
+    /// The counters the PID's next CPU delta will be taken from, if this exact incarnation
+    /// (`start_time`) is known. Lets a source see, from the fresh observation alone, whether
+    /// anything it would still measure can have moved.
+    pub(crate) fn cpu_baseline(&self, pid: u32, start_time: u64) -> Option<CpuBaseline> {
+        let slot = self.index.get(pid)?;
+        (slot.start_time == start_time).then(|| self.cpu.get(slot.cpu).baseline())
     }
 
     /// Resolve a row's cmdline bytes directly from the `Cmd` store (`&self` read; no lease).
@@ -314,6 +342,9 @@ impl ProcTable {
         let first = self.last.is_none();
         let jiff =
             window.map(|e| u32::try_from(elapsed_jiffies(e, self.clk_tck)).unwrap_or(u32::MAX));
+        if jiff.is_some() {
+            self.sample_cycle += 1;
+        }
 
         let refresh_n = self.refresh_n;
         let cap_full_mask = self.cap_full_mask;
@@ -334,6 +365,8 @@ impl ProcTable {
             let reused = prior.is_some_and(|s| s.start_time != e.start_time);
             // A birth or a PID reuse is a fresh incarnation — its identity is new either way.
             meta_changed |= prior.is_none() || reused;
+            // Reparenting moves the tree shape (and so top members, groups, the view) with no birth.
+            meta_changed |= prior.is_some_and(|s| s.ppid != e.ppid);
             let settling = prior.is_some_and(|s| {
                 !reused && cur_gen.wrapping_sub(s.first_seen_gen) < u64::from(CMDLINE_SETTLE_GENS)
             });
@@ -440,6 +473,7 @@ impl ProcTable {
                 cpu: cpu_ref,
                 meta: meta_ref,
                 start_time: e.start_time,
+                ppid: e.ppid,
                 first_seen_gen,
                 seen_gen: cur_gen,
                 lib_checked_gen,
@@ -503,7 +537,7 @@ impl ProcTable {
     }
 
     /// Fold this cycle's tick observation into the PID's hot CPU ring (creating it for a birth),
-    /// writing the derived `cpu_pct`/`cpu_peak` and the display-state override onto the row.
+    /// writing the derived `cpu_pct`/`cpu_now` and the display-state override onto the row.
     /// Returns the ring's slot for the caller to store in `PidSlot`. The ring `&mut` never spans
     /// a cmd/meta store op (which could relocate a chunk), so it stays a tight in-place borrow.
     fn sample_cpu(
@@ -515,16 +549,21 @@ impl ProcTable {
     ) -> Ref<CpuRing> {
         let cpu_ref = match prior {
             Some(s) => s.cpu,
-            None => self.cpu.insert(Gen::ALIVE, CpuRing::new(e.ticks)),
+            None => self.cpu.insert(
+                Gen::ALIVE,
+                CpuRing::new(e.ticks, e.wait_ticks, self.sample_cycle),
+            ),
         };
+        let cycle = self.sample_cycle;
         let ring = self.cpu.get_mut(cpu_ref);
-        ring.sample(e.ticks, jiff, reused, prior.is_some());
+        let sampled = ring.sample(e.ticks, e.wait_ticks, jiff, cycle, reused, prior.is_some());
+        e.cpu_now = sampled.rate;
+        e.wait_now = sampled.waiting;
         e.cpu_pct = ring.avg();
-        e.cpu_peak = ring.peak();
         // Display-time state: a process that ran in the recent window reads `R` stably;
         // otherwise the raw kernel state stands (so D/Z/T/X appear only when the process
         // genuinely isn't executing). Raw `state` is untouched (kill-safety / diagnostics).
-        e.display_state = if ring.had_ticks(ACTIVE_SAMPLES) {
+        e.display_state = if ring.had_ticks(AVG_SAMPLES) {
             b'R'
         } else {
             e.state

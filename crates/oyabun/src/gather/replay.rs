@@ -13,6 +13,7 @@ use crate::fxhash::{FxMap, PidMap};
 use crate::gather::Gatherer;
 use crate::procs::{ProcessEntry, Procs};
 use crate::sys::RawSystemSnapshot;
+use crate::view::RowKind;
 
 trait RawProcExt {
     fn write_into(&self, e: &mut ProcessEntry);
@@ -29,6 +30,7 @@ impl RawProcExt for RawProc {
         e.nice = self.nice;
         e.num_threads = self.num_threads;
         e.ticks = self.ticks;
+        e.wait_ticks = self.wait;
         e.mem_bytes = self.mem_bytes;
         e.start_time = self.start_time;
         e.is_kthread = self.is_kthread;
@@ -181,6 +183,11 @@ impl Replayer {
         self.app.gather();
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_header_width(&mut self, width: u16) {
+        self.app.set_header_width(width);
+    }
+
     pub(crate) fn proc(&self, pid: u32) -> &ProcessEntry {
         self.app
             .procs()
@@ -246,13 +253,66 @@ impl Replayer {
             .collect()
     }
 
+    /// `(pid, depth)` of every row, in display order.
+    #[cfg(test)]
+    pub(crate) fn display_depths(&self) -> Vec<(u32, u16)> {
+        self.app
+            .rows()
+            .iter()
+            .map(|row| (self.app.row_pid(row), row.depth))
+            .collect()
+    }
+
+    /// The display row index of the first row shown through `pid`.
+    #[cfg(test)]
+    pub(crate) fn row_of(&self, pid: u32) -> usize {
+        self.app
+            .rows()
+            .iter()
+            .position(|row| self.app.row_pid(row) == pid)
+            .unwrap_or_else(|| panic!("pid {pid} not displayed"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn totals(&self, pid: u32) -> crate::view::Totals {
+        self.app.row_totals(self.row_of(pid))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row_series(&self, pid: u32) -> Option<crate::gather::CpuSeries> {
+        self.app.row_series(self.row_of(pid))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kinds(&self) -> Vec<RowKind> {
+        self.app.rows().iter().map(|row| row.kind).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn collapse_selected(&mut self) {
+        self.app.collapse_selected();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn toggle_group_fold(&mut self) {
+        self.app.toggle_group_fold();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layout_count(&self) -> u64 {
+        self.app.layout_count()
+    }
+
     #[cfg(test)]
     pub(crate) fn row_collapsed(&self, pid: u32) -> bool {
         self.app
             .rows()
             .iter()
             .find(|row| self.app.row_pid(row) == pid)
-            .map_or_else(|| panic!("pid {pid} not displayed"), |row| row.collapsed)
+            .map_or_else(
+                || panic!("pid {pid} not displayed"),
+                crate::view::ViewRow::is_collapsed,
+            )
     }
 
     #[cfg(test)]
@@ -308,6 +368,18 @@ impl Rendered {
 
     pub(crate) fn cell(&self, row: u16, col: u16) -> Option<&vt100::Cell> {
         self.parser.screen().cell(row, col)
+    }
+
+    /// The rightmost block glyph on `row` — the newest cell of a row's sparkline.
+    pub(crate) fn newest_spark_cell(&self, row: u16) -> &vt100::Cell {
+        (0..self.width)
+            .filter_map(|col| self.cell(row, col))
+            .rfind(|c| {
+                c.contents()
+                    .chars()
+                    .any(|ch| ('\u{2581}'..='\u{2588}').contains(&ch))
+            })
+            .unwrap_or_else(|| panic!("no sparkline glyph in row {row}: {:?}", self.row(row)))
     }
 
     pub(crate) fn fg_at_text(&self, row: u16, text: &str) -> vt100::Color {
@@ -374,11 +446,10 @@ fn vt100_cursor_rows(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::DisplayRowKind;
     use crate::palette;
     use crate::procs::NONE;
 
-    const BODY_TOP: u16 = 4;
+    const BODY_TOP: u16 = 3;
 
     fn row_containing(screen: &Rendered, text: &str) -> u16 {
         (0..screen.height)
@@ -401,10 +472,8 @@ mod tests {
             .rows()
             .iter()
             .filter_map(|row| match row.kind {
-                DisplayRowKind::Application { group_idx } => {
-                    Some(r.app.app_group(group_idx).label.as_str())
-                }
-                DisplayRowKind::Process { .. } => None,
+                RowKind::Group { group_idx } => Some(r.app.app_group(group_idx).label.as_str()),
+                RowKind::Process { .. } => None,
             })
             .collect();
         labels.sort_unstable();
@@ -422,16 +491,19 @@ mod tests {
             r.app
                 .rows()
                 .iter()
-                .filter(|row| matches!(row.kind, DisplayRowKind::Application { .. }))
+                .filter(|row| matches!(row.kind, RowKind::Group { .. }))
                 .count(),
             5
         );
-        for pid in [2278, 2305, 2308, 1730] {
+        for pid in [2278, 2305, 2308] {
             assert!(
                 r.display_pids().contains(&pid),
                 "pid {pid} must remain native"
             );
         }
+        // 1730 belongs to another application but is a native child of a Chrome member: it is
+        // hidden inside the Chrome fold (and counted there), not left dangling beside it.
+        assert!(!r.display_pids().contains(&1730));
         let collapsed_screen = r.render(100, 24);
         let collapsed_text = collapsed_screen.text();
         assert!(collapsed_text.contains('◇'));
@@ -439,13 +511,13 @@ mod tests {
             .lines()
             .find(|line| line.contains("Google Chrome"))
             .unwrap();
-        assert!(chrome_text.contains("[+4]"), "{chrome_text}");
+        assert!(chrome_text.contains("[+5]"), "{chrome_text}");
 
         let chrome_row = r
             .app
             .rows()
             .iter()
-            .position(|row| matches!(row.kind, DisplayRowKind::Application { group_idx } if r.app.app_group(group_idx).label == "Google Chrome"))
+            .position(|row| matches!(row.kind, RowKind::Group { group_idx } if r.app.app_group(group_idx).label == "Google Chrome"))
             .unwrap();
         r.app.select_row(chrome_row);
         assert!(
@@ -453,16 +525,14 @@ mod tests {
             "synthetic application rows cannot be signalled"
         );
         r.app.toggle_collapse();
-        let chrome_members = [1684, 1690, 1718, 1721];
+        let chrome_members = [1684, 1690, 1718, 1721, 1730];
         let concrete: Vec<_> = r
             .app
             .rows()
             .iter()
             .filter_map(|row| match row.kind {
-                DisplayRowKind::Process { proc_idx } => {
-                    Some(r.app.procs().as_slice()[proc_idx].pid)
-                }
-                DisplayRowKind::Application { .. } => None,
+                RowKind::Process { proc_idx } => Some(r.app.procs().as_slice()[proc_idx].pid),
+                RowKind::Group { .. } => None,
             })
             .collect();
         for pid in chrome_members {
@@ -473,9 +543,19 @@ mod tests {
             );
         }
 
-        let screen = r.render(100, 24);
-        assert!(screen.text().contains('◆'));
-        assert!(screen.text().contains("Google Chrome"));
+        // Expanded: no group row at all — the members are ordinary process rows.
+        assert!(
+            r.app
+                .rows()
+                .iter()
+                .all(|row| !matches!(row.kind, RowKind::Group { group_idx } if r.app.app_group(group_idx).label == "Google Chrome")),
+            "an expanded group has no row of its own"
+        );
+        assert!(!r.render(100, 24).text().contains("◇ Google Chrome"));
+        // The foreign child is back at its native spot, one level under its parent.
+        let depths = r.display_depths();
+        let depth_of = |pid| depths.iter().find(|&&(p, _)| p == pid).unwrap().1;
+        assert_eq!(depth_of(1730), depth_of(1684) + 1);
     }
 
     #[test]
@@ -487,11 +567,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let zed_row = |r: &Replayer| {
-            r.app
-                .rows()
-                .iter()
-                .position(|row| matches!(row.kind, DisplayRowKind::Application { group_idx } if r.app.app_group(group_idx).label == "Zed"))
-                .expect("Zed application row")
+            r.app.rows().iter().position(
+                |row| matches!(row.kind, RowKind::Group { group_idx } if r.app.app_group(group_idx).label == "Zed"),
+            )
         };
 
         // Session 1: Zed folds by default; expanding it writes an override keyed by its identity.
@@ -499,21 +577,17 @@ mod tests {
             Replayer::from_stream(stream(include_str!("../../tests/fixtures/app-groups.dsl")));
         r.app.set_folds(FoldPreferences::at(path.clone()));
         r.cycle();
-        assert!(r.app.rows()[zed_row(&r)].collapsed, "Zed folds by default");
-        let row = zed_row(&r);
+        let row = zed_row(&r).expect("Zed folds by default");
         r.app.select_row(row);
         r.app.toggle_collapse();
-        assert!(!r.app.rows()[zed_row(&r)].collapsed);
+        assert!(zed_row(&r).is_none(), "expanded: no group row");
 
         // Session 2: a fresh run loads the override and Zed starts expanded by identity.
         let mut r2 =
             Replayer::from_stream(stream(include_str!("../../tests/fixtures/app-groups.dsl")));
         r2.app.set_folds(FoldPreferences::at(path.clone()));
         r2.cycle();
-        assert!(
-            !r2.app.rows()[zed_row(&r2)].collapsed,
-            "fold preference persisted"
-        );
+        assert!(zed_row(&r2).is_none(), "fold preference persisted");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -566,23 +640,56 @@ mod tests {
             .app
             .rows()
             .iter()
-            .position(|row| matches!(row.kind, DisplayRowKind::Application { .. }))
+            .position(|row| matches!(row.kind, RowKind::Group { .. }))
             .unwrap();
         r.app.select_row(row);
         r.app.toggle_collapse();
+        assert!(!r.kinds().iter().any(|k| matches!(k, RowKind::Group { .. })));
 
+        // 10 exits and 13 (same identity) is born: the expansion follows the identity.
         r.cycle();
-        let selected = &r.app.rows()[r.app.selected()];
-        assert!(matches!(selected.kind, DisplayRowKind::Application { .. }));
         assert!(
-            !selected.collapsed,
+            !r.kinds().iter().any(|k| matches!(k, RowKind::Group { .. })),
             "expansion suppression follows the app identity across cycles"
         );
+        // Folding again from a member row: the representative was replaced deterministically.
+        r.app.select_row(0);
+        r.toggle_group_fold();
+        let selected = &r.app.rows()[r.app.selected()];
+        assert!(matches!(selected.kind, RowKind::Group { .. }));
+        assert!(selected.is_collapsed());
         assert_eq!(
             r.app.row_pid(selected),
             11,
             "representative was replaced deterministically after 10 exited"
         );
+    }
+
+    #[test]
+    fn scrolling_does_not_recompute_every_row() {
+        let dsl = format!(
+            "{}\ncycle +1s\n",
+            include_str!("../../tests/fixtures/app-groups.dsl")
+        );
+        let mut r = Replayer::from_stream(stream(&dsl));
+        r.cycle();
+        let rows = r.app.rows().len();
+        assert!(rows > 3, "fixture must outscroll a 2-row viewport");
+        r.app.prepare_visible_rows(2);
+        let full = r.app.view_full_refreshes();
+        for row in 0..rows {
+            r.app.select_row(row);
+            r.app.adjust_scroll(2);
+            r.app.prepare_visible_rows(2);
+        }
+        assert_eq!(
+            r.app.view_full_refreshes(),
+            full,
+            "moving the viewport refreshes only the visible rows"
+        );
+        // A new cycle is new data: that one is a full pass.
+        r.cycle();
+        assert!(r.app.view_full_refreshes() > full);
     }
 
     #[test]
@@ -599,7 +706,7 @@ mod tests {
             .app
             .rows()
             .iter()
-            .position(|row| matches!(row.kind, DisplayRowKind::Application { group_idx } if r.app.app_group(group_idx).label == "Google Chrome"))
+            .position(|row| matches!(row.kind, RowKind::Group { group_idx } if r.app.app_group(group_idx).label == "Google Chrome"))
             .unwrap();
         r.app.select_row(chrome);
         r.app.adjust_scroll(1);
@@ -771,39 +878,490 @@ mod tests {
         assert_eq!(r.cmdline(42), b"epsilon");
     }
 
+    /// A cgroup that makes a process a member of the desktop application `foo`.
+    const FOO: &str = r#"uid=1000 cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo@a.service\n""#;
+    fn foo_stream(body: &str) -> oya_stream::Stream {
+        stream(&format!("cycle 0\n{body}\ncycle +1s\n"))
+    }
+
+    fn group_rows(r: &Replayer) -> usize {
+        r.kinds()
+            .iter()
+            .filter(|k| matches!(k, RowKind::Group { .. }))
+            .count()
+    }
+
     #[test]
-    fn replay_collapsed_subtree_uses_aggregate_cpu_and_memory() {
-        let stream = stream(
+    fn foreign_child_of_a_member_is_hidden_when_folded_and_nested_when_expanded() {
+        let mut r = Replayer::from_stream(foo_stream(&format!(
+            "  10 start=10 comm=foo {FOO}\n  11 ppid=10 start=11 comm=foo {FOO}\n  12 ppid=10 start=12 comm=foo {FOO}\n  20 ppid=11 start=20 comm=tool cmd=/bin/tool"
+        )));
+        r.cycle();
+        // Folded: one group row at the root's native spot; the foreign tool is hidden in it.
+        assert_eq!(r.display_depths(), vec![(10, 0)]);
+        let t = r.totals(10);
+        assert_eq!(t.count, 4, "the foreign descendant is counted in the fold");
+
+        // Expanded: members are ordinary rows; the foreign child sits natively under its
+        // parent, one level deeper — not at the member's level.
+        r.select_pid(10);
+        r.toggle_collapse();
+        assert_eq!(r.display_depths(), vec![(10, 0), (11, 1), (20, 2), (12, 1)]);
+    }
+
+    #[test]
+    fn group_with_two_top_members_has_one_row_and_no_row_for_the_other_top() {
+        let mut r = Replayer::from_stream(stream(&format!(
             r"
             cycle 0
-              10 comm=parent cmd=/srv/parent ticks=0 mem=1M
-              11 ppid=10 comm=child-a cmd=/srv/child-a ticks=0 mem=2M
-              12 ppid=10 comm=child-b cmd=/srv/child-b ticks=0 mem=3M
+              1 comm=init
+              2 ppid=1 comm=launcher cmd=/bin/launcher
+              3 ppid=1 comm=svc cmd=/bin/svc
+              10 ppid=2 start=10 comm=foo {FOO} ticks=0 mem=1M
+              11 ppid=10 start=11 comm=foo {FOO} ticks=0 mem=1M
+              12 ppid=3 start=12 comm=foo {FOO} ticks=0 mem=1M
+              13 ppid=12 start=13 comm=foo {FOO} ticks=0 mem=1M
 
             cycle +1s
               10 ticks=10
-              11 ticks=20
-              12 ticks=30
-            ",
-        );
-
-        let mut r = Replayer::from_stream(stream);
+              11 ticks=10
+              12 ticks=10
+              13 ticks=10
+            "
+        )));
         r.cycle();
         r.cycle();
+        // The group row sits at the anchor (the top containing the representative, 10); the other
+        // top member's native spot emits nothing.
+        assert_eq!(r.display_depths(), vec![(1, 0), (2, 1), (10, 2), (3, 1)]);
+        assert!(matches!(r.kinds()[2], RowKind::Group { .. }));
+        // Both subtrees are counted once, at the group row.
+        let t = r.totals(10);
+        assert_eq!(t.count, 4);
+        assert_eq!(t.cpu_pct, r.proc(10).cpu_pct * 4);
+        assert_eq!(t.mem_bytes, 4 * 1024 * 1024);
 
-        assert_eq!(r.proc(10).subtree_cpu, 6_000);
-        assert_eq!(r.proc(10).subtree_mem, 6 * 1024 * 1024);
-
+        // Unfold, select a process under the non-anchor top, refold: the selection resolves to
+        // the group row that now covers it.
         r.select_pid(10);
         r.toggle_collapse();
-        assert_eq!(r.display_pids(), vec![10]);
+        r.select_pid(13);
+        assert_eq!(r.selected_pid(), Some(13));
+        r.toggle_group_fold();
+        assert!(matches!(
+            r.app.rows()[r.app.selected()].kind,
+            RowKind::Group { .. }
+        ));
+        assert_eq!(r.selected_pid(), Some(10));
+    }
 
-        let screen = r.render(80, 16);
-        let parent_row = row_containing(&screen, "/srv/parent");
-        let text = screen.row(parent_row);
-        assert!(text.contains("[+2]"), "{text}");
-        assert!(text.contains("60.00%"), "{text}");
-        assert!(text.contains("6.0M"), "{text}");
+    #[test]
+    fn nested_group_counts_in_its_collapsed_ancestor_and_partial_groups_keep_their_outside() {
+        let mut r = Replayer::from_stream(stream(&format!(
+            r"
+            cycle 0
+              1 comm=init cmd=/sbin/init
+              2 ppid=1 comm=shell cmd=/bin/shell
+              10 ppid=2 start=10 comm=foo {FOO}
+              11 ppid=10 start=11 comm=foo {FOO}
+              12 ppid=10 start=12 comm=foo {FOO}
+              20 ppid=1 start=20 comm=foo {FOO}
+
+            cycle +1s
+            "
+        )));
+        r.cycle();
+        // `foo` has two tops: 10 (under shell 2) and 20. Anchor is the shallowest top (depth 1).
+        assert_eq!(group_rows(&r), 1);
+        assert_eq!(r.totals(20).count, 4);
+
+        // Collapsing the shell hides top 10 inside it (ancestor wins): the shell counts it, and
+        // the group's row is formed from the outside part (20) alone.
+        r.select_pid(2);
+        r.toggle_collapse();
+        assert_eq!(r.display_pids(), vec![1, 2, 20]);
+        assert_eq!(r.totals(2).count, 4, "shell + the whole hidden foo subtree");
+        assert_eq!(r.totals(20).count, 1, "only the outside part of the group");
+        assert_eq!(group_rows(&r), 1);
+
+        // Collapsing init hides everything: no group row at all.
+        r.select_pid(1);
+        r.toggle_collapse();
+        assert_eq!(r.display_pids(), vec![1]);
+        assert_eq!(group_rows(&r), 0);
+        assert_eq!(r.totals(1).count, 6);
+    }
+
+    #[test]
+    fn collapsed_process_and_folded_group_agree_on_the_same_set() {
+        // Two identical four-process trees: one a plain collapsed process, one a folded group.
+        let mut r = Replayer::from_stream(stream(&format!(
+            r"
+            cycle 0
+              100 comm=plain cmd=/bin/plain ticks=0 mem=2M
+              101 ppid=100 comm=plain cmd=/bin/plain ticks=0 mem=2M
+              102 ppid=100 comm=plain cmd=/bin/plain ticks=0 mem=2M
+              103 ppid=101 comm=plain cmd=/bin/plain ticks=0 mem=2M
+              200 start=200 comm=foo {FOO} ticks=0 mem=2M
+              201 ppid=200 start=201 comm=foo {FOO} ticks=0 mem=2M
+              202 ppid=200 start=202 comm=foo {FOO} ticks=0 mem=2M
+              203 ppid=201 start=203 comm=foo {FOO} ticks=0 mem=2M
+
+            cycle +1s
+              100 ticks=10
+              101 ticks=10
+              102 ticks=10
+              103 ticks=10
+              200 ticks=10
+              201 ticks=10
+              202 ticks=10
+              203 ticks=10
+            "
+        )));
+        r.cycle();
+        r.cycle();
+        r.select_pid(100);
+        r.toggle_collapse();
+        let (process, group) = (r.totals(100), r.totals(200));
+        assert_eq!(process, group, "same hidden set, same numbers");
+        assert_eq!(process.count, 4);
+        assert_eq!(process.threads, group.threads);
+        // The badge counts hidden processes: the process row stays visible itself.
+        let text = r.render_text(100, 12);
+        let plain = text.lines().find(|l| l.contains("/bin/plain")).unwrap();
+        let app = text.lines().find(|l| l.contains("◇")).unwrap();
+        assert!(plain.contains("[+3]"), "{plain}");
+        assert!(app.contains("[+4]"), "{app}");
+    }
+
+    #[test]
+    fn g_and_left_on_a_top_member_fold_the_group_but_left_on_a_non_top_collapses_natively() {
+        let mut r = Replayer::from_stream(foo_stream(&format!(
+            "  10 start=10 comm=foo {FOO}\n  11 ppid=10 start=11 comm=foo {FOO}\n  12 ppid=11 start=12 comm=foo {FOO}\n  13 ppid=11 start=13 comm=foo {FOO}"
+        )));
+        r.cycle();
+        r.select_pid(10);
+        r.toggle_collapse();
+        assert_eq!(r.display_pids(), vec![10, 11, 12, 13]);
+
+        // Left on a non-top member: native collapse; the group stays expanded.
+        r.select_pid(11);
+        r.collapse_selected();
+        assert_eq!(r.display_pids(), vec![10, 11]);
+        assert!(r.row_collapsed(11));
+        assert_eq!(group_rows(&r), 0);
+        r.toggle_collapse();
+        assert_eq!(r.display_pids(), vec![10, 11, 12, 13]);
+
+        // `g` from any member row folds the whole group; selection lands on the group row.
+        r.select_pid(12);
+        r.toggle_group_fold();
+        assert_eq!(r.display_pids(), vec![10]);
+        assert!(matches!(
+            r.app.rows()[r.app.selected()].kind,
+            RowKind::Group { .. }
+        ));
+        // `g` on the group row expands again, landing on the representative process.
+        r.toggle_group_fold();
+        assert_eq!(r.display_pids(), vec![10, 11, 12, 13]);
+        assert_eq!(r.selected_pid(), Some(10));
+
+        // Left on the top member folds the group too (fold-by-identity).
+        r.select_pid(10);
+        r.collapse_selected();
+        assert_eq!(r.display_pids(), vec![10]);
+        assert_eq!(group_rows(&r), 1);
+        // Enter on a top member of an expanded group folds it as well.
+        r.toggle_collapse();
+        assert_eq!(group_rows(&r), 0);
+        r.select_pid(10);
+        r.toggle_collapse();
+        assert_eq!(group_rows(&r), 1);
+    }
+
+    #[test]
+    fn steady_cycles_do_not_rebuild_rows_but_reparenting_and_toggles_do() {
+        let mut r = Replayer::from_stream(stream(
+            r"
+            cycle 0
+              1 uid=0 comm=init cmd=/sbin/init
+              2 comm=supervisor cmd=/usr/bin/supervisor
+              42 ppid=1 start=4242 comm=worker cmd=/usr/bin/worker
+
+            cycle +1s
+              42 ticks=10
+
+            cycle +1s
+              42 ppid=2
+            ",
+        ));
+        r.cycle();
+        let built = r.layout_count();
+        r.cycle();
+        assert_eq!(
+            r.layout_count(),
+            built,
+            "a steady cycle reuses the rows (numbers still refresh)"
+        );
+        assert!(r.proc(42).cpu_pct > 0, "numbers refresh without a rebuild");
+        r.cycle();
+        assert_eq!(r.layout_count(), built + 1, "reparenting rebuilds the rows");
+        assert_eq!(r.display_pids(), vec![1, 2, 42]);
+
+        r.select_pid(2);
+        r.toggle_collapse();
+        assert_eq!(r.layout_count(), built + 2, "a collapse change rebuilds");
+    }
+
+    #[test]
+    fn collapsed_row_series_is_the_sum_of_member_series_and_scrolls() {
+        let mut r = Replayer::from_stream(stream(
+            r"
+            cycle 0
+              10 comm=parent cmd=/srv/parent ticks=0
+              11 ppid=10 comm=a cmd=/srv/a ticks=0
+              12 ppid=10 comm=b cmd=/srv/b ticks=0
+
+            cycle +1s
+              10 ticks=+10
+              11 ticks=+20
+              12 ticks=+5
+
+            cycle +1s
+              10 ticks=+0
+              11 ticks=+0
+              12 ticks=+30
+
+            cycle +1s
+              12 ticks=+0
+
+            cycle +1s
+            ",
+        ));
+        r.cycle();
+        r.cycle();
+        r.select_pid(10);
+        r.toggle_collapse();
+        let sum = |r: &Replayer| {
+            let mut out = [crate::gather::SeriesCell::default(); crate::gather::SPARK_CELLS];
+            for pid in [10, 11, 12] {
+                let series = r.app.cpu_series(pid).expect("tracked");
+                for (acc, cell) in out.iter_mut().zip(series.0) {
+                    acc.add(cell);
+                }
+            }
+            out
+        };
+        assert_eq!(r.row_series(10).unwrap().0, sum(&r));
+        assert_eq!(
+            r.row_series(10).unwrap().rates().last().copied(),
+            Some(3_500)
+        );
+
+        // Subsequent cycles push the row's own sample and stay equal to the member sum.
+        r.cycle();
+        assert_eq!(r.row_series(10).unwrap().0, sum(&r));
+        r.cycle();
+        assert_eq!(r.row_series(10).unwrap().0, sum(&r));
+        r.cycle();
+        assert_eq!(r.row_series(10).unwrap().0, sum(&r));
+        assert_eq!(
+            r.row_series(10).unwrap().rates().last().copied(),
+            Some(0),
+            "quiet cycle scrolls a zero in"
+        );
+
+        // A rebuild (expand, collapse again) reconstructs the same series from the members.
+        r.toggle_collapse();
+        r.toggle_collapse();
+        assert_eq!(r.row_series(10).unwrap().0, sum(&r));
+    }
+
+    #[test]
+    fn a_dying_top_member_does_not_erase_the_groups_sparkline_history() {
+        let mut r = Replayer::from_stream(stream(&format!(
+            r"
+            cycle 0
+              1 comm=init
+              2 ppid=1 comm=launcher cmd=/bin/launcher
+              3 ppid=1 comm=svc cmd=/bin/svc
+              10 ppid=2 start=10 comm=foo {FOO} ticks=0
+              11 ppid=10 start=11 comm=foo {FOO} ticks=0
+              14 ppid=10 start=14 comm=foo {FOO} ticks=0
+              12 ppid=3 start=12 comm=foo {FOO} ticks=0
+              13 ppid=12 start=13 comm=foo {FOO} ticks=0
+
+            cycle +1s
+              10 ticks=+10
+              12 ticks=+20
+
+            cycle +1s
+              10 ticks=+10
+              12 ticks=+20
+
+            cycle +1s
+              - 13
+              - 12
+
+            cycle +1s
+            "
+        )));
+        for _ in 0..3 {
+            r.cycle();
+        }
+        let before = r.row_series(10).unwrap().rates();
+        assert_eq!(before[crate::gather::SPARK_CELLS - 2..], [3_000, 3_000]);
+        r.cycle();
+        assert_eq!(r.totals(10).count, 3, "top member 12 left the group");
+        let after = r.row_series(10).unwrap().rates();
+        let n = crate::gather::SPARK_CELLS;
+        assert_eq!(
+            after[n - 4..],
+            [0, 3_000, 3_000, 0],
+            "the dead top member's past stays in the row's history"
+        );
+    }
+
+    #[test]
+    fn a_root_that_moves_out_of_the_hidden_set_takes_its_history_along() {
+        let mut r = Replayer::from_stream(stream(&format!(
+            r"
+            cycle 0
+              1 comm=init cmd=/sbin/init
+              2 ppid=1 comm=shell cmd=/bin/shell ticks=0
+              10 ppid=2 start=10 comm=foo {FOO} ticks=0
+              11 ppid=10 start=11 comm=foo {FOO} ticks=0
+              12 ppid=10 start=12 comm=foo {FOO} ticks=0
+              20 ppid=1 start=20 comm=foo {FOO} ticks=0
+
+            cycle +1s
+              10 ticks=+10
+              20 ticks=+5
+
+            cycle +1s
+              10 ticks=+10
+              20 ticks=+5
+            "
+        )));
+        for _ in 0..3 {
+            r.cycle();
+        }
+        // The group row (anchored at the shallower top, 20) sums both tops.
+        let sum = r.row_series(20).unwrap().rates();
+        let n = crate::gather::SPARK_CELLS;
+        assert_eq!(sum[n - 2..], [1_500, 1_500]);
+
+        // The shell collapses and takes top 10 into its own hidden set: the group keeps 20 only.
+        r.select_pid(2);
+        r.toggle_collapse();
+        assert_eq!(r.display_pids(), vec![1, 2, 20]);
+        let group = r.row_series(20).unwrap();
+        assert_eq!(group.rates()[n - 2..], [500, 500]);
+        assert_eq!(group, r.app.cpu_series(20).unwrap());
+        assert_eq!(r.row_series(2).unwrap().rates()[n - 2..], [1_000, 1_000]);
+    }
+
+    #[test]
+    fn selection_follows_its_process_into_a_group_that_forms_over_it() {
+        let mut r = Replayer::from_stream(stream(&format!(
+            r"
+            cycle 0
+              1 comm=init
+              2 ppid=1 comm=launcher cmd=/bin/launcher
+              10 ppid=2 start=10 comm=foo {FOO}
+              11 ppid=10 start=11 comm=foo {FOO}
+              30 ppid=1 comm=other cmd=/bin/other
+
+            cycle +1s
+              + 12 ppid=10 start=12 comm=foo {FOO}
+            "
+        )));
+        r.cycle();
+        assert_eq!(r.display_pids(), vec![1, 2, 10, 11, 30]);
+        r.select_pid(11);
+        r.cycle();
+        // The three-member group folds over the selected process; the stale index would land on
+        // the unrelated row below.
+        assert_eq!(r.display_pids(), vec![1, 2, 10, 30]);
+        assert!(matches!(
+            r.app.rows()[r.app.selected()].kind,
+            RowKind::Group { .. }
+        ));
+    }
+
+    #[test]
+    fn kthreadd_stays_expanded_after_the_users_last_choice() {
+        let mut r = Replayer::from_stream(stream(
+            r"
+            cycle 0
+              2 uid=0 start=2 kthread=true comm=kthreadd
+              3 ppid=2 uid=0 start=3 kthread=true comm=kworker/0:0
+
+            cycle +1s
+            ",
+        ));
+        r.cycle();
+        r.select_pid(2);
+        for expect_expanded in [true, false, true] {
+            r.toggle_collapse();
+            assert_eq!(r.display_pids().len() > 1, expect_expanded);
+        }
+        r.cycle();
+        assert_eq!(r.display_pids().len(), 2, "a rebuild keeps the last choice");
+    }
+
+    #[test]
+    fn memory_falls_back_per_process_and_marks_it() {
+        let dir = std::env::temp_dir().join(format!("oya-pss-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("11")).unwrap();
+        // Process 11 reads as 40 MiB proportional at 100 MiB resident; 12 has no smaps rollup.
+        std::fs::write(
+            dir.join("11/smaps_rollup"),
+            "Rss: 102400 kB\nPss: 40960 kB\nShared_Clean: 102400 kB\nShared_Dirty: 0 kB\n\
+             Private_Clean: 0 kB\nPrivate_Dirty: 0 kB\n",
+        )
+        .unwrap();
+        let mut r = Replayer::from_stream(stream(
+            r"
+            cycle 0
+              10 comm=parent cmd=/srv/parent mem=100M
+              11 ppid=10 comm=a cmd=/srv/a mem=100M
+              12 ppid=10 comm=b cmd=/srv/b mem=100M
+
+            cycle +1s
+            ",
+        ));
+        r.app
+            .set_memory(crate::application::MemorySampler::with_root(dir.clone()));
+        r.cycle();
+
+        // Before any sampling every row is a resident-set fallback, flagged.
+        assert!(r.totals(11).mem_estimated);
+        let before = r.render_text(100, 12);
+        let row = before.lines().find(|l| l.contains("/srv/a")).unwrap();
+        assert!(row.contains("~100.0M"), "{row}");
+
+        assert!(r.app.prepare_visible_rows(10), "sampling changed numbers");
+        let after = r.render_text(100, 12);
+        let sampled = after.lines().find(|l| l.contains("/srv/a")).unwrap();
+        assert!(
+            sampled.contains("40.0M") && !sampled.contains('~'),
+            "{sampled}"
+        );
+        let unreadable = after.lines().find(|l| l.contains("/srv/b")).unwrap();
+        assert!(unreadable.contains("~100.0M"), "{unreadable}");
+
+        // The same viewport at the same generation samples nothing more.
+        assert!(!r.app.prepare_visible_rows(10));
+
+        // A parent folds its children's marker in: one fallback child marks the whole sum.
+        r.select_pid(10);
+        r.toggle_collapse();
+        let t = r.totals(10);
+        assert!(t.mem_estimated);
+        assert_eq!(t.mem_bytes, (100 + 40 + 100) * 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn chromium_group_stream() -> oya_stream::Stream {
@@ -859,7 +1417,7 @@ mod tests {
         r.select_pid(10);
         r.toggle_collapse();
         // The group row plus its reconstructed member forest (root then helpers).
-        assert_eq!(r.display_pids(), vec![10, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(r.display_pids(), vec![10, 11, 12, 13, 14, 15]);
         assert!(!r.row_collapsed(10));
     }
 
@@ -869,10 +1427,10 @@ mod tests {
         r.cycle();
         r.select_pid(200);
         r.toggle_collapse();
-        assert_eq!(r.display_pids(), vec![200, 200, 201, 202]);
+        assert_eq!(r.display_pids(), vec![200, 201, 202]);
 
         r.cycle();
-        assert_eq!(r.display_pids(), vec![200, 200, 201, 202]);
+        assert_eq!(r.display_pids(), vec![200, 201, 202]);
         assert!(
             !r.row_collapsed(200),
             "expansion follows the identity across cycles"
@@ -905,7 +1463,7 @@ mod tests {
         r.cycle();
         r.select_pid(200);
         r.toggle_collapse();
-        assert_eq!(r.display_pids(), vec![200, 200, 201, 202]);
+        assert_eq!(r.display_pids(), vec![200, 201, 202]);
 
         r.cycle();
         assert_eq!(r.display_pids(), Vec::<u32>::new());
@@ -937,7 +1495,7 @@ mod tests {
         r.select_pid(200);
         r.toggle_collapse();
 
-        assert_eq!(r.display_pids(), vec![200, 200, 201, 202]);
+        assert_eq!(r.display_pids(), vec![200, 201, 202]);
         assert!(!r.row_collapsed(200));
         let screen = r.render(80, 16);
         assert!(screen.text().contains("/usr/bin/daemon"));
@@ -967,10 +1525,7 @@ mod tests {
 
         r.select_pid(300);
         r.toggle_collapse();
-        assert_eq!(
-            r.display_pids(),
-            vec![300, 300, 301, 305, 306, 302, 303, 304]
-        );
+        assert_eq!(r.display_pids(), vec![300, 301, 305, 306, 302, 303, 304]);
         assert!(!r.row_collapsed(300));
     }
 
@@ -981,12 +1536,12 @@ mod tests {
         // Delta: user=80, sys=40, idle=280 out of 400 total → 20% user, 10% sys.
         let stream = stream(
             r"
-            cycle 0 stat_idle=10000 mem=8G mem_available=6G mem_buffers=256M mem_cached=256M swap_total=4G swap_free=4G load=125,75,50 uptime=3600
+            cycle 0 stat_idle=10000 mem=8G mem_available=6G mem_free=2G swap_total=4G swap_free=4G runnable=2 psi_cpu=0 psi_memory=0 pswpin=0
               1 uid=0 comm=init cmd=/sbin/init
               42 ppid=1 comm=hot cmd=/usr/bin/hot
               100 comm=batch cmd=/opt/batch
 
-            cycle +1s stat_user=+80 stat_system=+40 stat_idle=+280 mem_available=5G swap_free=3872M load=150,100,80 uptime=3660
+            cycle +1s stat_user=+80 stat_system=+40 stat_idle=+280 mem_available=5G swap_free=3872M psi_cpu=+100000 psi_memory=+0 pswpin=+10
               1 ticks=1
               42 ticks=50 mem=64M
               100 ticks=5 mem=12M
@@ -994,14 +1549,37 @@ mod tests {
         );
 
         let mut r = Replayer::from_stream(stream);
+        r.set_header_width(80);
         r.cycle();
         r.cycle();
 
         let screen = r.render(80, 24);
-        assert!(screen.row(0).contains("CPU["));
-        assert!(screen.row(1).contains("Mem["));
-        assert!(screen.row(2).contains("Load:"));
-        assert!(screen.row(3).contains("PID"));
+        // 1.2 busy cores (user 80 + sys 40 of 400 jiffies on 4), 0.4 of them kernel; CPU
+        // stalled 100 ms of the 1 s window = 10%.
+        let cpu = screen.row(0);
+        assert!(cpu.starts_with("CPU 1.2/4  wait  10%  sys 0.4"), "{cpu:?}");
+        assert!(
+            cpu.contains("▅"),
+            "1.2 of a 2-core scale, one interval: {cpu:?}"
+        );
+        assert!(
+            cpu.contains(" /2 1s"),
+            "scale label covers the one drawn cell: {cpu:?}"
+        );
+        let mem = screen.row(1);
+        assert!(mem.starts_with("Mem ["), "{mem:?}");
+        // used 3G of 8G, free 2G, cache 3G. Slots are fixed-width; at 80 columns the bars get
+        // their guaranteed share and the lower-priority slots (swap-in rate, ...) are dropped.
+        assert!(
+            mem.contains("]   3.0G/8.0G  avail   5.0G  wait   0%  Swap ["),
+            "{mem:?}"
+        );
+        assert!(mem.contains("] 224.0M/4.0G"), "{mem:?}");
+        assert!(!mem.contains(" in "), "swap-in slot dropped at 80: {mem:?}");
+        for glyph in ['⣿', '⣤'] {
+            assert!(mem.contains(glyph), "bar glyph {glyph}: {mem:?}");
+        }
+        assert!(screen.row(2).contains("PID"));
         assert!(screen.row(BODY_TOP).contains("/sbin/init"));
         assert!(screen.text().contains("/usr/bin/hot"));
         assert!(screen.text().contains("/opt/batch"));
@@ -1045,6 +1623,11 @@ mod tests {
             screen.bg_at_text(hot_row, "/usr/bin/hot"),
             vt_color(palette::SELECTION_BG)
         );
+        // The stream never names a wait, so the sparkline has no measurement: its glyph is the
+        // neutral tone (not the calm end of the pressure ramp), at the height of 50% of a core.
+        let spark = screen.newest_spark_cell(hot_row);
+        assert_eq!(spark.contents(), "▅");
+        assert_eq!(spark.fgcolor(), vt_color(palette::WAIT_UNKNOWN));
         assert_eq!(
             screen.fg_at_text(hot_row, "R"),
             vt_color(palette::state(b'R'))
@@ -1052,6 +1635,84 @@ mod tests {
 
         r.move_down();
         assert_eq!(r.selected_pid(), Some(42));
+    }
+
+    #[test]
+    fn row_sparkline_color_is_the_wait_share_and_height_is_log_cpu() {
+        let mut r = Replayer::from_stream(stream(
+            r"
+            cycle 0
+              1 uid=0 comm=init cmd=/sbin/init
+              40 ppid=1 comm=calm cmd=/usr/bin/calm ticks=0 wait=0
+              41 ppid=1 comm=starved cmd=/usr/bin/starved ticks=0 wait=0
+              42 ppid=1 comm=unmeasured cmd=/usr/bin/unmeasured ticks=0
+              43 ppid=1 comm=waitonly cmd=/usr/bin/waitonly ticks=0 wait=0
+
+            cycle +1s
+              40 ticks=+20 wait=+0
+              41 ticks=+20 wait=+20
+              42 ticks=+20
+              43 wait=+30
+            ",
+        ));
+        r.cycle();
+        r.cycle();
+        let screen = r.render(100, 16);
+        let spark = |name: &str| {
+            let cell = screen.newest_spark_cell(row_containing(&screen, name));
+            (cell.contents(), cell.fgcolor())
+        };
+        // 20 ticks over 100 jiffies = 20% of a core: level 3 on the shared ladder.
+        assert_eq!(
+            spark("/usr/bin/calm"),
+            ("▃", vt_color(palette::pressure(0)))
+        );
+        // Waited as long as it ran: 50% of the time it wanted a CPU, it was queued.
+        assert_eq!(
+            spark("/usr/bin/starved"),
+            ("▃", vt_color(palette::pressure(5000)))
+        );
+        assert_eq!(
+            spark("/usr/bin/unmeasured"),
+            ("▃", vt_color(palette::WAIT_UNKNOWN))
+        );
+        // Never ran, only queued: not idle — the lowest block, fully waiting.
+        assert_eq!(
+            spark("/usr/bin/waitonly"),
+            ("▁", vt_color(palette::pressure(10_000)))
+        );
+    }
+
+    #[test]
+    fn collapsed_row_wait_share_is_summed_wait_over_summed_wait_plus_run() {
+        let mut r = Replayer::from_stream(stream(
+            r"
+            cycle 0
+              10 comm=parent cmd=/srv/parent ticks=0 wait=0
+              11 ppid=10 comm=a cmd=/srv/a ticks=0 wait=0
+              12 ppid=10 comm=b cmd=/srv/b ticks=0 wait=0
+              13 ppid=10 comm=c cmd=/srv/c ticks=0
+
+            cycle +1s
+              10 ticks=+0
+              11 ticks=+90 wait=+10
+              12 ticks=+5 wait=+5
+              13 ticks=+40
+            ",
+        ));
+        r.cycle();
+        r.cycle();
+        r.select_pid(10);
+        r.toggle_collapse();
+        let cell = *r.row_series(10).unwrap().0.last().unwrap();
+        // 13 is unmeasured: it adds to the height but to neither side of the share.
+        assert_eq!(cell.rate, 13_500);
+        assert_eq!(cell.waiting, crate::gather::Waiting { wait: 15, run: 95 });
+        assert_eq!(cell.waiting.share_bp(), Some(1363));
+        // The rebuilt-from-members series agrees (collapse again → recomputed).
+        r.toggle_collapse();
+        r.toggle_collapse();
+        assert_eq!(*r.row_series(10).unwrap().0.last().unwrap(), cell);
     }
 
     /// Ad-hoc perf probe over a real capture. Times `App::gather` (the full per-cycle grouping

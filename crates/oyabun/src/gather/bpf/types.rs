@@ -31,6 +31,7 @@ pub struct TaskInfo {
     pub stime_ns: u64,
     pub start_boottime_ns: u64,
     pub rss_pages: i64,
+    pub wait_ns: u64,
     pub pid: u32,
     pub tgid: u32,
     pub ppid: u32,
@@ -46,7 +47,7 @@ pub struct TaskInfo {
 }
 
 const _: () = assert!(
-    size_of::<TaskInfo>() == 88,
+    size_of::<TaskInfo>() == 96,
     "TaskInfo must match oya_task_info"
 );
 const _: () = assert!(align_of::<TaskInfo>() == 8);
@@ -65,20 +66,6 @@ const _: () = assert!(
     "ProcEvent must match oya_proc_event"
 );
 
-/// Nanoseconds per clock tick — the divisor turning kernel ns into `/proc`-style jiffies.
-/// Computed **once** from `CLK_TCK` (constant for the process) and stored by the source, so the
-/// per-row conversion is a single division, not this plus the `1e9/CLK_TCK` division each time.
-/// `CLK_TCK` is ~always 100 (⇒ 10 ms), where the division is exact, matching the kernel's
-/// `nsec_to_clock_t`. A non-dividing `CLK_TCK` rounds slightly; immaterial to CPU% (already
-/// ±1-jiffy quantized) and to start-time identity (a mismatch only makes `kill` refuse — safe).
-///
-/// If profiling ever shows the per-row `ns / ns_per_tick` division is hot (unlikely: ~2 per
-/// process per cycle at a ~2 Hz interval), the divisor is a single value — swap in a precomputed
-/// libdivide-style magic multiply+shift here without touching call sites.
-pub fn ns_per_tick(clk_tck: u64) -> u64 {
-    (1_000_000_000 / clk_tck.max(1)).max(1)
-}
-
 impl TaskInfo {
     /// Thread-group `utime + stime` in clock ticks (the CPU% delta input, same unit as the
     /// stat parser). The BPF program walks the thread list to match `/proc/<pid>/stat`.
@@ -88,6 +75,13 @@ impl TaskInfo {
 
     /// Start time in clock ticks since boot — `/proc` stat field 22, the PID-reuse /
     /// kill-verification discriminator. Must equal what `sys::kill_verified` reads.
+    /// Live-thread scheduler wait in clock ticks — the same unit as [`ticks`](Self::ticks), so
+    /// wait and run divide exactly. Converting the *cumulative* ns (not each delta) means the
+    /// per-interval tick deltas telescope: sub-tick waits are carried, never dropped.
+    fn wait_ticks(&self, ns_per_tick: u64) -> u64 {
+        self.wait_ns / ns_per_tick
+    }
+
     fn start_time_ticks(&self, ns_per_tick: u64) -> u64 {
         self.start_boottime_ns / ns_per_tick
     }
@@ -113,9 +107,9 @@ impl TaskInfo {
     }
 
     /// Fill a process row's identity + volatile stat fields **and uid** (the BPF source owns
-    /// uid, unlike the `/proc` path where `ProcTable` reads it). `cpu_pct`/`cpu_peak`, the
+    /// uid, unlike the `/proc` path where `ProcTable` reads it). `cpu_pct`/`cpu_now`, the
     /// cmdline handle, and tree links are set by later stages, exactly as for the stat path.
-    /// `ns_per_tick` is the source's precomputed ns→tick divisor (see [`ns_per_tick`]).
+    /// `ns_per_tick` is the source's precomputed ns→tick divisor (see [`crate::gather::ns_per_tick`]).
     pub fn write_into(&self, e: &mut ProcessEntry, page_size: u64, ns_per_tick: u64) {
         e.pid = self.pid;
         e.ppid = self.ppid;
@@ -125,6 +119,7 @@ impl TaskInfo {
         e.nice = self.nice();
         e.num_threads = self.nr_threads;
         e.ticks = self.ticks(ns_per_tick);
+        e.wait_ticks = Some(self.wait_ticks(ns_per_tick));
         e.start_time = self.start_time_ticks(ns_per_tick);
         let pages = u64::try_from(self.rss_pages).unwrap_or(0); // transient negatives → 0
         e.mem_bytes = pages.saturating_mul(page_size);
@@ -162,6 +157,7 @@ fn state_char(state: u32, exit_state: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gather::ns_per_tick;
 
     #[test]
     fn state_chars_match_proc() {
@@ -184,6 +180,7 @@ mod tests {
             stime_ns: 80_000_000, // 8 ticks
             start_boottime_ns: 1_200_106_100_000_000,
             rss_pages: 0,
+            wait_ns: 25_000_000, // 2 ticks (the 5 ms remainder is carried by the cumulative)
             pid: 1,
             tgid: 1,
             ppid: 0,
@@ -199,6 +196,7 @@ mod tests {
         };
         let npt = ns_per_tick(100); // 10_000_000
         assert_eq!(ti.ticks(npt), 15);
+        assert_eq!(ti.wait_ticks(npt), 2);
         assert_eq!(ti.start_time_ticks(npt), 120_010_610);
         assert_eq!(ti.priority(), 20);
         assert_eq!(ti.nice(), 0);

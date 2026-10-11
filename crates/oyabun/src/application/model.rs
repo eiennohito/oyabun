@@ -1,8 +1,7 @@
 use crate::application::DesktopResolver;
 use crate::fxhash::FxMap;
 use crate::identity::{IdentityKind, ProcessIdentity};
-use crate::procs::{GpuMetrics, ProcessEntry};
-use std::collections::VecDeque;
+use crate::procs::{NONE, ProcessEntry};
 
 /// Minimum members before a group is worth folding: a two-process group saves one row at the cost
 /// of hiding one, which is not worth it.
@@ -18,42 +17,26 @@ pub(crate) struct AppGroupKey {
 pub(crate) struct AppGroup {
     pub(crate) key: AppGroupKey,
     pub(crate) representative: usize,
-    pub(crate) members: Vec<usize>,
     pub(crate) label: String,
     pub(crate) owner_uid: u32,
     /// Cross-run-stable key for persisting a fold preference, or `None` when the identity is
     /// ephemeral (container/pod ids, structural tokens) and folds stay session-only.
     pub(crate) persist_key: Option<String>,
-    pub(crate) threads: u32,
-    pub(crate) cpu_pct: u32,
-    pub(crate) cpu_peak: u32,
-    pub(crate) mem_bytes: u64,
-    pub(crate) gpu: Option<GpuMetrics>,
+    /// The top member whose subtree contains the representative: where the group's row sits.
+    pub(crate) anchor_top: usize,
+}
+
+/// A process's place in a group: which one, and whether it is a top member of it.
+#[derive(Clone, Copy)]
+struct Membership {
+    group: usize,
+    top: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct ApplicationGroups {
     groups: Vec<AppGroup>,
-    member_group: Vec<Option<usize>>,
-    peaks: FxMap<AppGroupKey, GroupCpuHistory>,
-    /// Metadata epoch the current grouping reflects; `None` until the first regroup.
-    epoch: Option<u64>,
-}
-
-#[derive(Default)]
-struct GroupCpuHistory {
-    samples: VecDeque<u32>,
-}
-
-impl GroupCpuHistory {
-    fn push(&mut self, sample: u32) -> u32 {
-        const WINDOW: usize = 10;
-        if self.samples.len() == WINDOW {
-            self.samples.pop_front();
-        }
-        self.samples.push_back(sample);
-        self.samples.iter().copied().max().unwrap_or(0)
-    }
+    membership: Vec<Option<Membership>>,
 }
 
 struct Candidate {
@@ -67,28 +50,21 @@ struct Candidate {
 }
 
 impl ApplicationGroups {
-    /// Refresh the application grouping for this cycle. Membership, labels, and keys are a pure
-    /// function of the per-process identities and so are recomputed only when the metadata
-    /// `epoch` moves (an unchanged epoch also means an unchanged pid set, hence unchanged proc
-    /// indices, since the process buffer is pid-sorted). The aggregated metrics move every cycle
-    /// regardless, so they are always refreshed over the current buffer.
+    /// Regroup: bucket processes by identity into groups (membership, representative, label,
+    /// keys, top members). Membership, labels, keys, and top members are a pure function of the
+    /// per-process identities and the tree shape, so the caller runs this only when the
+    /// metadata epoch moves (an unchanged epoch also means an unchanged pid set and parent
+    /// links, hence unchanged proc indices, since the process buffer is pid-sorted). Per-cycle
+    /// numbers are not kept here: the view sums them over whatever each row hides.
     pub(crate) fn rebuild<'a>(
         &mut self,
         procs: &[ProcessEntry],
         identities: impl IntoIterator<Item = (usize, &'a ProcessIdentity)>,
         resolver: &mut DesktopResolver,
-        gpu_for_pid: impl Fn(u32) -> Option<GpuMetrics>,
-        epoch: u64,
     ) {
-        if self.epoch != Some(epoch) {
-            self.epoch = Some(epoch);
-            self.regroup(procs, identities, resolver);
-        }
-        self.reaggregate(procs, &gpu_for_pid);
+        self.regroup(procs, identities, resolver);
     }
 
-    /// Bucket processes by identity into groups (membership, representative, label, keys). Runs
-    /// only on a moved epoch; leaves the metric fields zeroed for [`reaggregate`](Self::reaggregate).
     fn regroup<'a>(
         &mut self,
         procs: &[ProcessEntry],
@@ -115,8 +91,8 @@ impl ApplicationGroups {
         }
 
         self.groups.clear();
-        self.member_group.clear();
-        self.member_group.resize(procs.len(), None);
+        self.membership.clear();
+        self.membership.resize(procs.len(), None);
         for (key, mut members) in buckets {
             // Tiny groups aren't worth a row; a terminal member (each shell/tab is its own
             // workspace) means folding would hide what the user is actively doing.
@@ -148,70 +124,93 @@ impl ApplicationGroups {
             let representative = representative.proc_idx;
 
             let member_indices: Vec<usize> = members.iter().map(|m| m.proc_idx).collect();
-            let group_idx = self.groups.len();
+            let group = self.groups.len();
             for &idx in &member_indices {
-                self.member_group[idx] = Some(group_idx);
+                self.membership[idx] = Some(Membership { group, top: true });
             }
+            // A member with a member ancestor is not a top. The walk passes through foreign
+            // intermediates, not just the direct parent, or a nested member would double count.
+            for &idx in &member_indices {
+                if self.member_ancestor(procs, idx, group).is_some() {
+                    self.membership[idx] = Some(Membership { group, top: false });
+                }
+            }
+            let anchor_top = self
+                .topmost_member_ancestor(procs, representative, group)
+                .unwrap_or(representative);
             self.groups.push(AppGroup {
                 key,
                 representative,
-                members: member_indices,
                 label,
                 owner_uid,
                 persist_key,
-                threads: 0,
-                cpu_pct: 0,
-                cpu_peak: 0,
-                mem_bytes: 0,
-                gpu: None,
+                anchor_top,
             });
         }
-        let live: std::collections::HashSet<_> =
-            self.groups.iter().map(|g| g.key.clone()).collect();
-        self.peaks.retain(|key, _| live.contains(key));
     }
 
-    /// Recompute each group's aggregated metrics (threads, CPU, memory, GPU) and push the CPU
-    /// peak window from the current process buffer. Runs every cycle — these values move even
-    /// when membership does not.
-    fn reaggregate(
-        &mut self,
-        procs: &[ProcessEntry],
-        gpu_for_pid: &impl Fn(u32) -> Option<GpuMetrics>,
-    ) {
-        let Self { groups, peaks, .. } = self;
-        for group in groups.iter_mut() {
-            let mut threads = 0u32;
-            let mut cpu_pct = 0u32;
-            let mut mem_bytes = 0u64;
-            let mut gpu = None;
-            for &idx in &group.members {
-                let proc = &procs[idx];
-                threads = threads.saturating_add(proc.num_threads);
-                cpu_pct = cpu_pct.saturating_add(proc.cpu_pct);
-                mem_bytes = mem_bytes.saturating_add(proc.mem_bytes);
-                if let Some(sample) = gpu_for_pid(proc.pid) {
-                    gpu = Some(gpu.map_or(sample, |sum: GpuMetrics| sum.saturating_add(sample)));
-                }
+    /// The nearest proper ancestor of `idx` that belongs to `group`, if any. Bounded by the
+    /// process count so a (corrupt) parent cycle cannot loop.
+    fn member_ancestor(&self, procs: &[ProcessEntry], idx: usize, group: usize) -> Option<usize> {
+        let mut ancestor = procs[idx].parent_idx;
+        for _ in 0..procs.len() {
+            if ancestor == NONE {
+                return None;
             }
-            group.threads = threads;
-            group.cpu_pct = cpu_pct;
-            group.mem_bytes = mem_bytes;
-            group.cpu_peak = peaks.entry(group.key.clone()).or_default().push(cpu_pct);
-            group.gpu = gpu;
+            let a = ancestor as usize;
+            if self.membership[a].is_some_and(|m| m.group == group) {
+                return Some(a);
+            }
+            ancestor = procs[a].parent_idx;
         }
+        None
+    }
+
+    /// The topmost member of `group` among `idx` and its ancestors.
+    fn topmost_member_ancestor(
+        &self,
+        procs: &[ProcessEntry],
+        idx: usize,
+        group: usize,
+    ) -> Option<usize> {
+        let mut top = self.membership[idx]
+            .is_some_and(|m| m.group == group)
+            .then_some(idx);
+        let mut ancestor = procs[idx].parent_idx;
+        for _ in 0..procs.len() {
+            if ancestor == NONE {
+                break;
+            }
+            let a = ancestor as usize;
+            if self.membership[a].is_some_and(|m| m.group == group) {
+                top = Some(a);
+            }
+            ancestor = procs[a].parent_idx;
+        }
+        top
     }
 
     pub(crate) fn groups(&self) -> &[AppGroup] {
         &self.groups
     }
 
-    pub(crate) fn groups_mut(&mut self) -> &mut [AppGroup] {
-        &mut self.groups
+    /// The group `proc_idx` belongs to, if any.
+    pub(crate) fn member_group(&self, proc_idx: usize) -> Option<usize> {
+        self.membership
+            .get(proc_idx)
+            .copied()
+            .flatten()
+            .map(|m| m.group)
     }
 
-    pub(crate) fn member_group(&self, proc_idx: usize) -> Option<usize> {
-        self.member_group.get(proc_idx).copied().flatten()
+    /// The group `proc_idx` is a *top* member of (no member ancestor), if any.
+    pub(crate) fn top_group(&self, proc_idx: usize) -> Option<usize> {
+        self.membership
+            .get(proc_idx)
+            .copied()
+            .flatten()
+            .filter(|m| m.top)
+            .map(|m| m.group)
     }
 }
 
@@ -323,7 +322,7 @@ mod tests {
         resolver: &mut DesktopResolver,
         identities: impl IntoIterator<Item = (usize, &'a ProcessIdentity)>,
     ) {
-        groups.rebuild(procs, identities, resolver, |_| None, 1);
+        groups.rebuild(procs, identities, resolver);
     }
 
     #[test]
@@ -386,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn regroup_is_epoch_driven_but_metrics_still_refresh() {
+    fn rebuild_replaces_the_previous_grouping() {
         let procs = vec![proc(1, 1000), proc(2, 1000), proc(3, 1000)];
         let ids = [
             desktop_id("foo", true),
@@ -395,39 +394,37 @@ mod tests {
         ];
         let mut resolver = DesktopResolver::with_roots(Vec::new(), FxMap::default());
         let mut groups = ApplicationGroups::default();
-        groups.rebuild(&procs, ids.iter().enumerate(), &mut resolver, |_| None, 5);
+        groups.rebuild(&procs, ids.iter().enumerate(), &mut resolver);
         assert_eq!(groups.groups().len(), 1);
-
-        // Same epoch, but feed no identities: were regroup to run, the group would vanish. The
-        // epoch holds it, and metrics still refresh over the current buffer.
-        groups.rebuild(&procs, std::iter::empty(), &mut resolver, |_| None, 5);
-        assert_eq!(groups.groups().len(), 1);
-        assert_eq!(groups.groups()[0].threads, 6);
-
-        // A moved epoch regroups against the (now empty) identities and drops the group.
-        groups.rebuild(&procs, std::iter::empty(), &mut resolver, |_| None, 6);
+        groups.rebuild(&procs, std::iter::empty(), &mut resolver);
         assert!(groups.groups().is_empty());
     }
 
     #[test]
-    fn group_peak_is_a_window_of_aggregate_samples() {
-        let mut procs = vec![proc(1, 1000), proc(2, 1000), proc(3, 1000)];
+    fn tops_walk_through_foreign_intermediates() {
+        // 1 (member) → 2 (foreign) → 3 (member) → 4 (member); 5 (member) is a separate root.
+        let mut procs: Vec<_> = (1..=5).map(|pid| proc(pid, 1000)).collect();
+        for (child, parent) in [(1, 0), (2, 1), (3, 2)] {
+            procs[child].parent_idx = parent;
+        }
+        let member = |pid| desktop_id("foo", pid == 1);
         let ids = [
-            desktop_id("foo", true),
-            desktop_id("foo", false),
-            desktop_id("foo", false),
+            member(1),
+            desktop_id("bar", false),
+            member(3),
+            member(4),
+            member(5),
         ];
         let mut resolver = DesktopResolver::with_roots(Vec::new(), FxMap::default());
         let mut groups = ApplicationGroups::default();
-        rebuild(&mut groups, &procs, &mut resolver, ids.iter().enumerate());
-        let first_peak = groups.groups()[0].cpu_peak;
-        for proc in &mut procs {
-            proc.cpu_pct = 0;
-        }
-        for _ in 0..10 {
-            rebuild(&mut groups, &procs, &mut resolver, ids.iter().enumerate());
-        }
-        assert!(first_peak > 0);
-        assert_eq!(groups.groups()[0].cpu_peak, 0);
+        groups.rebuild(&procs, ids.iter().enumerate(), &mut resolver);
+        assert_eq!(groups.groups().len(), 1);
+        // Process 4 and 3 sit below member 1 (through foreign 2 and directly), so only 1 and 5
+        // are tops.
+        assert_eq!(groups.top_group(0), Some(0));
+        assert_eq!(groups.top_group(4), Some(0));
+        assert_eq!(groups.top_group(2), None);
+        assert_eq!(groups.member_group(2), Some(0));
+        assert_eq!(groups.top_group(4), Some(0));
     }
 }

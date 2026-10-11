@@ -1,7 +1,8 @@
 //! Rendering via `etch` (retained-mode, change-tracked).
 //!
 //! Layout (top → bottom):
-//! - System stats header (3 lines): CPU bar, Mem/Swap bars, Load/Tasks/Uptime.
+//! - System header (2 lines, +1 with a GPU): CPU numbers + history graph, then memory and
+//!   pressure leads (see [`crate::header`]; the GPU line is a pair of usage bars).
 //! - Column header (1 line).
 //! - Process list (fills remaining space): htop-style tree in the Command column.
 //! - Footer (1 line): keybinds.
@@ -10,8 +11,12 @@
 //! both the header and every body row. Each body cell binds a value that is *both*
 //! formatted and change-tracked, so an unchanged column does zero work; the Command
 //! column uses a content hash as its change key (the arena offset is not stable across
-//! snapshots) plus the
-//! tree prefix. Collapsed rows show subtree-aggregate CPU%/MEM and a `▸ [+N]` marker.
+//! snapshots) plus the tree prefix.
+//!
+//! A collapsed row (a folded process or application group) shows the sum over everything it
+//! hides, its own TREND sparkline, and a hidden-process badge. A folded group's other top members
+//! emit no row of their own (the group row counts them). The memory column is PSS;
+//! a `~` marker flags a total that includes a per-process resident-set fallback.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -19,11 +24,15 @@ use std::io::Write;
 
 use etch::{Cell, ColSpec, Frame, Rgb, Row, Schema, Style};
 
-use crate::app::{App, DisplayRowKind};
+use crate::app::App;
+use crate::gather::{CpuSeries, SPARK_CELLS};
+use crate::header;
 use crate::palette;
 use crate::procs::{GpuMetric, SystemStats};
+use crate::sparkline::{Level, Scale};
+use crate::view::RowKind;
 
-const CPU_HEADER_LINES: u16 = 3;
+const CPU_HEADER_LINES: u16 = 2;
 
 /// Number of terminal rows consumed by the fixed-startup system header.
 #[must_use]
@@ -36,6 +45,13 @@ pub const fn header_lines(gpu: bool) -> u16 {
 pub const fn chrome_lines(gpu: bool) -> u16 {
     header_lines(gpu) + 2
 }
+
+/// Sparkline column width: one terminal column per history cell.
+#[allow(clippy::cast_possible_truncation)] // bounded by the assert
+const SPARK_COLS: u16 = {
+    assert!(SPARK_CELLS <= u16::MAX as usize);
+    SPARK_CELLS as u16
+};
 
 const HEADER_STYLE: Style = Style::fg(palette::LABEL).bold();
 
@@ -53,13 +69,13 @@ fn column_specs(gpu: bool) -> Vec<ColSpec> {
         ColSpec::right("NI", 1, 3),
         ColSpec::right("THR", 1, 4),
         ColSpec::right("CPU%", 1, 7),
-        ColSpec::right("PEAK", 1, 7),
+        ColSpec::left("TREND", 1, SPARK_COLS),
     ];
     if gpu {
         columns.push(ColSpec::right("GPU%", 1, 7));
         columns.push(ColSpec::right("VRAM", 1, 8));
     }
-    columns.push(ColSpec::right("RSS", 1, 8));
+    columns.push(ColSpec::right("PSS", 1, 8));
     columns.push(ColSpec::fill("Command", 2));
     columns
 }
@@ -71,18 +87,21 @@ pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
     let gpu = app.gpu_available();
     let header_lines = header_lines(gpu);
 
-    // Each stat line is change-tracked on the values that feed it: a width change
-    // forces a full repaint anyway, so the data alone is the change key. On interactive
-    // (non-gather) frames the build closures never run — no `format!`, no allocation.
-    frame.line(0, sys, |l| build_cpu_line(l, &sys, wsz));
-    frame.line(1, sys, |l| build_mem_line(l, &sys, wsz));
+    // Each stat line is keyed on exactly what it draws — the formatted values and, for the
+    // graph, the drawn glyph levels and colors — so an idle machine (every cycle pushes a
+    // graph cell, but the picture is the same) and unrelated changes (CPU numbers vs. the
+    // memory line) repaint nothing. On unchanged frames the build closures never run.
+    let history = app.cpu_history();
+    let layout = app.header_layout();
+    let cpu_line = header::CpuLine::new(&sys, layout, history);
+    frame.line(0, &cpu_line, |l| cpu_line.build(l));
+    let mem_line = header::MemLine::new(&sys, layout);
+    frame.line(1, &mem_line, |l| mem_line.build(l));
     if gpu {
         frame.line(2, (sys, app.empty_gpus()), |l| {
             build_gpu_line(l, &sys, app.empty_gpus(), wsz);
         });
     }
-    let info_row = if gpu { 3 } else { 2 };
-    frame.line(info_row, sys, |l| build_info_line(l, &sys));
     frame.header(header_lines, schema, HEADER_STYLE);
 
     let body_height = height.saturating_sub(chrome_lines(gpu));
@@ -111,104 +130,6 @@ pub fn render<W: Write>(frame: &mut Frame<W>, app: &App, schema: &Schema) {
 // ---------------------------------------------------------------------------
 // System stats header
 // ---------------------------------------------------------------------------
-
-fn build_cpu_line(l: &mut etch::Line, sys: &SystemStats, width: usize) {
-    let busy_bp = sys.cpu_user_bp + sys.cpu_sys_bp + sys.cpu_iowait_bp;
-    let suffix = format!(
-        " {:.1}%]  ({} cores)",
-        system_cpu_pct_on_process_scale(busy_bp, sys.num_cores),
-        sys.num_cores
-    );
-    let label = "CPU[";
-    let bar_width = width.saturating_sub(label.len() + suffix.len()).max(4);
-
-    let user = (sys.cpu_user_bp as usize * bar_width / 10000).min(bar_width);
-    let system = (sys.cpu_sys_bp as usize * bar_width / 10000).min(bar_width - user);
-    let io = (sys.cpu_iowait_bp as usize * bar_width / 10000).min(bar_width - user - system);
-    let empty = bar_width - user - system - io;
-
-    l.span(label, palette::LABEL);
-    l.bar(user, '|', palette::BAR_BUSY);
-    l.bar(system, '|', palette::BAR_SYS);
-    l.bar(io, '|', palette::BAR_IO);
-    l.gap(empty);
-    l.span(&suffix, palette::LABEL);
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn system_cpu_pct_on_process_scale(busy_bp: u32, cores: u32) -> f64 {
-    f64::from(busy_bp) * f64::from(cores) / 100.0
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn build_mem_line(l: &mut etch::Line, sys: &SystemStats, width: usize) {
-    let mem_suffix = format!(" {}/{}]", Mem(sys.mem_used), Mem(sys.mem_total));
-    let swap_suffix = format!(" {}/{}]", Mem(sys.swap_used), Mem(sys.swap_total));
-    let mem_prefix = "Mem[";
-    let swap_prefix = "  Swp[";
-
-    let chrome = mem_prefix.len() + mem_suffix.len() + swap_prefix.len() + swap_suffix.len();
-    let total_bar = width.saturating_sub(chrome).max(8);
-    let mem_bar = total_bar * 2 / 3;
-    let swap_bar = total_bar - mem_bar;
-
-    let used_frac = frac(sys.mem_used, sys.mem_total, 1.0);
-    let cached_frac = frac(sys.mem_cached, sys.mem_total, 1.0 - used_frac);
-    let used_cells = (used_frac * mem_bar as f64) as usize;
-    let cached_cells = (cached_frac * mem_bar as f64) as usize;
-    let mem_empty = mem_bar.saturating_sub(used_cells + cached_cells);
-
-    l.span(mem_prefix, palette::LABEL);
-    l.bar(used_cells, '|', palette::BAR_BUSY);
-    l.bar(cached_cells, '|', palette::BAR_CACHE);
-    l.gap(mem_empty);
-    l.span(&mem_suffix, palette::LABEL);
-
-    let swap_frac = frac(sys.swap_used, sys.swap_total, 1.0);
-    let swap_cells = (swap_frac * swap_bar as f64) as usize;
-    let swap_empty = swap_bar.saturating_sub(swap_cells);
-
-    l.span(swap_prefix, palette::LABEL);
-    l.bar(swap_cells, '|', palette::BAR_SYS);
-    l.gap(swap_empty);
-    l.span(&swap_suffix, palette::LABEL);
-}
-
-/// `num / den` clamped to `[0, cap]`; 0 when `den == 0`.
-#[allow(clippy::cast_precision_loss)]
-fn frac(num: u64, den: u64, cap: f64) -> f64 {
-    if den == 0 {
-        0.0
-    } else {
-        (num as f64 / den as f64).min(cap)
-    }
-}
-
-fn build_info_line(l: &mut etch::Line, sys: &SystemStats) {
-    let total_tasks = sys.tasks_running
-        + sys.tasks_sleeping
-        + sys.tasks_stopped
-        + sys.tasks_zombie
-        + sys.tasks_idle;
-    let text = format!(
-        " Load: {:.2} {:.2} {:.2}  Tasks: {} ({} run, {} slp, {} stp, {} zmb)  Up: {}",
-        f64::from(sys.load[0]) / 100.0,
-        f64::from(sys.load[1]) / 100.0,
-        f64::from(sys.load[2]) / 100.0,
-        total_tasks,
-        sys.tasks_running,
-        sys.tasks_sleeping,
-        sys.tasks_stopped,
-        sys.tasks_zombie,
-        format_uptime(sys.uptime_secs),
-    );
-    l.span(&text, palette::INFO);
-    l.fill(' ');
-}
 
 #[allow(clippy::cast_possible_truncation)]
 fn build_gpu_line(
@@ -310,7 +231,7 @@ fn build_footer(
     l.span(tag, tag_color);
     l.span("] ", palette::FOOTER);
     let text = format!(
-        "Rows: {visible_rows} | q:quit k:kill ↑↓:scroll Enter/→:expand ←:collapse PgUp/PgDn Home/End"
+        "Rows: {visible_rows} | q:quit k:kill ↑↓:scroll Enter/→:expand ←:collapse g:fold app PgUp/PgDn Home/End"
     );
     l.span(&text, palette::FOOTER);
     // A low `RLIMIT_NOFILE` is the only realistic cause; surface it rather than degrade silently.
@@ -363,15 +284,16 @@ fn render_body<W: Write>(
             let depth = row.depth as usize;
             let selected = display_idx == app.selected();
 
+            let totals = app.row_totals(display_idx);
             prefix.clear();
             let prefix_cols = build_prefix(
                 &mut prefix,
                 depth,
-                row.has_children,
-                row.collapsed,
+                row.has_children(),
+                row.is_collapsed(),
                 row.has_next,
                 &guides,
-                if matches!(row.kind, DisplayRowKind::Application { .. }) {
+                if matches!(row.kind, RowKind::Group { .. }) {
                     PrefixKind::Application
                 } else {
                     PrefixKind::Process
@@ -379,82 +301,55 @@ fn render_body<W: Write>(
             );
             advance_guides(&mut guides, depth, row.has_next);
 
+            let bg = selected.then_some(palette::SELECTION_BG);
             let RowView {
                 p,
                 uid,
-                threads,
-                metrics,
                 text,
                 suffix_n,
-                state,
-                nice,
                 key,
                 is_kthread,
                 basename_fg,
             } = match row.kind {
-                DisplayRowKind::Process { proc_idx } => {
+                RowKind::Process { proc_idx } => {
                     let p = &procs[proc_idx];
-                    let metrics = p.effective_metrics(
-                        row.collapsed,
-                        app.gpu_for_pid(p.pid),
-                        app.subtree_gpu_for_pid(p.pid),
-                    );
-                    let suffix_n = if row.collapsed && p.subtree_size > 0 {
-                        p.subtree_size
-                    } else {
-                        0
-                    };
                     RowView {
                         p,
                         uid: p.uid,
-                        threads: p.num_threads,
-                        metrics,
                         text: row_text(app, p),
-                        suffix_n,
-                        state: p.display_state,
-                        nice: p.nice,
+                        // The row itself is shown, so only the descendants are "hidden".
+                        suffix_n: if row.is_collapsed() {
+                            totals.count.saturating_sub(1)
+                        } else {
+                            0
+                        },
                         key: u64::from(p.pid),
                         is_kthread: p.is_kthread,
                         basename_fg: basename_color(p.exe_deleted, p.uses_deleted_lib),
                     }
                 }
-                DisplayRowKind::Application { group_idx } => {
+                RowKind::Group { group_idx } => {
                     let group = app.app_group(group_idx);
-                    let p = &procs[group.representative];
-                    let metrics = crate::procs::RowMetrics {
-                        cpu_pct: group.cpu_pct,
-                        cpu_peak: group.cpu_peak,
-                        mem_bytes: group.mem_bytes,
-                        gpu: group.gpu,
-                    };
-                    let suffix_n = if row.collapsed {
-                        u32::try_from(group.members.len()).unwrap_or(u32::MAX)
-                    } else {
-                        0
-                    };
                     RowView {
-                        p,
+                        p: &procs[group.representative],
                         uid: group.owner_uid,
-                        threads: group.threads,
-                        metrics,
                         text: RowText::GroupLabel {
                             bytes: group.label.as_bytes(),
                             non_ascii: !group.label.is_ascii(),
                         },
-                        suffix_n,
-                        state: p.display_state,
-                        nice: p.nice,
+                        suffix_n: totals.count,
                         key: application_row_key(&group.key),
                         is_kthread: false,
                         basename_fg: palette::BASENAME,
                     }
                 }
             };
+            let (state, nice) = (p.display_state, p.nice);
+            let (threads, series) = (totals.threads, app.row_series(display_idx));
 
             // Selection is the only row-level color: a distinct background, applied to every
             // cell. A change flips the row-level style below, forcing a full-row repaint (so
             // the bg reaches every cell); otherwise each cell is change-tracked and colored independently.
-            let bg = selected.then_some(palette::SELECTION_BG);
             let cmd = CommandCell {
                 prefix: prefix.as_str(),
                 prefix_cols,
@@ -471,20 +366,24 @@ fn render_body<W: Write>(
                 r.styled_field(nice, cell(Some(palette::nice(nice)), bg));
                 r.styled_field(threads, cell(palette::threads(threads), bg));
                 r.styled_field(
-                    Pct(metrics.cpu_pct),
-                    cell(Some(palette::cpu(metrics.cpu_pct)), bg),
+                    Pct(totals.cpu_pct),
+                    cell(Some(palette::cpu(totals.cpu_pct)), bg),
                 );
-                r.styled_field(
-                    Pct(metrics.cpu_peak),
-                    cell(Some(palette::cpu(metrics.cpu_peak)), bg),
-                );
+                // Style = the row's bg only; each glyph carries its own foreground.
+                r.cell(Spark(series), |c: &mut Cell| Spark(series).write(c));
                 if app.gpu_process_available() {
-                    write_gpu_fields(r, metrics.gpu, app.gpu_process_sample_available(), bg);
+                    write_gpu_fields(r, totals.gpu, app.gpu_process_sample_available(), bg);
                 }
-                r.styled_field(
-                    Mem(metrics.mem_bytes),
-                    cell(Some(palette::rss(metrics.mem_bytes)), bg),
-                );
+                // PSS; a dim `~` marks a sum that includes a process still reported by its
+                // resident set (no proportional measurement yet).
+                r.cell((totals.mem_bytes, totals.mem_estimated), |c: &mut Cell| {
+                    if totals.mem_estimated {
+                        c.set_fg(palette::TREE);
+                        c.ascii(b"~");
+                    }
+                    c.set_fg(palette::bytes(totals.mem_bytes));
+                    let _ = write!(c, "{}", Mem(totals.mem_bytes));
+                });
                 // Command change key: content hash (a changed cmdline reuses a freed store
                 // slot, so the handle isn't a stable content identity) + tree prefix +
                 // collapse suffix + the flags that drive its per-span colors.
@@ -537,21 +436,16 @@ fn basename_color(exe_deleted: bool, uses_deleted_lib: bool) -> Rgb {
     }
 }
 
-/// One display row's render inputs, resolved from either a process or an application group into a
-/// single named shape. A struct (not a positional tuple) so the two construction arms name every
-/// field — several share a type (`u32` threads/suffix, the ids) and would silently transpose in a
-/// tuple.
+/// What differs per row between a process and a group row, resolved into one named shape. A
+/// struct (not a positional tuple) so both construction arms name every field. The numbers are
+/// not here: every row kind reads them from the view's per-row totals.
 struct RowView<'a> {
     /// The process backing this row: the process itself, or an application group's representative.
     p: &'a crate::procs::ProcessEntry,
     uid: u32,
-    threads: u32,
-    metrics: crate::procs::RowMetrics,
     text: RowText<'a>,
-    /// Collapsed-row count badge: hidden-descendant count for a process, member count for a group.
+    /// Collapsed-row count badge: how many processes the row hides.
     suffix_n: u32,
-    state: u8,
-    nice: i8,
     /// Stable per-row identity for the retained renderer's change detection.
     key: u64,
     is_kthread: bool,
@@ -687,16 +581,14 @@ fn build_prefix(
     guides: &[bool],
     kind: PrefixKind,
 ) -> usize {
-    if kind == PrefixKind::Application {
-        out.push(if collapsed { '◇' } else { '◆' });
-        out.push(' ');
-        return 2;
-    }
+    let diamond = kind == PrefixKind::Application;
     let mut cols = 0usize;
     let collapse_shown = match depth {
         0 => false,
         1 => {
-            out.push_str(if has_children && collapsed {
+            out.push_str(if diamond {
+                "◇ "
+            } else if has_children && collapsed {
                 "○ "
             } else {
                 "● "
@@ -705,7 +597,9 @@ fn build_prefix(
             true
         }
         2 => {
-            out.push_str(if has_children && collapsed {
+            out.push_str(if diamond {
+                "  ◇ "
+            } else if has_children && collapsed {
                 "  ◦ "
             } else {
                 "  • "
@@ -732,7 +626,13 @@ fn build_prefix(
     };
 
     if !collapse_shown && has_children {
-        out.push(if collapsed { '▸' } else { '▾' });
+        out.push(if diamond {
+            '◇'
+        } else if collapsed {
+            '▸'
+        } else {
+            '▾'
+        });
         out.push(' ');
         cols += 2;
     }
@@ -767,26 +667,77 @@ impl fmt::Display for Pct {
     }
 }
 
-/// Resident memory in bytes, rendered in human units.
+/// A row's CPU history as block glyphs, oldest → newest. Height is CPU used, on the shared log
+/// ladder (the same for every row, so rows are comparable); color is how much of the time the
+/// work wanted a CPU it spent queued for one, on the same ramp as the header graph's pressure.
+/// An interval whose wait was not measured is neutral, never calm. Exactly-zero intervals are
+/// blank, except one that waited without running, which shows the lowest block; `None` (a row
+/// with no series of its own) is blank throughout.
 #[derive(Hash)]
-struct Mem(u64);
+struct Spark(Option<CpuSeries>);
+
+impl Spark {
+    fn write(&self, c: &mut Cell) {
+        let Some(series) = self.0 else { return };
+        for cell in series.0 {
+            let level = if cell.rate == 0 && cell.is_active() {
+                Level::LOWEST
+            } else {
+                Level::of(u64::from(cell.rate), Scale::Log)
+            };
+            if level.is_blank() {
+                c.reset_fg();
+            } else {
+                c.set_fg(
+                    cell.waiting
+                        .share_bp()
+                        .map_or(palette::WAIT_UNKNOWN, palette::pressure),
+                );
+            }
+            let mut utf8 = [0u8; 4];
+            c.glyph(level.glyph().encode_utf8(&mut utf8), 1);
+        }
+    }
+}
+
+/// Memory in bytes, rendered in human units, at most [`Mem::MAX_WIDTH`] columns. A unit is
+/// used up to 1000 of itself, then the next takes over (`999.9M`, then `1.0G`): rounding to a
+/// tenth is what decides, so a value that would print as `1000.0` moves up instead of widening.
+#[derive(Hash)]
+pub(crate) struct Mem(pub u64);
+
+impl Mem {
+    /// Widest text any value prints: `999.9G`.
+    pub(crate) const MAX_WIDTH: usize = 6;
+}
 
 impl fmt::Display for Mem {
-    #[allow(clippy::cast_precision_loss)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const KIB: u64 = 1024;
-        const MIB: u64 = 1024 * 1024;
-        const GIB: u64 = 1024 * 1024 * 1024;
+        const UNITS: [char; 6] = ['K', 'M', 'G', 'T', 'P', 'E'];
         let b = self.0;
-        if b >= GIB {
-            write!(f, "{:.1}G", b as f64 / GIB as f64)
-        } else if b >= MIB {
-            write!(f, "{:.1}M", b as f64 / MIB as f64)
-        } else if b >= KIB {
-            write!(f, "{}K", b / KIB)
-        } else {
-            write!(f, "{b}B")
+        if b < 1024 {
+            return write!(f, "{b}B");
         }
+        // Rounded tenths of the unit at `shift` bits.
+        let tenths = |shift: u32| ((u128::from(b) * 10) + (1 << (shift - 1))) >> shift;
+        let mut unit = 0;
+        let mut shift = 10;
+        // K is whole numbers; from M up, a count that would round to 1000.0 moves up a unit.
+        while unit + 1 < UNITS.len()
+            && if unit == 0 {
+                b >> 10 >= 1000
+            } else {
+                tenths(shift) >= 10_000
+            }
+        {
+            unit += 1;
+            shift += 10;
+        }
+        if unit == 0 {
+            return write!(f, "{}K", b >> 10);
+        }
+        let t = tenths(shift);
+        write!(f, "{}.{}{}", t / 10, t % 10, UNITS[unit])
     }
 }
 
@@ -799,7 +750,7 @@ fn metric_cpu_color(metric: Option<GpuMetric<u32>>) -> Option<Rgb> {
 
 fn metric_mem_color(metric: Option<GpuMetric<u64>>) -> Option<Rgb> {
     match metric {
-        Some(GpuMetric::Value(value)) => Some(palette::rss(value)),
+        Some(GpuMetric::Value(value)) => Some(palette::bytes(value)),
         _ => None,
     }
 }
@@ -830,19 +781,6 @@ impl fmt::Display for MaybeMem {
     }
 }
 
-fn format_uptime(secs: u64) -> String {
-    let days = secs / 86400;
-    let hours = (secs % 86400) / 3600;
-    let mins = (secs % 3600) / 60;
-    if days > 0 {
-        format!("{days}d {hours}h {mins}m")
-    } else if hours > 0 {
-        format!("{hours}h {mins}m")
-    } else {
-        format!("{mins}m")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,14 +790,6 @@ mod tests {
         assert_eq!(Pct(0).to_string(), "0.00%");
         assert_eq!(Pct(1234).to_string(), "12.34%");
         assert_eq!(Pct(40000).to_string(), "400.00%");
-    }
-
-    #[test]
-    #[allow(clippy::float_cmp)]
-    fn system_cpu_header_uses_process_cpu_scale() {
-        assert_eq!(system_cpu_pct_on_process_scale(10_000, 1), 100.0);
-        assert_eq!(system_cpu_pct_on_process_scale(10_000, 8), 800.0);
-        assert_eq!(system_cpu_pct_on_process_scale(2_500, 8), 200.0);
     }
 
     #[test]
@@ -873,11 +803,31 @@ mod tests {
     }
 
     #[test]
-    fn uptime_ranges() {
-        assert_eq!(format_uptime(0), "0m");
-        assert_eq!(format_uptime(90), "1m");
-        assert_eq!(format_uptime(3661), "1h 1m");
-        assert_eq!(format_uptime(90061), "1d 1h 1m");
+    fn mem_switches_unit_at_a_thousand_and_stays_bounded() {
+        const K: u64 = 1024;
+        assert_eq!(Mem(1023).to_string(), "1023B");
+        assert_eq!(Mem(999 * K).to_string(), "999K");
+        assert_eq!(Mem(1000 * K).to_string(), "1.0M");
+        assert_eq!(Mem(999 * K * K + K * K * 9 / 10).to_string(), "999.9M");
+        assert_eq!(
+            Mem(1000 * K * K - 1).to_string(),
+            "1.0G",
+            "would round to 1000.0M"
+        );
+        assert_eq!(Mem(1000 * K * K * K).to_string(), "1.0T");
+        assert_eq!(Mem(999 * K * K * K).to_string(), "999.0G");
+        assert_eq!(Mem(u64::MAX).to_string(), "16.0E");
+        let mut b = 1u64;
+        while b < u64::MAX / 3 {
+            for v in [b - 1, b, b + 1, b / 3 * 2] {
+                assert!(Mem(v).to_string().len() <= Mem::MAX_WIDTH, "{v}");
+            }
+            b *= 3;
+        }
+        for v in (0..64).flat_map(|s| [(1u64 << s) - 1, 1 << s, (1 << s) + 1]) {
+            assert!(Mem(v).to_string().len() <= Mem::MAX_WIDTH, "{v}");
+        }
+        assert!(Mem(u64::MAX).to_string().len() <= Mem::MAX_WIDTH);
     }
 
     #[test]
@@ -888,10 +838,10 @@ mod tests {
 
     #[test]
     fn geometry_changes_only_when_gpu_is_present() {
-        assert_eq!(header_lines(false), 3);
-        assert_eq!(chrome_lines(false), 5);
-        assert_eq!(header_lines(true), 4);
-        assert_eq!(chrome_lines(true), 6);
+        assert_eq!(header_lines(false), 2);
+        assert_eq!(chrome_lines(false), 4);
+        assert_eq!(header_lines(true), 3);
+        assert_eq!(chrome_lines(true), 5);
         let cpu = column_specs(false);
         let gpu = column_specs(true);
         assert_eq!(cpu.len(), 9);

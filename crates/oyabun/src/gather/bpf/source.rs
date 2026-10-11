@@ -9,13 +9,14 @@ use std::time::Instant;
 
 use aya::maps::{Array, MapData, RingBuf};
 use aya::programs::{BtfTracePoint, Iter};
-use aya::{Btf, Ebpf};
+use aya::{Btf, Ebpf, EbpfLoader};
 use thoop::{Arena, TypedBuf};
 use zerocopy::FromBytes;
 
 use super::super::source::{CycleResult, Source, SourceCtx};
 use super::types::{EVENT_FORK, EVENT_FREE, ProcEvent, TaskInfo};
 use crate::fxhash::{FxBuildHasher, FxMap};
+use crate::gather::ns_per_tick;
 use crate::log::debug_log;
 use crate::procs::{ProcessEntry, Procs};
 
@@ -90,7 +91,7 @@ pub struct BpfSource {
     #[cfg_attr(not(test), allow(dead_code))] // read only by tests today; a future churn metric
     last_emitted: usize,
     page_size: u64,
-    /// Precomputed ns→clock-tick divisor (see [`types::ns_per_tick`]).
+    /// Precomputed ns→clock-tick divisor (see [`ns_per_tick`]).
     ns_per_tick: u64,
 }
 
@@ -134,7 +135,12 @@ impl BpfSource {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let btf = Btf::from_sys_fs()?;
         // `Ebpf::load` applies CO-RE relocations against the kernel BTF at load time.
-        let mut ebpf = Ebpf::load(OBJECT)?;
+        // The wait coarsening in the change hash needs the same ns-per-tick divisor as the
+        // userspace conversion; it is a rodata constant, patched in before load.
+        let ns_per_tick = ns_per_tick(clk_tck);
+        let mut ebpf = EbpfLoader::new()
+            .override_global("oya_ns_per_tick", &ns_per_tick, true)
+            .load(OBJECT)?;
 
         // Task iterator: load (resolving the `bpf_iter_task` attach point); attach is per-read.
         let iter: &mut Iter = program(&mut ebpf, "oya_task_iter")?.try_into()?;
@@ -166,7 +172,7 @@ impl BpfSource {
             force_resync: false,
             last_emitted: 0,
             page_size,
-            ns_per_tick: super::types::ns_per_tick(clk_tck),
+            ns_per_tick,
         })
     }
 
@@ -520,6 +526,89 @@ mod tests {
         assert_eq!(
             s.num_threads, 1,
             "single-threaded sleep must report 1 thread"
+        );
+    }
+
+    /// The iterator's wait is the live-thread sum of `sched_info.run_delay` — the same quantity
+    /// `/proc/<tid>/schedstat` exposes per thread. Contended threads (all pinned to one CPU)
+    /// make it nonzero, and since it is monotone while the thread set is stable, the BPF value
+    /// must land between a `/proc` read just before the scan and one just after. Skips without
+    /// caps, or when the kernel keeps no scheduler statistics.
+    #[test]
+    fn bpf_wait_is_the_live_thread_sum_of_run_delay() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::gather::schedstat::WaitSampler;
+
+        let arena = Box::new(Arena::new(0));
+        let Some(mut src) = BpfSource::probe(&arena, sys::page_size(), sys::clk_tck()) else {
+            crate::gather::config::skip_privileged_test();
+            return;
+        };
+        if std::fs::read("/proc/self/schedstat").is_err() {
+            return;
+        }
+        let mut procs = Procs::new(&arena, 256);
+        src.wire(&arena);
+        procs.wire(&arena);
+
+        // One CPU this process may run on; every spinner pins to it so they queue behind each other.
+        // SAFETY: plain libc affinity calls on a zeroed cpu_set_t.
+        let cpu = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &raw mut set);
+            (0..libc::CPU_SETSIZE as usize)
+                .find(|&c| libc::CPU_ISSET(c, &set))
+                .expect("an allowed cpu")
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let spinners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    // SAFETY: pins the calling thread; the set is a valid zeroed cpu_set_t.
+                    unsafe {
+                        let mut set: libc::cpu_set_t = std::mem::zeroed();
+                        libc::CPU_SET(cpu, &mut set);
+                        libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &raw const set);
+                    }
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let me = std::process::id();
+        let threads = u32::try_from(std::fs::read_dir("/proc/self/task").unwrap().count()).unwrap();
+        let mut sampler = WaitSampler::new(sys::clk_tck());
+        let mut proc_wait = || {
+            let mut row = ProcessEntry::TOMBSTONE;
+            row.pid = me;
+            row.num_threads = threads;
+            let mut rows = [row];
+            sampler.fill(&mut rows, &[me], |_| None);
+            rows[0].wait_ticks
+        };
+        let before = proc_wait().expect("proc wait");
+        src.scan(&mut procs);
+        let after = proc_wait().expect("proc wait");
+        stop.store(true, Ordering::Relaxed);
+        for s in spinners {
+            s.join().unwrap();
+        }
+
+        let mine = procs.as_slice().iter().find(|p| p.pid == me).copied();
+        let bpf = mine
+            .expect("self in snapshot")
+            .wait_ticks
+            .expect("the BPF source always measures wait");
+        assert!(after > 0, "pinned spinners must have queued");
+        assert!(
+            before <= bpf && bpf <= after,
+            "bpf wait {bpf} must lie between /proc reads {before}..{after}"
         );
     }
 

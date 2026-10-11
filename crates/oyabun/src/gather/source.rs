@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use super::table::PidIndex;
+use super::table::ProcTable;
 use crate::procs::Procs;
 
 /// Per-cycle side-band returned by an observation source after it materializes the live process
@@ -13,14 +13,18 @@ pub(crate) struct CycleResult {
     pub(crate) short_lived: u32,
 }
 
-/// Immutable context a source may need while filling a cycle. The PID index is read-only and
-/// belongs to the table tail; `/proc` uses it only to distinguish known leaders from speculative
-/// birth-probe threads.
+/// Immutable context a source may need while filling a cycle. The per-PID table is read-only and
+/// belongs to the table tail; `/proc` uses its index to tell known leaders from speculative
+/// birth-probe threads, and its CPU baselines to know which processes cannot have waited.
 #[derive(Clone, Copy)]
 pub(crate) struct SourceCtx<'a> {
-    pub(crate) index: &'a PidIndex,
+    pub(crate) table: &'a ProcTable,
     pub(crate) page_size: u64,
     pub(crate) prev_gen: u64,
+    /// PIDs whose scheduler wait is worth measuring (what the screen shows numbers for), most
+    /// important first. Only the `/proc` source needs it — the privileged source gets wait for
+    /// every process from its iterator.
+    pub(crate) wait_watch: &'a [u32],
 }
 
 /// A producer for the source-output shape of the process buffer.

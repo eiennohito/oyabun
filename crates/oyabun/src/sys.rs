@@ -92,6 +92,7 @@ pub struct RawCpuCounters {
 }
 
 impl RawCpuCounters {
+    /// Every accounted jiffy; the denominator that turns a counter delta into cores.
     pub fn total(&self) -> u64 {
         self.user
             + self.nice
@@ -102,13 +103,22 @@ impl RawCpuCounters {
             + self.softirq
             + self.steal
     }
+
+    /// Jiffies this machine's CPUs spent executing work. Excludes `idle` and `iowait` (the CPU
+    /// was free, merely with IO outstanding) and `steal` (the hypervisor ran someone else — our
+    /// CPU time was *denied*, not used; it is reported on its own).
+    pub fn busy(&self) -> u64 {
+        self.user + self.nice + self.kernel()
+    }
+
+    /// Jiffies in the kernel on behalf of tasks or interrupts: `system + irq + softirq`.
+    pub fn kernel(&self) -> u64 {
+        self.system + self.irq + self.softirq
+    }
 }
 
-/// Parse the first (`cpu`) line of `/proc/stat`.
-pub fn read_cpu_counters() -> RawCpuCounters {
-    let mut buf = [0u8; 512];
-    let data = read_proc_file(c"/proc/stat".as_ptr(), &mut buf);
-    // First line: "cpu  <user> <nice> <sys> <idle> <iowait> <irq> <softirq> <steal> ..."
+/// First line: `"cpu  <user> <nice> <sys> <idle> <iowait> <irq> <softirq> <steal> ..."`.
+fn parse_cpu_counters(data: &[u8]) -> RawCpuCounters {
     let line = data.split(|&b| b == b'\n').next().unwrap_or(&[]);
     let mut it = line.split(|&b| b == b' ').filter(|f| !f.is_empty());
     it.next(); // skip "cpu"
@@ -134,19 +144,19 @@ pub fn read_cpu_counters() -> RawCpuCounters {
 }
 
 /// Memory stats from `/proc/meminfo` (bytes).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct MemInfo {
     pub total: u64,
+    /// `MemFree`: pages nobody holds at all (not even as cache).
+    pub free: u64,
     pub available: u64,
-    pub buffers: u64,
-    pub cached: u64,
+    /// tmpfs + SysV/POSIX shared memory: charged to no process, swappable.
+    pub shmem: u64,
     pub swap_total: u64,
     pub swap_free: u64,
 }
 
-pub fn read_meminfo() -> MemInfo {
-    let mut buf = [0u8; 2048];
-    let data = read_proc_file(c"/proc/meminfo".as_ptr(), &mut buf);
+fn parse_meminfo(data: &[u8]) -> MemInfo {
     let mut info = MemInfo::default();
     for line in data.split(|&b| b == b'\n') {
         let Some((key, val)) = meminfo_line(line) else {
@@ -156,9 +166,9 @@ pub fn read_meminfo() -> MemInfo {
         let bytes = val.saturating_mul(1024);
         match key {
             b"MemTotal" => info.total = bytes,
+            b"MemFree" => info.free = bytes,
             b"MemAvailable" => info.available = bytes,
-            b"Buffers" => info.buffers = bytes,
-            b"Cached" => info.cached = bytes,
+            b"Shmem" => info.shmem = bytes,
             b"SwapTotal" => info.swap_total = bytes,
             b"SwapFree" => info.swap_free = bytes,
             _ => {}
@@ -179,43 +189,48 @@ fn meminfo_line(line: &[u8]) -> Option<(&[u8], u64)> {
     Some((key, num))
 }
 
-/// Load averages × 100 and uptime in seconds.
-pub fn read_loadavg() -> [u32; 3] {
-    let mut buf = [0u8; 128];
-    let data = read_proc_file(c"/proc/loadavg".as_ptr(), &mut buf);
-    let mut fields = data.split(|&b| b == b' ');
-    let parse_load = |f: Option<&[u8]>| -> u32 {
-        let s = f.unwrap_or(&[]);
-        // "1.23" → 123
-        let dot = s.iter().position(|&b| b == b'.').unwrap_or(s.len());
-        let whole = parse_u64_bytes(&s[..dot]).unwrap_or(0);
-        let frac_bytes = s.get(dot + 1..).unwrap_or(&[]);
-        let digit = |b: u8| {
-            if b.is_ascii_digit() {
-                u64::from(b - b'0')
-            } else {
-                0
-            }
-        };
-        let d0 = frac_bytes.first().copied().unwrap_or(b'0');
-        let d1 = frac_bytes.get(1).copied().unwrap_or(b'0');
-        let frac = digit(d0) * 10 + digit(d1);
-        u32::try_from(whole * 100 + frac).unwrap_or(u32::MAX)
-    };
-    [
-        parse_load(fields.next()),
-        parse_load(fields.next()),
-        parse_load(fields.next()),
-    ]
+/// Runnable scheduling entities *other than the reader*: `"0.52 0.58 0.59 3/1234 56789\n"` → 2.
+///
+/// The `running/total` fourth field of `/proc/loadavg` is the kernel's `nr_running`, which
+/// counts the very task reading it — always at least 1 even on an idle machine. Subtracting it
+/// here, once, at the read boundary keeps every consumer (and recordings) in "work waiting or
+/// running besides us" terms. Same value as `/proc/stat`'s `procs_running`, but that line sits
+/// after the per-core and interrupt lines (tens of KiB on many cores); this file is ~30 bytes.
+fn parse_runnable(data: &[u8]) -> u32 {
+    data.split(|&b| b == b' ')
+        .nth(3)
+        .and_then(|f| f.split(|&b| b == b'/').next())
+        .and_then(parse_u64_bytes)
+        .and_then(|n| u32::try_from(n).ok())
+        .map_or(0, |n| n.saturating_sub(1))
 }
 
-pub fn read_uptime_secs() -> u64 {
-    let mut buf = [0u8; 64];
-    let data = read_proc_file(c"/proc/uptime".as_ptr(), &mut buf);
-    // "12345.67 ..."
-    let field = data.split(|&b| b == b' ').next().unwrap_or(&[]);
-    let dot = field.iter().position(|&b| b == b'.').unwrap_or(field.len());
-    parse_u64_bytes(&field[..dot]).unwrap_or(0)
+/// Cumulative `some` stall time in microseconds for each pressure-stall resource. `None` when
+/// the kernel does not expose that file (`CONFIG_PSI` off, or booted with `psi=0`) — absence is
+/// a distinct state, never a fake zero.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct RawPsi {
+    pub cpu: Option<u64>,
+    pub memory: Option<u64>,
+    pub io: Option<u64>,
+}
+
+/// `total=` (µs) of the `some` line: `"some avg10=0.05 avg60=0.03 avg300=0.08 total=634013983"`.
+fn parse_psi_some_total(data: &[u8]) -> Option<u64> {
+    let line = data
+        .split(|&b| b == b'\n')
+        .find(|l| l.starts_with(b"some "))?;
+    line.split(|&b| b == b' ')
+        .find_map(|f| f.strip_prefix(b"total="))
+        .and_then(parse_u64_bytes)
+}
+
+/// `pswpin` (cumulative pages swapped in since boot) from `/proc/vmstat`; `None` if the counter
+/// is not there.
+fn parse_pswpin(data: &[u8]) -> Option<u64> {
+    data.split(|&b| b == b'\n')
+        .find_map(|l| l.strip_prefix(b"pswpin "))
+        .and_then(parse_u64_bytes)
 }
 
 fn parse_u64_bytes(b: &[u8]) -> Option<u64> {
@@ -234,22 +249,156 @@ fn parse_u64_bytes(b: &[u8]) -> Option<u64> {
 
 /// All raw system reads bundled for a single cycle — the source data that
 /// [`SystemSampler`](crate::gather::sysstat::SystemSampler) consumes to produce
-/// derived CPU percentages and memory stats.
+/// the windowed CPU, pressure, and memory figures the header shows.
 #[derive(Clone, Copy)]
 pub struct RawSystemSnapshot {
     pub cpu: RawCpuCounters,
+    /// Runnable entities besides the reader at this instant (see [`parse_runnable`]).
+    pub runnable: u32,
     pub mem: MemInfo,
-    pub load: [u32; 3],
-    pub uptime_secs: u64,
+    pub psi: RawPsi,
+    /// Cumulative pages swapped in; `None` when not read (no swap, or unreadable), so a failed
+    /// read can never masquerade as a counter that reset to zero.
+    pub pswpin: Option<u64>,
 }
 
-/// Read `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`, and `/proc/uptime` into one snapshot.
-pub fn read_system_snapshot() -> RawSystemSnapshot {
-    RawSystemSnapshot {
-        cpu: read_cpu_counters(),
-        mem: read_meminfo(),
-        load: read_loadavg(),
-        uptime_secs: read_uptime_secs(),
+/// One long-lived procfs file. procfs `seq_file`s regenerate their content for a read at offset
+/// zero, so one descriptor serves every cycle via `pread` — the same property the per-PID stat
+/// pool relies on. Replaces an open+read+close triple per file per cycle.
+///
+/// The file is probed once, on first use. A file the kernel does not expose (PSI off) stays
+/// absent for the process lifetime rather than costing a failed `open` every cycle.
+struct HeldFile {
+    path: &'static std::ffi::CStr,
+    state: HeldState,
+}
+
+enum HeldState {
+    Unprobed,
+    Open(RawFd),
+    Absent,
+}
+
+impl HeldFile {
+    const fn new(path: &'static std::ffi::CStr) -> Self {
+        Self {
+            path,
+            state: HeldState::Unprobed,
+        }
+    }
+
+    fn fd(&mut self) -> Option<RawFd> {
+        if matches!(self.state, HeldState::Unprobed) {
+            // SAFETY: valid C path, read-only.
+            let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            self.state = if fd < 0 {
+                HeldState::Absent
+            } else {
+                HeldState::Open(fd)
+            };
+        }
+        match self.state {
+            HeldState::Open(fd) => Some(fd),
+            _ => None,
+        }
+    }
+
+    /// Whether the file exists (probing it if needed).
+    fn present(&mut self) -> bool {
+        self.fd().is_some()
+    }
+
+    /// One `pread` at offset 0: enough for files that fit the buffer in a single chunk.
+    /// Empty when absent or unreadable.
+    fn read<'b, const N: usize>(&mut self, buf: &'b mut [u8; N]) -> &'b [u8] {
+        let Some(fd) = self.fd() else { return &[] };
+        // SAFETY: `buf` is a valid writable region of N bytes; `fd` is ours.
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), N, 0) };
+        &buf[..usize::try_from(n).unwrap_or(0).min(N)]
+    }
+
+    /// `pread`s to EOF (or a full buffer), for multi-record files where one read returns only
+    /// a page-sized chunk.
+    fn read_all<'b, const N: usize>(&mut self, buf: &'b mut [u8; N]) -> &'b [u8] {
+        let Some(fd) = self.fd() else { return &[] };
+        let mut len = 0;
+        while len < N {
+            let off = libc::off_t::try_from(len).unwrap_or(0);
+            // SAFETY: `buf[len..]` is a valid writable region of `N - len` bytes.
+            let n = unsafe { libc::pread(fd, buf[len..].as_mut_ptr().cast(), N - len, off) };
+            let Ok(n) = usize::try_from(n) else { break };
+            if n == 0 {
+                break;
+            }
+            len += n;
+        }
+        &buf[..len]
+    }
+}
+
+impl Drop for HeldFile {
+    fn drop(&mut self) {
+        if let HeldState::Open(fd) = self.state {
+            // SAFETY: our fd, closed once.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// The system-wide procfs files, held open across cycles. One read per cycle gives the whole
+/// [`RawSystemSnapshot`].
+pub struct SystemFiles {
+    stat: HeldFile,
+    loadavg: HeldFile,
+    meminfo: HeldFile,
+    psi_cpu: HeldFile,
+    psi_memory: HeldFile,
+    psi_io: HeldFile,
+    vmstat: HeldFile,
+}
+
+impl SystemFiles {
+    pub fn new() -> Self {
+        Self {
+            stat: HeldFile::new(c"/proc/stat"),
+            loadavg: HeldFile::new(c"/proc/loadavg"),
+            meminfo: HeldFile::new(c"/proc/meminfo"),
+            psi_cpu: HeldFile::new(c"/proc/pressure/cpu"),
+            psi_memory: HeldFile::new(c"/proc/pressure/memory"),
+            psi_io: HeldFile::new(c"/proc/pressure/io"),
+            vmstat: HeldFile::new(c"/proc/vmstat"),
+        }
+    }
+
+    /// Read `/proc/stat`, `/proc/loadavg`, `/proc/meminfo`, `/proc/pressure/*`, and (only on a
+    /// machine with swap — `pswpin` can only move there) `/proc/vmstat`.
+    pub fn read(&mut self) -> RawSystemSnapshot {
+        // Only the aggregate first line is used; it is well inside the first 512 bytes.
+        let mut stat = [0u8; 512];
+        // ~30 bytes.
+        let mut load = [0u8; 128];
+        // ~1.6 KiB on current kernels and growing with new counters; leave generous headroom.
+        let mut mem_buf = [0u8; 4096];
+        let mut psi = [0u8; 256];
+        let mem = parse_meminfo(self.meminfo.read(&mut mem_buf));
+        let pswpin = if mem.swap_total > 0 && self.vmstat.present() {
+            // ~4.3 KiB today; read to EOF.
+            let mut vm = [0u8; 16384];
+            parse_pswpin(self.vmstat.read_all(&mut vm))
+        } else {
+            None
+        };
+        RawSystemSnapshot {
+            cpu: parse_cpu_counters(self.stat.read(&mut stat)),
+            runnable: parse_runnable(self.loadavg.read(&mut load)),
+            mem,
+            psi: RawPsi {
+                cpu: parse_psi_some_total(self.psi_cpu.read(&mut psi)),
+                memory: parse_psi_some_total(self.psi_memory.read(&mut psi)),
+                io: parse_psi_some_total(self.psi_io.read(&mut psi)),
+            },
+            pswpin,
+        }
     }
 }
 
@@ -269,16 +418,21 @@ impl From<oya_stream::SystemStats> for RawSystemSnapshot {
                 softirq: s.stat_softirq,
                 steal: s.stat_steal,
             },
+            runnable: s.runnable,
             mem: MemInfo {
                 total: s.mem_total,
+                free: s.mem_free,
                 available: s.mem_available,
-                buffers: s.mem_buffers,
-                cached: s.mem_cached,
+                shmem: s.mem_shmem,
                 swap_total: s.swap_total,
                 swap_free: s.swap_free,
             },
-            load: s.load,
-            uptime_secs: s.uptime_secs,
+            psi: RawPsi {
+                cpu: s.psi_cpu,
+                memory: s.psi_memory,
+                io: s.psi_io,
+            },
+            pswpin: s.pswpin,
         }
     }
 }
@@ -298,14 +452,17 @@ impl RawSystemSnapshot {
             stat_irq: self.cpu.irq,
             stat_softirq: self.cpu.softirq,
             stat_steal: self.cpu.steal,
+            runnable: self.runnable,
             mem_total: self.mem.total,
+            mem_free: self.mem.free,
             mem_available: self.mem.available,
-            mem_buffers: self.mem.buffers,
-            mem_cached: self.mem.cached,
+            mem_shmem: self.mem.shmem,
             swap_total: self.mem.swap_total,
             swap_free: self.mem.swap_free,
-            load: self.load,
-            uptime_secs: self.uptime_secs,
+            psi_cpu: self.psi.cpu,
+            psi_memory: self.psi.memory,
+            psi_io: self.psi.io,
+            pswpin: self.pswpin,
         }
     }
 }
@@ -511,6 +668,19 @@ impl ProcDir {
         Ok(Self { fd })
     }
 
+    /// The `/proc/<pid>/task` directory: its numeric entries are the process's thread ids, so
+    /// [`read_pids`](Self::read_pids) lists them. Fails if the process is gone.
+    pub fn open_tasks(pid: u32) -> io::Result<Self> {
+        let mut path = ProcPath::new();
+        let ptr = path.write(pid, b"task");
+        // SAFETY: valid NUL-terminated path in `path`, standard flags.
+        let fd = unsafe { libc::open(ptr, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
     /// Fill `out` with the numeric PIDs under `/proc`, using `buf` as scratch.
     /// Non-numeric entries (`self`, `net`, …) are skipped. `out` is unsorted.
     pub fn read_pids(&self, buf: &mut [u8], out: &mut Vec<u32>) {
@@ -639,29 +809,84 @@ mod tests {
 
     #[test]
     fn cpu_counters_are_nonzero() {
-        let c = read_cpu_counters();
+        let c = SystemFiles::new().read().cpu;
         assert!(c.total() > 0, "total jiffies must be > 0");
         assert!(c.idle > 0, "idle jiffies should be > 0 on a live system");
     }
 
     #[test]
     fn meminfo_has_total() {
-        let m = read_meminfo();
+        let m = SystemFiles::new().read().mem;
         assert!(m.total > 0, "MemTotal must be > 0");
         assert!(m.available > 0, "MemAvailable must be > 0");
         assert!(m.available <= m.total);
     }
 
     #[test]
-    fn loadavg_parses() {
-        let l = read_loadavg();
-        // On any live system, load average is some positive number.
-        assert!(l[0] > 0 || l[1] > 0 || l[2] > 0, "all loads zero?");
+    fn live_snapshot_reads_succeed() {
+        let mut files = SystemFiles::new();
+        let s = files.read();
+        // PSI may be absent (CONFIG_PSI off / psi=0); if present, totals are cumulative µs.
+        if let Some(t) = s.psi.cpu {
+            // The held descriptors re-read from offset 0 each cycle.
+            assert!(files.read().psi.cpu.unwrap_or(0) >= t);
+        }
+        assert!(files.read().cpu.total() >= s.cpu.total());
     }
 
     #[test]
-    fn uptime_positive() {
-        assert!(read_uptime_secs() > 0);
+    fn cpu_counters_split_busy_from_idle_iowait_and_steal() {
+        let c = parse_cpu_counters(b"cpu  10 20 30 400 50 6 7 8 0 0\ncpu0 1 2 3 4 5 6 7 8 0 0\n");
+        assert_eq!(c.busy(), 10 + 20 + 30 + 6 + 7);
+        assert_eq!(c.kernel(), 30 + 6 + 7);
+        assert_eq!(c.steal, 8);
+        assert_eq!(c.total(), 10 + 20 + 30 + 400 + 50 + 6 + 7 + 8);
+    }
+
+    #[test]
+    fn meminfo_parses_shmem_and_swap() {
+        let m = parse_meminfo(
+            b"MemTotal:       65536 kB\nMemFree:  1 kB\nMemAvailable:   32768 kB\n\
+              Shmem:            2048 kB\nSwapTotal:       8192 kB\nSwapFree:        6144 kB\n",
+        );
+        assert_eq!(
+            m,
+            MemInfo {
+                total: 65536 * 1024,
+                free: 1024,
+                available: 32768 * 1024,
+                shmem: 2048 * 1024,
+                swap_total: 8192 * 1024,
+                swap_free: 6144 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn runnable_is_loadavg_numerator() {
+        assert_eq!(
+            parse_runnable(b"0.52 0.58 0.59 3/1234 56789\n"),
+            2,
+            "the reader itself is not counted"
+        );
+        assert_eq!(parse_runnable(b"0.00 0.00 0.00 1/1234 56789\n"), 0);
+        assert_eq!(parse_runnable(b""), 0);
+    }
+
+    #[test]
+    fn psi_takes_some_total_and_distinguishes_absence() {
+        let cpu = b"some avg10=0.05 avg60=0.03 avg300=0.08 total=634013983\n\
+                    full avg10=0.00 avg60=0.00 avg300=0.00 total=77\n";
+        assert_eq!(parse_psi_some_total(cpu), Some(634_013_983));
+        assert_eq!(parse_psi_some_total(b""), None);
+        assert_eq!(parse_psi_some_total(b"full avg10=0 total=5\n"), None);
+    }
+
+    #[test]
+    fn pswpin_is_found_among_other_counters() {
+        let v = b"pgpgin 1\npswpin 32\npswpout 7\npswpin_x 9\n";
+        assert_eq!(parse_pswpin(v), Some(32));
+        assert_eq!(parse_pswpin(b"pgpgin 1\n"), None);
     }
 
     #[test]

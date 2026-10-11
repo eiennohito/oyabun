@@ -467,3 +467,41 @@ fn unicode_fill_neutralizes_control_chars() {
         "control char shown as '?'"
     );
 }
+
+#[test]
+fn fixed_cell_carries_color_runs_and_aligns() {
+    // A fixed-width column written through `cell`: color runs, right-aligned in the body,
+    // and re-rendered only when its key changes.
+    let schema = Schema::new(vec![ColSpec::right("H", 1, 4), ColSpec::fill("CMD", 1)]);
+    let draw = |d: &mut Display<Vec<u8>>, key: u8| {
+        let mut f = d.begin_frame(20, 3);
+        f.table(&schema, 0, 3, |t| {
+            t.row(1, Style::NONE, |r| {
+                r.cell(key, |c| {
+                    c.set_fg(GREY);
+                    c.glyph("▁", 1);
+                    c.set_fg(RED);
+                    c.glyph("█", 1);
+                    c.set_fg(WHITE);
+                    c.glyph("▅", 1);
+                });
+                r.fill("x", |c| c.ascii(b"x"));
+            });
+        });
+        f.commit().unwrap();
+    };
+    let mut d = Display::new(Vec::new());
+    draw(&mut d, 1);
+
+    let emitted = String::from_utf8_lossy(d.get_ref()).into_owned();
+    let at = |c| emitted.find(&fg_sgr(c)).expect("color emitted");
+    assert!(at(GREY) < at(RED) && at(RED) < at(WHITE), "{emitted:?}");
+    let p = parse(d.get_ref(), 3, 20);
+    assert_eq!(row(&p, 0, 20), "  ▁█▅ x", "right-aligned in sep1+body4");
+
+    let before = d.get_ref().len();
+    draw(&mut d, 1);
+    assert_eq!(d.get_ref().len(), before, "same key: cell emits nothing");
+    draw(&mut d, 2);
+    assert!(d.get_ref().len() > before, "changed key repaints the cell");
+}

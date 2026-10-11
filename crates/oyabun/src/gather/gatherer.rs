@@ -9,6 +9,8 @@
 use thoop::Arena;
 
 use super::config::INITIAL_ROWS;
+use super::cpu::CpuSeries;
+use super::cpu_history::CpuHistory;
 use super::nvml::NvmlSampler;
 use super::procfs::ProcSource;
 #[cfg(feature = "record")]
@@ -34,6 +36,18 @@ enum ObservationSource {
     Replay(Box<ReplaySource>),
 }
 
+/// What a cycle needs besides the buffers: the clock of generations and what to measure.
+#[derive(Clone, Copy)]
+struct CycleInput<'a> {
+    page_size: u64,
+    /// The just-finished generation.
+    prev_gen: u64,
+    /// The generation being built.
+    building_gen: u64,
+    /// See [`SourceCtx::wait_watch`].
+    wait_watch: &'a [u32],
+}
+
 impl ObservationSource {
     /// Fill the source-output rows, then run the per-PID table pass with the matching metadata
     /// reader. Replay owns both sides; live sources share the gatherer's real `/proc` reader.
@@ -42,41 +56,28 @@ impl ObservationSource {
         procs: &mut Procs,
         table: &mut ProcTable,
         live_reader: &mut RealProcReader,
-        page_size: u64,
-        prev_gen: u64,
-        building_gen: u64,
+        input: CycleInput<'_>,
     ) -> super::source::CycleResult {
         match self {
-            ObservationSource::Proc(p) => Self::populate_with_reader(
-                p.as_mut(),
-                live_reader,
-                procs,
-                table,
-                page_size,
-                prev_gen,
-                building_gen,
-            ),
+            ObservationSource::Proc(p) => {
+                Self::populate_with_reader(p.as_mut(), live_reader, procs, table, input)
+            }
             #[cfg(feature = "bpf")]
-            ObservationSource::Bpf(b) => Self::populate_with_reader(
-                b.as_mut(),
-                live_reader,
-                procs,
-                table,
-                page_size,
-                prev_gen,
-                building_gen,
-            ),
+            ObservationSource::Bpf(b) => {
+                Self::populate_with_reader(b.as_mut(), live_reader, procs, table, input)
+            }
             #[cfg(test)]
             ObservationSource::Replay(r) => {
                 let result = {
                     let ctx = SourceCtx {
-                        index: table.index(),
-                        page_size,
-                        prev_gen,
+                        table,
+                        page_size: input.page_size,
+                        prev_gen: input.prev_gen,
+                        wait_watch: input.wait_watch,
                     };
                     r.populate(procs, ctx)
                 };
-                table.update(procs, result.now, building_gen, r.as_mut());
+                table.update(procs, result.now, input.building_gen, r.as_mut());
                 result
             }
         }
@@ -87,19 +88,18 @@ impl ObservationSource {
         reader: &mut R,
         procs: &mut Procs,
         table: &mut ProcTable,
-        page_size: u64,
-        prev_gen: u64,
-        building_gen: u64,
+        input: CycleInput<'_>,
     ) -> super::source::CycleResult {
         let result = {
             let ctx = SourceCtx {
-                index: table.index(),
-                page_size,
-                prev_gen,
+                table,
+                page_size: input.page_size,
+                prev_gen: input.prev_gen,
+                wait_watch: input.wait_watch,
             };
             source.populate(procs, ctx)
         };
-        table.update(procs, result.now, building_gen, reader);
+        table.update(procs, result.now, input.building_gen, reader);
         result
     }
 
@@ -135,6 +135,8 @@ pub struct Gatherer {
     /// Real `/proc/<pid>` metadata reader used by live sources. Replay provides its own reader.
     reader: RealProcReader,
     sys_sampler: SystemSampler,
+    /// Held-open system procfs files (live source only).
+    sys_files: sys::SystemFiles,
     /// Optional runtime NVML sampler, fixed at startup.
     nvml: Option<NvmlSampler>,
     /// System-wide stats for this cycle.
@@ -151,6 +153,9 @@ pub struct Gatherer {
     short_lived: u32,
     tree_stack: Vec<u32>,
     tree_order: Vec<u32>,
+    /// PIDs the screen shows numbers for, largest CPU first: the `/proc` source measures
+    /// scheduler wait for these only. Refilled by the caller between cycles.
+    wait_watch: Vec<u32>,
     page_size: u64,
     generation: u64,
     #[cfg(feature = "record")]
@@ -256,6 +261,7 @@ impl Gatherer {
             identities: IdentityResolver::default(),
             reader: RealProcReader::new(),
             sys_sampler: SystemSampler::new(),
+            sys_files: sys::SystemFiles::new(),
             nvml,
             sys,
             gpu: GpuProcessStats::default(),
@@ -264,6 +270,7 @@ impl Gatherer {
             short_lived: 0,
             tree_stack: Vec::new(),
             tree_order: Vec::new(),
+            wait_watch: Vec::new(),
             page_size,
             generation: 0,
             #[cfg(feature = "record")]
@@ -281,6 +288,46 @@ impl Gatherer {
     #[must_use]
     pub fn sys(&self) -> &SystemStats {
         &self.sys
+    }
+
+    /// Count of measured CPU-sample cycles; the index every per-PID series (and every series
+    /// derived from them) is aligned to. A too-soon refresh does not advance it.
+    #[must_use]
+    pub(crate) fn sample_cycle(&self) -> u64 {
+        self.table.sample_cycle()
+    }
+
+    /// The per-interval CPU history behind the header graph.
+    #[must_use]
+    pub fn cpu_history(&self) -> &CpuHistory {
+        self.sys_sampler.history()
+    }
+
+    /// Size the CPU history for a terminal `width` columns wide whose graph shows `visible`
+    /// cells: room for the widest width ever seen, and the scale fitted to the visible tail.
+    pub fn fit_cpu_history(&mut self, width: usize, visible: usize) {
+        let history = self.sys_sampler.history_mut();
+        history.reserve(width);
+        history.set_visible(visible);
+    }
+
+    /// Declare which processes the screen shows numbers for (indices into the *current* rows),
+    /// for the next cycle: the `/proc` source measures scheduler wait for just these, largest
+    /// CPU first so a limited read budget goes where the color matters most. Without
+    /// this call (or for indices that moved) wait is simply unknown. A no-op's worth of work
+    /// in privileged mode, which measures every process anyway.
+    pub fn set_wait_interest(&mut self, viewport: &[usize]) {
+        let rows = self.procs.as_slice();
+        self.wait_watch.clear();
+        self.wait_watch
+            .extend(viewport.iter().filter_map(|&i| rows.get(i)).map(|p| p.pid));
+        // Rank by the CPU the rows showed last cycle (rows are PID-sorted: binary search).
+        let cpu = |pid: &u32| {
+            rows.binary_search_by_key(pid, |p| p.pid)
+                .map_or(0, |i| rows[i].cpu_pct)
+        };
+        self.wait_watch
+            .sort_by_cached_key(|pid| std::cmp::Reverse(cpu(pid)));
     }
 
     /// Head of the root sibling chain, or [`NONE`].
@@ -341,11 +388,6 @@ impl Gatherer {
         self.gpu.live(pid)
     }
 
-    #[must_use]
-    pub fn subtree_gpu_for_pid(&self, pid: u32) -> Option<GpuMetrics> {
-        self.gpu.subtree(pid)
-    }
-
     /// Empty physical-device indices, or `None` when both context lists were not available.
     #[must_use]
     pub fn empty_gpus(&self) -> Option<&[u32]> {
@@ -372,6 +414,13 @@ impl Gatherer {
         self.table.cmdline(e)
     }
 
+    /// The process's recent per-interval CPU rates (sparkline input), or `None` for a PID the
+    /// table doesn't know.
+    #[must_use]
+    pub(crate) fn cpu_series(&self, pid: u32) -> Option<CpuSeries> {
+        self.table.cpu_series(pid)
+    }
+
     /// The grouping identity of the process at `proc_idx` this cycle, if it belongs to a group.
     #[must_use]
     pub(crate) fn identity(&self, proc_idx: usize) -> Option<&ProcessIdentity> {
@@ -394,9 +443,12 @@ impl Gatherer {
             &mut self.procs,
             &mut self.table,
             &mut self.reader,
-            self.page_size,
-            self.generation,
-            building_gen,
+            CycleInput {
+                page_size: self.page_size,
+                prev_gen: self.generation,
+                building_gen,
+                wait_watch: &self.wait_watch,
+            },
         );
         self.pool_overflow = result.pool_overflow;
         self.short_lived = result.short_lived;
@@ -409,12 +461,12 @@ impl Gatherer {
         let replay_snap: Option<(RawSystemSnapshot, u32)> = None;
         let raw_snap = if let Some((snap, num_cores)) = replay_snap {
             self.sys_sampler.set_num_cores(num_cores);
-            self.sys_sampler.update(&mut self.sys, snap);
+            self.sys_sampler.update(&mut self.sys, snap, result.now);
             self.gpu.clear_unavailable();
             snap
         } else {
-            let snap = sys::read_system_snapshot();
-            self.sys_sampler.update(&mut self.sys, snap);
+            let snap = self.sys_files.read();
+            self.sys_sampler.update(&mut self.sys, snap, result.now);
             if let Some(nvml) = &mut self.nvml {
                 nvml.sample(&mut self.sys, self.procs.as_slice(), &mut self.gpu);
             } else {
@@ -427,7 +479,6 @@ impl Gatherer {
             &mut self.tree_stack,
             &mut self.tree_order,
         );
-        tree::aggregate(self.procs.as_mut_slice(), &self.tree_order, &mut self.gpu);
         self.identities.update(
             self.procs.as_slice(),
             &self.tree_order,
@@ -500,12 +551,13 @@ mod tests {
 
         let mut g = new_test();
         let me = std::process::id();
-        let (mut max_cpu, mut max_peak) = (0, 0);
+        let (mut max_cpu, mut max_cell) = (0, 0);
         for _ in 0..4 {
             g.cycle();
             if let Some(p) = g.procs().as_slice().iter().find(|p| p.pid == me) {
                 max_cpu = max_cpu.max(p.cpu_pct);
-                max_peak = max_peak.max(p.cpu_peak);
+                let series = g.cpu_series(me).expect("own pid is tracked");
+                max_cell = max_cell.max(series.rates().into_iter().max().unwrap_or(0));
             }
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -519,8 +571,8 @@ mod tests {
             "busy process should average >30% per-core, got {max_cpu} bp"
         );
         assert!(
-            max_peak >= max_cpu,
-            "peak ({max_peak}) must capture at least the average ({max_cpu})"
+            max_cell > 3000,
+            "the sparkline series must show the busy interval, got {max_cell} bp"
         );
     }
 

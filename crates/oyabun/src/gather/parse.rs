@@ -42,7 +42,7 @@ impl StatFields {
     /// Populate a process row from these parsed stat fields, copying `comm` out of the
     /// transient read `slot` **inline** into the row (the slot is reused by the next read,
     /// so `comm` cannot stay borrowed from it). `uid`/`cmdline` are filled afterward by the
-    /// `ProcTable`; `cpu_pct`/`cpu_peak` and the tree links by later stages; `pid` was set
+    /// `ProcTable`; `cpu_pct`/`cpu_now` and the tree links by later stages; `pid` was set
     /// when the tombstone was pushed.
     pub fn write_into(&self, e: &mut ProcessEntry, page_size: u64, slot: &[u8]) {
         e.ppid = self.ppid;

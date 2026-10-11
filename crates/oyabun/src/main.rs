@@ -2,13 +2,16 @@ mod app;
 mod application;
 mod fxhash;
 mod gather;
+mod header;
 mod identity;
 mod log;
 mod palette;
 mod procs;
+mod sparkline;
 mod sys;
 mod tree;
 mod ui;
+mod view;
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -38,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One thread, one owner: the arena + `!Send` stores + the io_uring ring all live on this
     // thread, which both gathers and renders. Prime the first buffer before entering raw mode.
     let mut app = App::new(page_size, proc_dir, uid_names);
+    app.set_header_width(crossterm::terminal::size().map_or(80, |(w, _)| w));
     app.gather();
 
     enable_raw_mode()?;
@@ -72,18 +76,22 @@ fn run(mut display: Display<io::Stdout>, mut app: App) -> Result<(), Box<dyn std
     let mut next_gather = Instant::now() + REFRESH_INTERVAL;
 
     loop {
+        let (width, height) = crossterm::terminal::size()?;
+        // Before the gather: history capacity and the graph's scale follow the width.
+        app.set_header_width(width);
         if Instant::now() >= next_gather {
             app.gather();
             next_gather = Instant::now() + REFRESH_INTERVAL;
             dirty = true;
         }
 
-        let (width, height) = crossterm::terminal::size()?;
         let visible_height = height.saturating_sub(ui::chrome_lines(gpu)) as usize;
         if app.adjust_scroll(visible_height) {
             dirty = true;
         }
-        app.prepare_visible_rows(visible_height);
+        if app.prepare_visible_rows(visible_height) {
+            dirty = true;
+        }
         if dirty {
             let mut frame = display.begin_frame(width, height);
             ui::render(&mut frame, &app, &schema);
@@ -96,7 +104,13 @@ fn run(mut display: Display<io::Stdout>, mut app: App) -> Result<(), Box<dyn std
         if event::poll(timeout)? {
             let mut force_gather = false;
             loop {
-                if let Event::Key(key) = event::read()?
+                let ev = event::read()?;
+                // The new size is picked up at the top of the loop; it just needs a repaint now
+                // rather than a refresh from now.
+                if matches!(ev, Event::Resize(..)) {
+                    dirty = true;
+                }
+                if let Event::Key(key) = ev
                     && key.kind == KeyEventKind::Press
                 {
                     match key.code {
@@ -105,6 +119,7 @@ fn run(mut display: Display<io::Stdout>, mut app: App) -> Result<(), Box<dyn std
                         KeyCode::Down => app.move_down(),
                         KeyCode::Enter | KeyCode::Right => app.toggle_collapse(),
                         KeyCode::Left => app.collapse_selected(),
+                        KeyCode::Char('g') => app.toggle_group_fold(),
                         KeyCode::Char('k') => force_gather |= app.kill_selected(),
                         KeyCode::PageUp => app.page_up(visible_height),
                         KeyCode::PageDown => app.page_down(visible_height),

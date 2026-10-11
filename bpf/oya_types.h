@@ -46,6 +46,8 @@ struct oya_task_info {
 	__u64 stime_ns;          /* thread-group stime total (nanoseconds) */
 	__u64 start_boottime_ns; /* task->start_boottime — matches /proc field 22 after nsec_to_clock_t */
 	__s64 rss_pages;         /* sum of FILE+ANON+SHMEM rss counters (pages; may be transiently <0) */
+	__u64 wait_ns;           /* sum of sched_info.run_delay over LIVE threads (ns runnable but queued);
+	                            can drop when a thread exits — dead threads' wait is not accumulated */
 	__u32 pid;               /* task->tgid (userspace PID) */
 	__u32 tgid;              /* task->tgid (== pid for the leaders we emit) */
 	__u32 ppid;              /* real_parent->tgid */
@@ -60,7 +62,7 @@ struct oya_task_info {
 	__u8  _pad[4];           /* explicit tail pad: size is a multiple of 8 */
 };
 
-_Static_assert(sizeof(struct oya_task_info) == 88, "oya_task_info layout drift");
+_Static_assert(sizeof(struct oya_task_info) == 96, "oya_task_info layout drift");
 
 /*
  * A birth/reap record pushed to the ringbuf by the fork/free tp_btf programs.

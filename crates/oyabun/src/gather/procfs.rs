@@ -7,6 +7,7 @@
 use std::time::Instant;
 
 use super::config::{Config, RING_ENTRIES, force_syscall, pool_capacity};
+use super::schedstat::WaitSampler;
 use super::source::{CycleResult, Source, SourceCtx};
 use super::syscall::SyscallBackend;
 use super::table::PidIndex;
@@ -56,6 +57,8 @@ pub(crate) struct ProcSource {
     /// I/O backend, built once on the owning thread (the sole ring submitter).
     backend: Backend,
     proc_dir: ProcDir,
+    /// Scheduler wait for the watched processes, which stat cannot provide.
+    waits: WaitSampler,
     pids: Vec<u32>,
     dent_buf: Vec<u8>,
     /// Persistent-fd pool capacity, retained for the mid-run `io_uring`→syscall downgrade.
@@ -68,7 +71,10 @@ pub(crate) struct ProcSource {
 
 impl Source for ProcSource {
     fn populate(&mut self, procs: &mut Procs, ctx: SourceCtx<'_>) -> CycleResult {
-        let (now, pool_overflow) = self.scan(procs, ctx.index, ctx.page_size, ctx.prev_gen);
+        let (now, pool_overflow) = self.scan(procs, ctx.table.index(), ctx.page_size, ctx.prev_gen);
+        self.waits.fill(procs.as_mut_slice(), ctx.wait_watch, |p| {
+            ctx.table.cpu_baseline(p.pid, p.start_time)
+        });
         CycleResult {
             now,
             pool_overflow,
@@ -85,6 +91,7 @@ impl ProcSource {
         Self {
             backend,
             proc_dir,
+            waits: WaitSampler::new(sys::clk_tck()),
             pids: Vec::new(),
             dent_buf: vec![0u8; 64 * 1024],
             pool_cap,

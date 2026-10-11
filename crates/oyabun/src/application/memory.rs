@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use crate::application::AppGroup;
 use crate::fxhash::PidMap;
 use crate::procs::ProcessEntry;
 
@@ -41,7 +40,7 @@ impl Split {
     }
 }
 
-/// Per-member cache. Keyed by PID and validated by `start_time`, so a reused PID never inherits a
+/// Per-process cache. Keyed by PID and validated by `start_time`, so a reused PID never inherits a
 /// stale reading; entries whose process is not live this generation are evicted in
 /// [`MemorySampler::begin_cycle`].
 struct MemberSample {
@@ -52,18 +51,19 @@ struct MemberSample {
     read_gen: u64,
 }
 
-/// Estimate-based proportional-memory sampler for folded application rows.
+/// Estimate-based proportional-memory sampler for the processes on screen.
 ///
-/// Correct application memory sums proportional set size across **every** member, and reading a
-/// member's PSS forces a kernel walk of its whole address space — the dominant interactive cost
-/// on a real desktop if done every cycle. The key invariant is that the *shape* of a
-/// member's footprint — its shared-vs-private split — changes far more slowly than its size. So
-/// PSS is estimated, not re-read: each member caches that split from one walk, then every cycle
-/// recombines it with the free live resident reading (resident growth is attributed to private
-/// pages, exact for heap growth). The expensive walk runs only to bootstrap a member's split and,
-/// on a staggered backstop, to catch a change in the shared mapping set — the one thing the
-/// resident reading cannot reveal — under a per-cycle budget. See
-/// `docs/application-memory-gotchas.md`.
+/// Every row's memory is proportional set size (a collapsed row sums it over what it hides),
+/// and reading a process's PSS forces a kernel walk of its whole address space — the dominant
+/// interactive cost on a real desktop if done every cycle. The key invariant is that the *shape*
+/// of a process's footprint — its shared-vs-private split — changes far more slowly than its
+/// size. So PSS is estimated, not re-read: each process caches that split from one walk, then
+/// every cycle recombines it with the free live resident reading (resident growth is attributed
+/// to private pages, exact for heap growth). The expensive walk runs only to bootstrap a
+/// process's split and, on a staggered backstop, to catch a change in the shared mapping set —
+/// the one thing the resident reading cannot reveal — under a per-cycle budget. A process
+/// without a split yet is reported by its resident set and flagged, per process, so one
+/// unreadable process never degrades a whole row. See `docs/application-memory-gotchas.md`.
 pub(crate) struct MemorySampler {
     proc_root: PathBuf,
     members: PidMap<MemberSample>,
@@ -74,19 +74,6 @@ pub(crate) struct MemorySampler {
     budget: u32,
     #[cfg(test)]
     reads: std::cell::Cell<usize>,
-}
-
-/// One member's contribution to a group total, resolved from the cache after the budgeted reads.
-enum Contribution {
-    /// A usable proportional value (private + shared-recombined bytes).
-    Pss(u64),
-    /// The member has no address space (zombie / racing exit): contributes zero, never forces
-    /// the whole-group resident fallback.
-    Empty,
-    /// The member is live with resident memory but has no proportional value yet (never read
-    /// within budget, or unreadable). Any such member drops the whole group to resident-set
-    /// addition — mixing proportional and resident units in one total would be incoherent.
-    Missing,
 }
 
 impl MemorySampler {
@@ -117,43 +104,54 @@ impl MemorySampler {
         });
     }
 
-    /// Refresh and write `mem_bytes` for the given visible collapsed groups. Stale members
-    /// across all of them are prioritized by absolute resident-set change and read highest-first
-    /// until the shared budget is spent; every group's total is then recomputed from the cache.
-    /// Cheap to call repeatedly within a generation — fresh members trigger no reads.
-    pub(crate) fn sample_visible(
-        &mut self,
-        groups: &mut [AppGroup],
-        visible: &[usize],
-        procs: &[ProcessEntry],
-    ) {
+    /// Spend the cycle's remaining read budget on `wanted` (indices into `procs`): the stale
+    /// ones, ranked by resident size, largest first, so a freshly shown big subtree spends the
+    /// budget where it matters most and spreads the rest across the next few cycles. Returns
+    /// whether anything was read (the caller then recomputes its totals). Cheap to call
+    /// repeatedly within a generation — processes with a fresh split trigger no reads.
+    pub(crate) fn sample(&mut self, wanted: &[usize], procs: &[ProcessEntry]) -> bool {
         // Reuse the scratch buffer across calls (no per-frame allocation). Taking it out by value
         // sidesteps the borrow conflict between `self.refresh_priority` (&self) and pushing.
         let mut candidates = std::mem::take(&mut self.candidates);
         candidates.clear();
-        for &group_idx in visible {
-            for &proc_idx in &groups[group_idx].members {
-                let proc = &procs[proc_idx];
-                if let Some(priority) = self.refresh_priority(proc) {
-                    candidates.push((proc_idx, priority));
-                }
+        for &proc_idx in wanted {
+            if let Some(priority) = self.refresh_priority(&procs[proc_idx]) {
+                candidates.push((proc_idx, priority));
             }
         }
-        // Largest members first, so a fresh fold of a big application spends the budget where it
-        // matters most and spreads the rest across the next few cycles.
         candidates.sort_unstable_by_key(|&(_, priority)| std::cmp::Reverse(priority));
+        let mut read = false;
         for &(proc_idx, _) in &candidates {
             if self.budget == 0 {
                 break;
             }
             self.budget -= 1;
             self.read_member(&procs[proc_idx]);
+            read = true;
         }
         self.candidates = candidates;
+        read
+    }
 
-        for &group_idx in visible {
-            let total = self.group_total(&groups[group_idx], procs);
-            groups[group_idx].mem_bytes = total;
+    /// Report the current PSS estimate of each `wanted` process (index into `procs`) that has a
+    /// usable split, as `(index, bytes)`. One hash lookup per wanted process, so the cost follows
+    /// the viewport, not the cache (which keeps every entry sampled so far, so scrolling back to
+    /// a sampled process shows its number without a re-walk) nor the process table. A process
+    /// absent here has no proportional value and falls back to its resident set.
+    pub(crate) fn estimates(
+        &self,
+        procs: &[ProcessEntry],
+        wanted: &[usize],
+        mut f: impl FnMut(usize, u64),
+    ) {
+        for &idx in wanted {
+            let proc = &procs[idx];
+            if let Some(sample) = self.members.get(&proc.pid)
+                && sample.start_time == proc.start_time
+                && let Some(split) = sample.split
+            {
+                f(idx, split.estimate(proc.mem_bytes));
+            }
         }
     }
 
@@ -201,39 +199,6 @@ impl MemorySampler {
             },
         );
     }
-
-    fn group_total(&self, group: &AppGroup, procs: &[ProcessEntry]) -> u64 {
-        let mut pss_sum = 0u64;
-        for &proc_idx in &group.members {
-            match self.contribution(&procs[proc_idx]) {
-                Contribution::Pss(pss) => pss_sum = pss_sum.saturating_add(pss),
-                Contribution::Empty => {}
-                Contribution::Missing => return rss_sum(group, procs),
-            }
-        }
-        pss_sum
-    }
-
-    fn contribution(&self, proc: &ProcessEntry) -> Contribution {
-        if proc.mem_bytes == 0 {
-            return Contribution::Empty;
-        }
-        match self.members.get(&proc.pid) {
-            Some(sample) if sample.start_time == proc.start_time => {
-                sample.split.map_or(Contribution::Missing, |split| {
-                    Contribution::Pss(split.estimate(proc.mem_bytes))
-                })
-            }
-            _ => Contribution::Missing,
-        }
-    }
-}
-
-fn rss_sum(group: &AppGroup, procs: &[ProcessEntry]) -> u64 {
-    group
-        .members
-        .iter()
-        .fold(0u64, |sum, &idx| sum.saturating_add(procs[idx].mem_bytes))
 }
 
 /// Walk a member's `smaps_rollup` into its shared/private split. `None` when the address space is
@@ -275,19 +240,17 @@ fn field_bytes(line: &str, label: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::AppGroupKey;
     use std::fs;
 
     struct Fixture {
         root: PathBuf,
         sampler: MemorySampler,
         procs: Vec<ProcessEntry>,
-        group: AppGroup,
     }
 
     impl Fixture {
         /// `n` members, PIDs `1..=n`, each with `rss_mib` MiB resident and a `smaps_rollup`
-        /// whose split reports `pss_mib` MiB proportional at that resident set. Whole group.
+        /// whose split reports `pss_mib` MiB proportional at that resident set. Every process wanted.
         fn new(name: &str, n: u32, rss_mib: u64, pss_mib: u64) -> Self {
             let root = std::env::temp_dir().join(format!("oya-mem-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
@@ -302,38 +265,27 @@ mod tests {
                 procs.push(p);
                 write_rollup(&proc_root, pid, rss_mib, pss_mib);
             }
-            let group = AppGroup {
-                key: AppGroupKey {
-                    owner_uid: 1,
-                    canonical: "x".into(),
-                },
-                representative: 0,
-                members: (0..n as usize).collect(),
-                label: "x".into(),
-                owner_uid: 1,
-                persist_key: None,
-                threads: 0,
-                cpu_pct: 0,
-                cpu_peak: 0,
-                mem_bytes: 0,
-                gpu: None,
-            };
             Self {
                 sampler: MemorySampler::with_root(proc_root),
                 root,
                 procs,
-                group,
             }
         }
 
         fn cycle(&mut self, generation: u64) {
             self.sampler.begin_cycle(generation, &self.procs);
-            self.sampler
-                .sample_visible(std::slice::from_mut(&mut self.group), &[0], &self.procs);
+            let wanted: Vec<usize> = (0..self.procs.len()).collect();
+            self.sampler.sample(&wanted, &self.procs);
         }
 
+        /// Sum of per-process memory as a row would show it: the estimate where the sampler has
+        /// a split, else the resident fallback.
         fn total(&self) -> u64 {
-            self.group.mem_bytes
+            let mut own: Vec<u64> = self.procs.iter().map(|p| p.mem_bytes).collect();
+            let all: Vec<usize> = (0..self.procs.len()).collect();
+            self.sampler
+                .estimates(&self.procs, &all, |idx, bytes| own[idx] = bytes);
+            own.iter().sum()
         }
     }
 
@@ -366,6 +318,22 @@ mod tests {
         let mut f = Fixture::new("pss-sum", 3, 100, 40);
         f.cycle(1);
         assert_eq!(f.total(), 3 * 40 * 1024 * 1024);
+        assert_eq!(f.sampler.read_count(), 3);
+    }
+
+    #[test]
+    fn estimates_cover_only_the_wanted_processes_and_the_cache_is_kept() {
+        let mut f = Fixture::new("viewport", 3, 100, 40);
+        f.cycle(1);
+        let mut seen = Vec::new();
+        f.sampler
+            .estimates(&f.procs, &[1], |idx, bytes| seen.push((idx, bytes)));
+        assert_eq!(seen, [(1, 40 * 1024 * 1024)]);
+        // Scrolling elsewhere and back needs no further walk.
+        seen.clear();
+        f.sampler
+            .estimates(&f.procs, &[0, 2], |idx, _| seen.push((idx, 0)));
+        assert_eq!(seen.len(), 2);
         assert_eq!(f.sampler.read_count(), 3);
     }
 
@@ -404,8 +372,10 @@ mod tests {
         let mut f = Fixture::new("budget", members, 100, 10);
         f.cycle(1);
         assert_eq!(f.sampler.read_count(), READ_BUDGET as usize);
-        // Not every member has a proportional value yet → coherent resident-set fallback.
-        assert_eq!(f.total(), u64::from(members) * 100 * 1024 * 1024);
+        // The unread members fall back to their resident set, per process; the read ones are
+        // already proportional (no whole-group fallback).
+        let (read, unread) = (u64::from(READ_BUDGET), u64::from(members - READ_BUDGET));
+        assert_eq!(f.total(), (read * 10 + unread * 100) * 1024 * 1024);
 
         f.cycle(2);
         assert_eq!(f.sampler.read_count(), members as usize);
@@ -445,13 +415,12 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_member_drops_group_to_resident_addition() {
+    fn unreadable_member_falls_back_alone() {
         let mut f = Fixture::new("fallback", 3, 100, 40);
         fs::remove_file(f.root.join("proc/2/smaps_rollup")).unwrap();
         f.cycle(1);
-        // A live member with resident memory but no proportional value makes the whole group
-        // fall back to resident-set addition rather than mix units.
-        assert_eq!(f.total(), 3 * 100 * 1024 * 1024);
+        // Only the unreadable member reports its resident set; the rest stay proportional.
+        assert_eq!(f.total(), (40 + 100 + 40) * 1024 * 1024);
     }
 
     #[test]
@@ -460,8 +429,7 @@ mod tests {
         f.procs[1].mem_bytes = 0; // zombie / racing exit: no address space
         fs::remove_file(f.root.join("proc/2/smaps_rollup")).unwrap();
         f.cycle(1);
-        // The empty member contributes nothing and its unreadable record does not trigger the
-        // whole-group resident fallback; the two readable members still sum proportionally.
+        // The empty member contributes nothing; the two readable members sum proportionally.
         assert_eq!(f.total(), 2 * 40 * 1024 * 1024);
     }
 

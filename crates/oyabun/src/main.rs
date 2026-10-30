@@ -1,5 +1,6 @@
 mod app;
 mod application;
+mod control;
 mod fxhash;
 mod gather;
 mod header;
@@ -121,6 +122,8 @@ fn run(mut display: Display<io::Stdout>, mut app: App) -> Result<(), Box<dyn std
                         KeyCode::Left => app.collapse_selected(),
                         KeyCode::Char('g') => app.toggle_group_fold(),
                         KeyCode::Char('k') => force_gather |= app.kill_selected(),
+                        // Shift-only: a stray lowercase `n` must not reprioritize a tree.
+                        KeyCode::Char('N') => force_gather |= app.deprioritize_selected(),
                         KeyCode::PageUp => app.page_up(visible_height),
                         KeyCode::PageDown => app.page_down(visible_height),
                         KeyCode::Home => app.select_first(),
@@ -133,7 +136,8 @@ fn run(mut display: Display<io::Stdout>, mut app: App) -> Result<(), Box<dyn std
                     break;
                 }
             }
-            // A kill nudges the next gather to now, so the change shows without a full interval.
+            // A kill or deprioritization nudges the next gather to now, so the change shows
+            // without a full interval.
             if force_gather {
                 next_gather = Instant::now();
             }

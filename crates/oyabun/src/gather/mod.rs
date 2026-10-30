@@ -47,3 +47,4 @@ pub(crate) use cpu::{CpuSeries, SPARK_CELLS, SeriesCell, Waiting, ns_per_tick};
 pub use cpu_history::CpuCell;
 pub use cpu_history::CpuHistory;
 pub use gatherer::Gatherer;
+pub(crate) use parse::read_stat;

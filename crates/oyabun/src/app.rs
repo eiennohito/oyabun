@@ -8,11 +8,12 @@
 use crate::application::{
     AppGroup, AppGroupKey, ApplicationGroups, DesktopResolver, FoldPreferences, MemorySampler,
 };
+use crate::control::VerifiedProcess;
 use crate::fxhash::FxMap;
 use crate::gather::{CpuHistory, CpuSeries, Gatherer};
 use crate::header;
 use crate::procs::{ProcessEntry, Procs, SystemStats};
-use crate::sys::{self, ProcDir};
+use crate::sys::ProcDir;
 use crate::view::{Collapse, RowKind, Totals, ViewRow, ViewTree};
 
 /// What the viewport shows: the candidate set of processes the view sums numbers for is a
@@ -667,9 +668,36 @@ impl App {
             return false;
         };
         let e = self.entry(proc_idx);
-        // Only signals if (pid, start_time) still identify this exact process — a reused PID is
-        // never hit.
-        sys::kill_verified(e.pid, e.start_time, libc::SIGTERM)
+        VerifiedProcess::open(e.pid, e.start_time).is_some_and(|p| p.signal(libc::SIGTERM))
+    }
+
+    /// `N`: push the selected row's whole tree to the background (see
+    /// [`VerifiedProcess::deprioritize`]). Kernel threads and oyabun itself are skipped: the
+    /// first are the kernel's to schedule, the second would make the UI lag under the very load
+    /// being tamed. Returns whether anything changed — the loop then gathers immediately.
+    #[must_use]
+    pub fn deprioritize_selected(&mut self) -> bool {
+        if self.view.rows().get(self.selected).is_none() {
+            return false;
+        }
+        let me = std::process::id();
+        let mut targets = Vec::new();
+        let procs = self.gatherer.procs().as_slice();
+        self.view.tree_procs(self.selected, procs, |iu| {
+            let e = &procs[iu as usize];
+            if !e.is_kthread && e.pid != me {
+                targets.push((e.pid, e.start_time));
+            }
+        });
+        let mut tids = Vec::new();
+        let mut changed = Vec::new();
+        for (pid, start_time) in targets {
+            if VerifiedProcess::open(pid, start_time).is_some_and(|p| p.deprioritize(&mut tids)) {
+                changed.push(pid);
+            }
+        }
+        self.gatherer.reprioritized(&changed);
+        !changed.is_empty()
     }
 }
 

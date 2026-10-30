@@ -231,7 +231,7 @@ fn build_footer(
     l.span(tag, tag_color);
     l.span("] ", palette::FOOTER);
     let text = format!(
-        "Rows: {visible_rows} | q:quit k:kill ↑↓:scroll Enter/→:expand ←:collapse g:fold app PgUp/PgDn Home/End"
+        "Rows: {visible_rows} | q:quit k:kill N:idle tree ↑↓:scroll Enter/→:expand ←:collapse g:fold app PgUp/PgDn Home/End"
     );
     l.span(&text, palette::FOOTER);
     // A low `RLIMIT_NOFILE` is the only realistic cause; surface it rather than degrade silently.

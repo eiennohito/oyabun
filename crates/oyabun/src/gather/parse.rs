@@ -128,6 +128,15 @@ pub fn parse_stat(slot: &[u8]) -> Option<StatFields> {
     })
 }
 
+/// One process's stat read on demand, outside the cycle's batched I/O — the rare targeted
+/// re-read an action needs. Only the numeric fields are meaningful: the `comm` range points
+/// into a read buffer that is gone. `None` if the process is gone or the read is malformed.
+pub(crate) fn read_stat(pid: u32) -> Option<StatFields> {
+    let mut slot = [0u8; super::config::STAT_SLOT];
+    let fields = parse_stat(crate::sys::read_pid_file(pid, b"stat", &mut slot))?;
+    (fields.parsed_pid == pid).then_some(fields)
+}
+
 fn skip<'a>(it: &mut impl Iterator<Item = &'a [u8]>, n: usize) -> Option<()> {
     for _ in 0..n {
         it.next()?;

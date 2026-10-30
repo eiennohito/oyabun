@@ -78,6 +78,16 @@ fn read_proc_file<const N: usize>(path: *const libc::c_char, buf: &mut [u8; N]) 
     &buf[..usize::try_from(n).unwrap_or(0).min(N)]
 }
 
+/// Read `/proc/<pid>/<suffix>` into a stack buffer; empty if the process is gone.
+pub fn read_pid_file<'a, const N: usize>(
+    pid: u32,
+    suffix: &[u8],
+    buf: &'a mut [u8; N],
+) -> &'a [u8] {
+    let mut path = ProcPath::new();
+    read_proc_file(path.write(pid, suffix), buf)
+}
+
 /// Cumulative CPU jiffies from the aggregate `cpu` line of `/proc/stat`.
 #[derive(Clone, Copy, Default)]
 pub struct RawCpuCounters {
@@ -556,42 +566,6 @@ fn write_u32(buf: &mut [u8], v: u32) -> usize {
     n
 }
 
-/// Send `sig` to `pid` **only if it is still the same process incarnation** — i.e.
-/// `/proc/<pid>/stat`'s start-time still matches `start_time`. Race-safe: the signal
-/// goes through the pidfd (anchored to the kernel `task_struct`, not the PID number),
-/// so even if the PID is recycled between `pidfd_open` and the `start_time` check,
-/// `pidfd_send_signal` targets the original (now-dead) process and harmlessly fails
-/// with ESRCH. The `start_time` check prevents signaling a process that exited and
-/// was replaced — the pidfd makes it safe, the `start_time` makes it correct.
-pub fn kill_verified(pid: u32, start_time: u64, sig: i32) -> bool {
-    let Ok(pid_arg) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: pidfd_open with a valid pid and zero flags.
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid_arg, 0) };
-    let Ok(pidfd) = libc::c_int::try_from(raw) else {
-        return false; // process already gone, or unsupported
-    };
-
-    let identity_ok = process_start_time(pid) == Some(start_time);
-    let sent = identity_ok && {
-        // SAFETY: pidfd is valid; null siginfo and zero flags are accepted.
-        let r = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                pidfd,
-                sig,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
-        r == 0
-    };
-    // SAFETY: closing our own fd exactly once.
-    unsafe { libc::close(pidfd) };
-    sent
-}
-
 /// Is this task a thread group leader (a real process, not a non-leader thread)?
 /// Uses `pidfd_open(pid, 0)` — one syscall, no file I/O. Returns `EINVAL` for
 /// non-leader threads (kernel ≥ 5.3, the same floor as `io_uring`). The birth probe
@@ -608,43 +582,6 @@ pub fn is_thread_group_leader(pid: u32) -> bool {
     } else {
         false
     }
-}
-
-/// Field 22 of `/proc/<pid>/stat` — process start time (jiffies since boot), the
-/// discriminator that distinguishes PID reuse. `None` if the PID is gone.
-///
-/// Intentionally duplicates the field-22 parse from `gather::parse::parse_stat` —
-/// `sys` is a low-level module that must not depend on `gather`, and this path uses
-/// a small stack buffer rather than the arena.
-fn process_start_time(pid: u32) -> Option<u64> {
-    let mut path = ProcPath::new();
-    let ptr = path.write(pid, b"stat");
-    // SAFETY: valid C path, read-only.
-    let fd = unsafe { libc::open(ptr, libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return None;
-    }
-    let mut buf = [0u8; 512];
-    // SAFETY: reading into a local buffer of the given length.
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    // SAFETY: our fd.
-    unsafe { libc::close(fd) };
-    let slot = buf.get(..usize::try_from(n).ok()?)?;
-
-    // starttime is the 20th space-separated field after the comm's closing ')'.
-    let close = slot.iter().rposition(|&b| b == b')')?;
-    let mut fields = slot.get(close + 2..)?.split(|&b| b == b' ');
-    for _ in 0..19 {
-        fields.next()?;
-    }
-    let mut v: u64 = 0;
-    for &c in fields.next()? {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        v = v.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
-    }
-    Some(v)
 }
 
 /// An open handle to `/proc`, scanned repeatedly via `getdents64` into a caller
@@ -800,14 +737,6 @@ mod tests {
     }
 
     #[test]
-    fn start_time_of_self_is_stable() {
-        let me = std::process::id();
-        let a = process_start_time(me).expect("own start time");
-        let b = process_start_time(me).expect("own start time");
-        assert_eq!(a, b, "start time must be constant for a live process");
-    }
-
-    #[test]
     fn cpu_counters_are_nonzero() {
         let c = SystemFiles::new().read().cpu;
         assert!(c.total() > 0, "total jiffies must be > 0");
@@ -901,29 +830,5 @@ mod tests {
                 "ns_last_pid {last} should not exceed pid_max {pid_max}"
             );
         }
-    }
-
-    #[test]
-    fn kill_verified_respects_identity() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("10")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-        let start = process_start_time(pid).expect("child start time");
-
-        // Mismatched start time (as if the PID had been reused) → refuse to signal.
-        assert!(
-            !kill_verified(pid, start.wrapping_add(1), libc::SIGTERM),
-            "must not signal a different incarnation"
-        );
-        // Correct identity → signal is delivered.
-        assert!(kill_verified(pid, start, libc::SIGTERM));
-
-        let status = child.wait().expect("reap child");
-        assert!(
-            !status.success(),
-            "child should have been terminated by signal"
-        );
     }
 }

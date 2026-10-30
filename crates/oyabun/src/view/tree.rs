@@ -8,6 +8,7 @@ use super::totals::{ProcessTotals, Totals};
 use crate::application::{ApplicationGroups, MemorySampler};
 use crate::gather::{CpuSeries, Gatherer};
 use crate::procs::{NONE, ProcessEntry};
+use crate::tree::for_each_in_subtrees;
 
 /// A native node waiting to be emitted, with the row of the nearest emitted ancestor.
 struct Frame {
@@ -359,16 +360,33 @@ impl ViewTree {
                 RowKind::Process { proc_idx } if !row.is_collapsed() => out.push(proc_idx),
                 RowKind::Process { .. } | RowKind::Group { .. } => {
                     let hidden = row.hidden();
-                    let walk = &mut self.scratch.walk;
-                    walk.clear();
-                    walk.extend_from_slice(&self.roots[hidden.start as usize..hidden.end as usize]);
-                    while let Some(iu) = walk.pop() {
+                    let roots = &self.roots[hidden.start as usize..hidden.end as usize];
+                    for_each_in_subtrees(procs, roots, &mut self.scratch.walk, |iu| {
                         out.push(iu as usize);
-                        push_siblings(procs, procs[iu as usize].first_child, walk);
-                    }
+                    });
                 }
             }
         }
+    }
+
+    /// Every process in the row's tree: a process row's whole native subtree, shown or not; a
+    /// folded group's top members' subtrees. The set an action on the row reaches.
+    pub(crate) fn tree_procs(&mut self, row: usize, procs: &[ProcessEntry], f: impl FnMut(u32)) {
+        let row = &self.rows[row];
+        let own;
+        let roots = match row.kind {
+            // Fits `u32` by the process-buffer design.
+            #[allow(clippy::cast_possible_truncation)]
+            RowKind::Process { proc_idx } => {
+                own = proc_idx as u32;
+                std::slice::from_ref(&own)
+            }
+            RowKind::Group { .. } => {
+                let hidden = row.hidden();
+                &self.roots[hidden.start as usize..hidden.end as usize]
+            }
+        };
+        for_each_in_subtrees(procs, roots, &mut self.scratch.walk, f);
     }
 }
 /// Push a native sibling chain so a LIFO stack pops it PID-ascending.
@@ -383,13 +401,4 @@ fn push_chain(procs: &[ProcessEntry], head: u32, parent_row: u32, stack: &mut Ve
         c = procs[c as usize].next_sibling;
     }
     stack[base..].reverse();
-}
-
-/// Push a sibling chain in any order (the order is irrelevant to a set walk).
-fn push_siblings(procs: &[ProcessEntry], head: u32, stack: &mut Vec<u32>) {
-    let mut c = head;
-    while c != NONE {
-        stack.push(c);
-        c = procs[c as usize].next_sibling;
-    }
 }

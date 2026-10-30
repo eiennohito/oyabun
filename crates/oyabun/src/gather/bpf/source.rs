@@ -16,7 +16,7 @@ use zerocopy::FromBytes;
 use super::super::source::{CycleResult, Source, SourceCtx};
 use super::types::{EVENT_FORK, EVENT_FREE, ProcEvent, TaskInfo};
 use crate::fxhash::{FxBuildHasher, FxMap};
-use crate::gather::ns_per_tick;
+use crate::gather::{ns_per_tick, read_stat};
 use crate::log::debug_log;
 use crate::procs::{ProcessEntry, Procs};
 
@@ -261,6 +261,18 @@ impl BpfSource {
         (now, short_lived)
     }
 
+    /// Re-read priority and nice for `pids` from `/proc` into the carried-forward set. Both are
+    /// cold fields the walk only refreshes alongside a hot change, so a sleeping process
+    /// reprioritized from here would show its old values until the next resync. One read per
+    /// PID, once, after the kernel already holds the new values — nothing per cycle.
+    pub fn reread_priority(&mut self, pids: &[u32]) {
+        for &pid in pids {
+            if let (Some(ti), Some(stat)) = (self.set.get_mut(&pid), read_stat(pid)) {
+                ti.set_priority(stat.priority, stat.nice);
+            }
+        }
+    }
+
     /// Drain the fork/free ring, maintaining `set` + `pending` and counting short-lived
     /// processes. `fork` arms pairing; `free` (the reap) removes the row and, if its fork was
     /// never reconciled by a snapshot, counts it short-lived (forked and gone between cycles).
@@ -403,6 +415,42 @@ mod tests {
             "start_time must equal /proc field 22 exactly (kill identity)"
         );
         assert_eq!(mine.comm(), proc_comm.as_slice(), "comm must match /proc");
+    }
+
+    /// A sleeping process reniced between cycles changes no hot field, so the walk would carry
+    /// its old nice forward; the targeted re-read must land the new value in the very next
+    /// cycle's rows. Skips without caps.
+    #[test]
+    fn bpf_reread_priority_reaches_rows() {
+        let arena = Box::new(Arena::new(0));
+        let Some(mut src) = BpfSource::probe(&arena, sys::page_size(), sys::clk_tck()) else {
+            crate::gather::config::skip_privileged_test();
+            return;
+        };
+        let mut procs = Procs::new(&arena, 256);
+        src.wire(&arena);
+        procs.wire(&arena);
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        src.scan(&mut procs);
+        // SAFETY: plain syscall on our own child.
+        assert_eq!(unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 19) }, 0);
+
+        src.reread_priority(&[pid]);
+        src.scan(&mut procs);
+        let row = procs
+            .as_slice()
+            .iter()
+            .find(|p| p.pid == pid)
+            .expect("child row");
+        assert_eq!((row.nice, row.priority), (19, 39));
+
+        child.kill().ok();
+        child.wait().ok();
     }
 
     fn sys_uid() -> u32 {

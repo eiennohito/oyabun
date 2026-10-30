@@ -78,6 +78,22 @@ pub fn build(procs: &mut [ProcessEntry], stack: &mut Vec<u32>, order: &mut Vec<u
     first_root
 }
 
+/// Visit every process in the native subtrees under `roots`, in no particular order. `stack` is
+/// scratch.
+pub fn for_each_in_subtrees(
+    procs: &[ProcessEntry],
+    roots: &[u32],
+    stack: &mut Vec<u32>,
+    mut f: impl FnMut(u32),
+) {
+    stack.clear();
+    stack.extend_from_slice(roots);
+    while let Some(iu) = stack.pop() {
+        f(iu);
+        push_chain(procs, procs[iu as usize].first_child, stack);
+    }
+}
+
 /// Push a sibling chain (head + its `next_sibling`s) onto the DFS stack.
 fn push_chain(procs: &[ProcessEntry], head: u32, stack: &mut Vec<u32>) {
     let mut c = head;

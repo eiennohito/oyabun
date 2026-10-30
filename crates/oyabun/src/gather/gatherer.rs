@@ -103,6 +103,18 @@ impl ObservationSource {
         result
     }
 
+    /// See [`Gatherer::reprioritized`]. The `/proc` source re-reads priority every cycle, and
+    /// replay only plays back what was recorded.
+    fn reprioritized(&mut self, pids: &[u32]) {
+        match self {
+            ObservationSource::Proc(_) => {}
+            #[cfg(feature = "bpf")]
+            ObservationSource::Bpf(b) => b.reread_priority(pids),
+            #[cfg(test)]
+            ObservationSource::Replay(_) => {}
+        }
+    }
+
     #[cfg(test)]
     fn replay_snapshot(&self) -> Option<(RawSystemSnapshot, u32)> {
         match self {
@@ -426,6 +438,12 @@ impl Gatherer {
     pub(crate) fn identity(&self, proc_idx: usize) -> Option<&ProcessIdentity> {
         let e = &self.procs.as_slice()[proc_idx];
         self.identities.identity(e.pid, e.start_time)
+    }
+
+    /// `pids` just had their priority changed from here (the kernel already holds the new
+    /// values): the next cycle shows them even where the source would carry old values forward.
+    pub fn reprioritized(&mut self, pids: &[u32]) {
+        self.source.reprioritized(pids);
     }
 
     /// Run one gather cycle, filling [`procs`](Self::procs) + [`sys`](Self::sys) in place. The

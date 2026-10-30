@@ -100,6 +100,13 @@ impl TaskInfo {
         i8::try_from(i32::from(self.static_prio) - 120).unwrap_or(0)
     }
 
+    /// Inverse of [`priority`](Self::priority) and [`nice`](Self::nice): take both from the
+    /// `/proc` stat columns.
+    pub fn set_priority(&mut self, priority: i8, nice: i8) {
+        self.prio = i16::from(priority) + 100;
+        self.static_prio = i16::from(nice) + 120;
+    }
+
     /// `comm` trimmed at the NUL terminator (kernel writes a C string into 16 bytes).
     fn comm_bytes(&self) -> &[u8] {
         let end = self.comm.iter().position(|&b| b == 0).unwrap_or(COMM_LEN);

@@ -122,16 +122,9 @@ impl ProcessTotals {
     /// Sum over every process in the native subtrees under `roots`.
     fn subtrees(&self, roots: &[u32], procs: &[ProcessEntry], walk: &mut Vec<u32>) -> Totals {
         let mut sum = Totals::default();
-        walk.clear();
-        walk.extend_from_slice(roots);
-        while let Some(iu) = walk.pop() {
+        crate::tree::for_each_in_subtrees(procs, roots, walk, |iu| {
             sum.add(&self.own[iu as usize]);
-            let mut child = procs[iu as usize].first_child;
-            while child != crate::procs::NONE {
-                walk.push(child);
-                child = procs[child as usize].next_sibling;
-            }
-        }
+        });
         sum
     }
 }

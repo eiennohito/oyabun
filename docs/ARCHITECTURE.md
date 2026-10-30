@@ -31,8 +31,8 @@ hold self-referential raw pointers (a store caches a pointer to the arena), so t
 
 The loop blocks for input with a timeout equal to the time until the next gather is due, so
 idle is near-zero CPU (asleep in the kernel, not polling) and a redraw happens only when
-something changed (a dirty flag set by a gather, input, resize, or scroll). A kill nudges the
-next gather to *now* so the change shows without waiting a full interval (a direct deadline
+something changed (a dirty flag set by a gather, input, resize, or scroll). A process action
+(kill, deprioritize) nudges the next gather to *now* so the change shows without waiting a full interval (a direct deadline
 change — there is no cross-thread channel).
 
 ## Process buffer (data, not snapshots)
@@ -95,9 +95,9 @@ generation tag), not incarnation keying. The timing gap between death
 and reuse — vastly longer than 2 cycles under any non-pathological load — is the invariant that
 makes PID-keyed state safe without a discriminator.
 
-**The start time is reserved for signal safety.** The kill path is the one path where a wrong
-target is dangerous regardless of probability: it re-reads `/proc/<pid>/stat` field 22 and
-compares to the selected row's start time, refusing to signal on mismatch. The `pidfd` it
+**The start time is reserved for action safety.** Process actions are the one path where a wrong
+target is dangerous regardless of probability: each re-reads `/proc/<pid>/stat` field 22 and
+compares to the selected row's start time, refusing to act on mismatch. The `pidfd` it
 opens pins the kernel `task_struct` (so even a same-microsecond reuse would ESRCH, not hit the
 new process); the start-time check is the formal proof on top of the physical one. Both are
 cheap; both stay.
@@ -107,6 +107,51 @@ is bound to the old inode), triggering a reopen that reads the new incarnation. 
 backward-counter guard catches most tick-discontinuities; metadata self-heals within the settle
 window. The worst case is one frame of wrong CPU% — bounded and self-correcting. No special
 guard is needed beyond what the normal eviction + reopen path already does.
+
+## Process actions
+
+**Kill** signals one process. **Deprioritize** reaches the selected row's whole tree: a process
+row's full native subtree (shown or collapsed), a folded group's top members' subtrees — the same
+set the row's totals add up, through the same walk, so what an action reaches and what the row
+claims to hold cannot drift apart. It is bound to a shifted key so a stray keystroke cannot
+reprioritize a tree.
+
+**Why "deprioritize" is three settings, not `renice 19`.** The goal is a desktop that stays
+responsive (audio, input) next to a heavy job, and each obvious lever alone falls short:
+- *Nice 19* still leaves the job a ~1.5% share per competing task and little effect on how fast a
+  waking interactive task gets the CPU. The idle scheduling policy goes further: the job runs
+  only when nothing else wants the CPU, and any normal task preempts it on wakeup.
+- *I/O best-effort level 7* is, on common setups, a no-op: the NVMe default scheduler ignores I/O
+  priority entirely, and mq-deadline distinguishes classes but not levels within best-effort.
+  The idle class is the only setting that changes anything there, and mq-deadline ages idle
+  requests, so they are delayed, not starved forever.
+- Nice is still set alongside: it is what the NI column shows, and it is where the job lands
+  if anything later moves it back to the normal policy.
+
+This is a *desktop* trade-off. A server may want the milder variant; that belongs in config once
+config exists. The known risk is priority inversion: an idled task holding a lock a normal task
+needs releases it slowly — but only while other normal work saturates every core, since an idled
+task runs freely on any idle core. (Nice 19 has the same failure shape, milder.)
+
+**Every thread.** Nice, scheduling policy, and I/O priority are all per-thread on Linux; setting
+them on the PID alone (what `renice -p` does) leaves worker threads untouched. Threads and
+children created afterwards inherit the settings, so a one-time pass covers a growing tree.
+
+**What is never touched.** Real-time threads (promoted on purpose — typically audio; demoting them
+causes exactly the glitches this exists to prevent), kernel threads (the kernel's to schedule),
+and oyabun itself (it would lag under the very load being tamed).
+
+**Identity.** Each process is pinned and start-time checked like kill. Thread ids are listed only
+after the pin, and the pin is re-confirmed unreaped after listing, so every listed id belonged to
+the selected process. One window remains: a thread could exit and its id be reused between the
+listing and the priority calls, which take ids, not pidfds. That is accepted because these calls
+can only *lower* a priority — the worst case is a stray deprioritization, not a stray signal.
+
+**Making the change visible.** The `/proc` source reads priority every cycle. The BPF source
+carries priority forward as a cold field (see Observation sources), so a sleeping process
+reniced from here would show its old value until the next resync. The action therefore tells the
+gatherer which processes it changed, and the BPF source re-reads just those from `/proc` once —
+after the kernel already holds the new values, at no per-cycle cost.
 
 ## Storage foundation (`thoop`) and oyabun's single-thread policy
 
@@ -363,7 +408,9 @@ kernel hash of the **hot** fields — the ones that move without the process run
 sleeps, and the parent on reparenting) — so an unchanged hash bails *before* reading the
 **cold** fields (uid, nice, thread count, start time, name) or writing anything. Cold fields
 refresh only on a change or a resync, so a sleeping process that is *only* reniced or reparented
-lags until the next resync — cosmetic, and bounded by it. (A collision in the 64-bit hash,
+lags until the next resync — cosmetic, and bounded by it. A renice made *from oyabun* does not
+lag: the action triggers a one-time `/proc` re-read of the processes it changed (see Process
+actions). (A collision in the 64-bit hash,
 vanishingly unlikely, would also self-heal at the next resync, so it is bounded-stale, not a
 correctness hole.)
 
@@ -906,10 +953,11 @@ on its own coarse interval, which is all the per-process breakdown needs.
   built without it today). The THP map is the reusable primitive for that step.
 - **Selection-follows-PID** across refreshes is implemented; full follow-mode
   auto-scroll is not.
-- **Kill is race-safe**: the kill path pins the target with a `pidfd` and re-checks
-  the start time (see **PID reuse model**) — the pidfd makes it physically safe, the
-  start time makes it formally correct. (`sudo` escalation for protected processes is
-  still future.)
+- **Process actions are race-safe**: kill and deprioritize pin each target with a `pidfd` and
+  re-check the start time (see **PID reuse model**) — the pidfd makes it physically safe, the
+  start time makes it formally correct. (`sudo` escalation for protected processes is still
+  future: without it, deprioritize reaches only the user's own processes and silently skips
+  the rest.)
 
 ## Not yet implemented (see GOALS.md)
 
